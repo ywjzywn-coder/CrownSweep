@@ -17,7 +17,9 @@ GUI 和 CLI 使用独立版本；GUI 标签使用 `gui-v*`，不得复用上游 
 - [第三方版权和许可证](gui/THIRD_PARTY_NOTICES.md)
 - [上游原始 README](UPSTREAM_README.md)
 
-构建依赖：macOS、Xcode Command Line Tools、Node.js 24、Rust 1.90 或以上。
+The retained Mole CLI requires macOS 12 or newer and supports Intel and Apple Silicon.
+
+GUI 构建依赖：macOS、Xcode Command Line Tools、Node.js 24、Rust 1.90 或以上。
 
 ```sh
 cd gui
