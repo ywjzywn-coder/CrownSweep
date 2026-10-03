@@ -1,3 +1,13 @@
+# CrownSweep fork scope
+
+This fork intentionally adds the CrownSweep macOS GUI in `gui/`. For GUI work, read
+`gui/AGENTS.md`, `gui/README.md`, and `gui/docs/MAINTENANCE.md` first. The upstream
+terminal-first product direction below applies to the preserved CLI, not to the
+independently branded GUI. Keep GUI changes isolated from upstream shell/Go code.
+GUI tags use `gui-v*`; never use the CLI `V*` release workflow for GUI releases.
+
+The following upstream instructions are retained for CLI maintenance.
+
 # Mole Agent Guide
 
 This file is the shared source of truth for any AI agent working on this repo (Claude Code, Codex, etc.). `CLAUDE.md` is a symlink to this file. Put machine-specific or personal overrides in `AGENTS.local.md` / `CLAUDE.local.md`; both are gitignored.

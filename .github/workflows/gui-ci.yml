@@ -1,0 +1,66 @@
+name: CrownSweep GUI
+
+on:
+  push:
+    branches: [main]
+    paths: ["gui/**", ".github/workflows/gui-ci.yml"]
+  pull_request:
+    paths: ["gui/**", ".github/workflows/gui-ci.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gui-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: GUI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel]
+    defaults:
+      run:
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+          package-manager-cache: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal
+          rustup override set 1.90.0
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Verify GUI and release tooling
+        run: |
+          npm test
+          npm run build
+          python3 scripts/test_release.py
+          cargo test --lib --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build native App (validation only)
+        run: npm run tauri -- build --bundles app
+      - name: Verify expected sidecar architecture
+        run: |
+          file "src-tauri/target/release/bundle/macos/CrownSweep.app/Contents/MacOS/mole-smc"
+          python3 - <<'PYTHON'
+          import json, platform, plistlib, subprocess
+          from pathlib import Path
+          app = Path("src-tauri/target/release/bundle/macos/CrownSweep.app")
+          info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+          assert info["CFBundleName"] == "CrownSweep"
+          assert info["CFBundleShortVersionString"] == json.loads(Path("package.json").read_text())["version"]
+          assert info["LSMinimumSystemVersion"] == "12.0"
+          for name in [info["CFBundleExecutable"], "mole-smc"]:
+              result = subprocess.check_output(["file", str(app / "Contents/MacOS" / name)], text=True)
+              assert platform.machine() in result, result
+          PYTHON
