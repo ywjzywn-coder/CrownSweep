@@ -1,11 +1,13 @@
 import { PageHeader, EmptyState, EngineNotice } from "../components/Page";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useApp } from "../App";
 import ConfirmDialog from "../components/ConfirmDialog";
-import { IconBox, IconPlay, IconSearch, IconTrash } from "../components/icons";
+import { IconBox, IconSearch, IconTrash } from "../components/icons";
 import { api, AppEntry, UninstallList, fmtBytes } from "../lib/api";
+import { useAppIcons } from "../lib/useAppIcons";
 
 type SortKey = "size" | "name";
+const PAGE_SIZE = 24;
 
 function sizeBytes(entry: AppEntry): number {
   return entry.size_hint_mb * 1024 * 1024;
@@ -17,30 +19,24 @@ export default function Uninstall() {
   const [list, setList] = useState<UninstallList | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [icons, setIcons] = useState<Record<string, string>>({});
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("size");
+  const [onlySelected, setOnlySelected] = useState(false);
+  const [page, setPage] = useState(1);
+  const grid = useRef<HTMLDivElement>(null);
+  const focusPage = useRef(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [permanent, setPermanent] = useState(false);
+  const permanent = false;
 
   const load = async () => {
     setLoading(true);
     setError(null);
     setSelected(new Set());
+    setPage(1);
     try {
       const l = await api.uninstallList();
       setList(l);
-      // Fetch icons lazily; failures just leave the fallback icon.
-      if (l.json) {
-        l.apps.forEach((a) => {
-          if (!a.path) return;
-          api
-            .appIcon(a.path)
-            .then((data) => setIcons((prev) => ({ ...prev, [a.path]: data })))
-            .catch(() => {});
-        });
-      }
     } catch (e) {
       setError(String(e));
       setList(null);
@@ -60,12 +56,35 @@ export default function Uninstall() {
     return arr;
   }, [list, sortKey]);
 
-  const visibleApps = sorted.filter((a) => `${a.name} ${a.bundle_id}`.toLowerCase().includes(query.trim().toLowerCase()));
+  const visibleApps = useMemo(() => {
+    const search = query.trim().toLowerCase();
+    return sorted.filter((app) => `${app.name} ${app.bundle_id}`.toLowerCase().includes(search) && (!onlySelected || selected.has(app.path)));
+  }, [sorted, query, onlySelected, selected]);
+  const pageCount = Math.max(1, Math.ceil(visibleApps.length / PAGE_SIZE));
+  const currentPage = Math.min(page, pageCount);
+  const pageApps = useMemo(() => visibleApps.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE), [visibleApps, currentPage]);
+  const iconPaths = useMemo(() => loading ? [] : pageApps.map((app) => app.path), [pageApps, loading]);
+  const icons = useAppIcons(iconPaths);
+  useEffect(() => {
+    if (!focusPage.current) return;
+    focusPage.current = false;
+    grid.current?.focus({ preventScroll: true });
+    grid.current?.scrollIntoView({ block: "start" });
+  }, [currentPage]);
+
+  const changePage = (value: number) => {
+    if (value === currentPage) return;
+    focusPage.current = true;
+    setPage(value);
+  };
 
   const selectedApps = useMemo(
     () => sorted.filter((a) => selected.has(a.path)),
     [sorted, selected],
   );
+  const outsideFilterCount = selectedApps.length - visibleApps.filter((app) => selected.has(app.path)).length;
+
+  const showAll = () => { setOnlySelected(false); setQuery(""); setPage(1); };
 
   const toggle = (path: string) => {
     setSelected((prev) => {
@@ -110,16 +129,16 @@ export default function Uninstall() {
         <button
           className="btn danger"
           onClick={() => setConfirmOpen(true)}
-          disabled={selectedApps.length === 0 || running}
+          disabled={selectedApps.length === 0 || running || loading || !engine}
         >
           <IconTrash size={14} /> 卸载所选{selectedApps.length > 0 ? ` (${selectedApps.length})` : ""}
         </button>
         {list?.json && sorted.length > 0 && (
           <div className="seg">
-            <button className={sortKey === "size" ? "on" : ""} onClick={() => setSortKey("size")}>
+            <button className={sortKey === "size" ? "on" : ""} aria-pressed={sortKey === "size"} onClick={() => { setSortKey("size"); setPage(1); }}>
               按大小
             </button>
-            <button className={sortKey === "name" ? "on" : ""} onClick={() => setSortKey("name")}>
+            <button className={sortKey === "name" ? "on" : ""} aria-pressed={sortKey === "name"} onClick={() => { setSortKey("name"); setPage(1); }}>
               按名称
             </button>
           </div>
@@ -130,15 +149,28 @@ export default function Uninstall() {
       </div>
 
       {(!list || loading) && <EmptyState icon={<IconBox size={32} />} busy={loading} title={loading ? "正在整理应用列表" : "只留下你需要的应用"} description={loading ? "正在读取应用名称、大小与图标，请稍候。" : "获取应用列表后，按大小排序或搜索名称，选择要卸载的应用。"} />}
-      {list?.json && <div className="collection-toolbar"><div><strong>{sorted.length}</strong> 个应用 <span className="note">· 已选 {selectedApps.length} 个</span></div><input className="text app-search" aria-label="搜索应用" placeholder="搜索应用名称…" value={query} onChange={(e) => setQuery(e.target.value)} /></div>}
-      {list?.json && visibleApps.length === 0 && <EmptyState icon={<IconSearch size={28} />} title={query ? "没有匹配的应用" : "暂无可卸载应用"} description={query ? "试试其他名称，或清空搜索条件。" : "你可以重新获取列表。"} />}
+      {list?.json && !loading && <>
+        <div className="collection-toolbar">
+          <div className="selection-summary"><strong>{sorted.length}</strong> 个应用 <span className="note">· 已选 {selectedApps.length} 个</span></div>
+          <div className="collection-controls"><input className="text app-search" aria-label="搜索应用" placeholder="搜索名称或 bundle ID…" value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} />{query && <button className="btn small" onClick={() => { setQuery(""); setPage(1); }}>清空搜索</button>}</div>
+        </div>
+        <div className="selection-tools">
+          <button className={`btn small ${onlySelected ? "primary" : ""}`} aria-pressed={onlySelected} onClick={() => { setOnlySelected((value) => !value); setPage(1); }}>仅看已选</button>
+          <button className="btn small" disabled={selectedApps.length === 0 || running} onClick={() => { setSelected(new Set()); setPage(1); }}>清空选择</button>
+          <span className="note" role="status">筛选结果 {visibleApps.length} 个{outsideFilterCount > 0 ? ` · 当前筛选外已选 ${outsideFilterCount} 个，卸载时仍会包含` : ""}</span>
+        </div>
+      </>}
+      {list?.json && !loading && visibleApps.length === 0 && <>
+        <EmptyState icon={<IconSearch size={28} />} title={onlySelected && selectedApps.length === 0 ? "还未选择应用" : query ? "没有匹配的应用" : "暂无可卸载应用"} description={onlySelected ? "返回全部应用，选择需要卸载的应用。" : query ? "试试其他名称，或清空搜索条件。" : "你可以重新获取列表。"} />
+        {(onlySelected || query) && <button className="btn" onClick={showAll}>查看全部应用</button>}
+      </>}
 
-      {list?.json && (
-        <div className="app-grid" style={{ marginBottom: 14 }}>
-          {visibleApps.map((a) => {
+      {list?.json && !loading && (
+        <div ref={grid} className="app-grid" role="group" aria-label={`应用列表，第 ${currentPage} 页`} tabIndex={-1} style={{ marginBottom: 14 }}>
+          {pageApps.map((a) => {
             const on = selected.has(a.path);
             return (
-              <button type="button" disabled={running} aria-pressed={on} key={a.path || a.name} className={`app-card ${on ? "selected" : ""}`} onClick={() => toggle(a.path)}>
+              <button type="button" disabled={running} aria-pressed={on} aria-label={`${on ? "取消选择" : "选择"} ${a.name}`} key={a.path || a.name} className={`app-card ${on ? "selected" : ""}`} onClick={() => toggle(a.path)}>
                 {icons[a.path] ? (
                   <img src={icons[a.path]} alt="" />
                 ) : (
@@ -163,6 +195,15 @@ export default function Uninstall() {
           })}
         </div>
       )}
+
+      {list?.json && !loading && visibleApps.length > 0 && <nav className="list-pagination" aria-label="应用列表分页">
+        <span className="note" role="status">显示 {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, visibleApps.length)} 项，共 {visibleApps.length} 项</span>
+        <div className="row wrap">
+          <button className="btn small" disabled={currentPage === 1} onClick={() => changePage(currentPage - 1)}>上一页</button>
+          <select className="text page-select" aria-label="应用列表页码" value={currentPage} onChange={(e) => changePage(Number(e.target.value))}>{Array.from({ length: pageCount }, (_, index) => <option key={index + 1} value={index + 1}>第 {index + 1} / {pageCount} 页</option>)}</select>
+          <button className="btn small" disabled={currentPage === pageCount} onClick={() => changePage(currentPage + 1)}>下一页</button>
+        </div>
+      </nav>}
 
       {list && !list.json && (
         <div className="card">

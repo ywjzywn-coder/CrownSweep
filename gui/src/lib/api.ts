@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { AnalyzeResult, parseAnalyzeResult } from "./analyze";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 
 export interface EngineInfo {
@@ -50,9 +51,10 @@ export const api = {
   statusStart: () => invoke<void>("status_start"),
   statusStop: () => invoke<void>("status_stop"),
   statusSnapshot: () => invoke<Json>("status_snapshot"),
-  analyzeRun: (path: string) => invoke<Json>("analyze_run", { path }),
+  analyzeRun: async (path: string, taskId?: string): Promise<AnalyzeResult> => parseAnalyzeResult(await invoke<unknown>("analyze_run", { path, taskId })),
   historyRun: () => invoke<Json>("history_run"),
-  cleanPreview: () => invoke<CleanPreview>("clean_preview"),
+  cleanPreview: (taskId?: string) => invoke<CleanPreview>("clean_preview", { taskId }),
+  scanCancel: (id: string) => invoke<void>("scan_cancel", { id }),
   whitelistList: () => invoke<string[]>("whitelist_list"),
   whitelistAdd: (pattern: string) => invoke<string[]>("whitelist_add", { pattern }),
   whitelistRemove: (pattern: string) => invoke<string[]>("whitelist_remove", { pattern }),

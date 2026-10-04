@@ -69,10 +69,105 @@ it('cancellation remains cancelled even when the engine exits zero', async () =>
   await output('Proceed with uninstallation? [y/N] '); await click('取消卸载');
   await act(async () => bridge.handlers['pty-exit']({id, code: 0}));
   expect(host.textContent).toContain('已取消');
+  expect(host.querySelector('.job-status-icon')?.textContent).toBe('—');
 });
 it('parses current ANSI prompts but ignores historical prompt text', () => {
   expect(jobPrompt('\x1b[32mPassword:\x1b[0m ')?.kind).toBe('password');
   expect(jobPrompt('Password:\r\nWorking')).toBeNull();
   expect(jobPrompt('Remove 2 apps, 22MB [Running]  Enter confirm, ESC cancel:')?.choices[0].label).toBe('确认卸载');
   expect(plainOutput('\x1b]0;title\x07hello')).toBe('hello');
+});
+
+it('stops a running process and keeps cancellation when exit is zero', async () => {
+  const phase = vi.fn();
+  await act(async () => root.render(<TaskProgress program="fixture" args={[]} runToken={1} stopToken={1} onPhaseChange={phase} onExit={done}/>));
+  expect(atob(bridge.write.mock.calls[0][1])).toBe('\x03');
+  await output('Stopped');
+  await act(async () => bridge.handlers['pty-exit']({id, code: 0}));
+  expect(phase).toHaveBeenLastCalledWith('cancelled');
+  expect(host.querySelector('.job-status-icon')?.textContent).toBe('—');
+});
+
+it('does not resurrect a cancelled task when exit arrives before write resolves', async () => {
+  let resolveWrite!: () => void;
+  bridge.write.mockImplementationOnce(() => new Promise<void>(resolve => { resolveWrite = resolve; }));
+  await output('Proceed with uninstallation? [y/N] ');
+  await click('取消卸载');
+  await act(async () => bridge.handlers['pty-exit']({id, code: 0}));
+  await act(async () => resolveWrite());
+  expect(host.textContent).toContain('已取消');
+  expect(host.textContent).not.toContain('正在停止');
+});
+it('preserves a completed task when an acknowledgement arrives after exit', async () => {
+  let resolveWrite!: () => void;
+  bridge.write.mockImplementationOnce(() => new Promise<void>(resolve => { resolveWrite = resolve; }));
+  await output('Press Enter to continue:'); await click('继续');
+  await act(async () => bridge.handlers['pty-exit']({id, code: 0}));
+  await act(async () => resolveWrite());
+  expect(host.textContent).toContain('任务已结束');
+  expect(host.textContent).not.toContain('正在处理');
+});
+it('keeps the next confirmation waiting when it arrives before input resolves', async () => {
+  let resolveWrite!: () => void;
+  bridge.write.mockImplementationOnce(() => new Promise<void>(resolve => { resolveWrite = resolve; }));
+  await output('Proceed with uninstallation? [y/N] ');
+  await click('扫描关联文件');
+  await output('Remove 1 app, 12MB Enter confirm, ESC cancel: ');
+  await act(async () => resolveWrite());
+  expect(host.textContent).toContain('确认卸载');
+  expect(host.querySelector('.job-status')?.classList.contains('phase-waiting')).toBe(true);
+});
+it('keeps the terminal outcome when a stop request rejects after exit', async () => {
+  let rejectWrite!: (error: Error) => void;
+  bridge.write.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectWrite = reject; }));
+  await act(async () => root.render(<TaskProgress program="fixture" args={[]} runToken={1} stopToken={1} onExit={done}/>));
+  await act(async () => bridge.handlers['pty-exit']({id, code: 0}));
+  await act(async () => rejectWrite(new Error('session closed')));
+  expect(host.textContent).toContain('已取消');
+  expect(host.textContent).not.toContain('停止失败');
+});
+it('ignores a late password prompt after stopping', async () => {
+  const onOutput = vi.fn();
+  await act(async () => root.render(<TaskProgress program="fixture" args={[]} runToken={1} stopToken={1} onOutput={onOutput} onAttention={attention}/>));
+  await output('Password:');
+  expect(onOutput).not.toHaveBeenCalled(); expect(attention).not.toHaveBeenCalled();
+  expect(host.querySelector('input[type=password]')).toBeNull();
+  expect(host.textContent).toContain('正在停止');
+});
+
+it('keeps a live session active when deferred stop input fails after spawn', async () => {
+  let resolveStart!: () => void;
+  bridge.start.mockImplementationOnce(() => new Promise<void>(resolve => { resolveStart = resolve; }));
+  bridge.write.mockRejectedValueOnce(new Error('write refused'));
+  await act(async () => root.render(<TaskProgress program="fixture" args={[]} runToken={2} stopToken={0} onExit={done}/>));
+  id = bridge.start.mock.calls[1][0] as string;
+  await act(async () => root.render(<TaskProgress program="fixture" args={[]} runToken={2} stopToken={1} onExit={done}/>));
+  await act(async () => resolveStart());
+  expect(done).not.toHaveBeenCalled();
+  expect(host.textContent).toContain('停止失败');
+  expect(host.querySelector('.job-status')?.classList.contains('phase-running')).toBe(true);
+  await output('Still running');
+  expect(done).not.toHaveBeenCalled();
+});
+it('does not restore an old confirmation when its write rejects after a newer stop', async () => {
+  let rejectWrite!: (error: Error) => void;
+  bridge.write.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectWrite = reject; }));
+  await output('Proceed with uninstallation? [y/N] ');
+  await click('扫描关联文件');
+  await act(async () => root.render(<TaskProgress program="fixture" args={[]} runToken={1} stopToken={1} onExit={done}/>));
+  await act(async () => rejectWrite(new Error('old write failed')));
+  expect(host.textContent).toContain('正在停止');
+  expect(host.querySelector('.job-prompt')).toBeNull();
+  await act(async () => bridge.handlers['pty-exit']({id, code: 0}));
+  expect(host.textContent).toContain('已取消');
+});
+it('does not restore the previous prompt when input rejects after newer output', async () => {
+  let rejectWrite!: (error: Error) => void;
+  bridge.write.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectWrite = reject; }));
+  await output('Proceed with uninstallation? [y/N] ');
+  await click('扫描关联文件');
+  await output('Remove 1 app, 12MB Enter confirm, ESC cancel: ');
+  await act(async () => rejectWrite(new Error('old write failed')));
+  expect(host.textContent).toContain('确认卸载');
+  expect(host.querySelector('.job-prompt')?.textContent).not.toContain('扫描关联文件');
 });

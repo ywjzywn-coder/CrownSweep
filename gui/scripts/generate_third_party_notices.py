@@ -75,6 +75,8 @@ def github_license_overrides(package: dict, base: pathlib.Path) -> list[tuple[by
         "https://github.com/dropbox/rust-alloc-no-stdlib": ["LICENSE"],
         "https://github.com/madsmtm/objc2": ["LICENSE.md"],
         "https://github.com/knurling-rs/defmt": ["LICENSE-MIT", "LICENSE-APACHE"],
+        "https://github.com/tauri-apps/tauri": ["LICENSE-MIT", "LICENSE-APACHE-2.0"],
+        "https://github.com/tauri-apps/plugins-workspace": ["LICENSE_MIT", "LICENSE_APACHE-2.0"],
     }.get(repo)
     if not names:
         raise RuntimeError("Unreviewed package with no license file: " + package["name"])

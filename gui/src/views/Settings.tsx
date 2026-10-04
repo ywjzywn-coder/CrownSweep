@@ -4,24 +4,29 @@ import { useApp } from "../App";
 import { MoleLogo, IconRefresh, IconDownload, IconUpload, IconTerminal, IconCpu } from "../components/icons";
 import { api } from "../lib/api";
 import { version } from "../../package.json";
-import gplText from "../../LICENSE?raw";
-import noticesText from "../../THIRD_PARTY_NOTICES.md?raw";
-import thirdPartyText from "../../licenses/THIRD_PARTY_LICENSES.txt?raw";
-
-const legalDocuments = {
-  gpl: { title: "GPLv3", text: gplText },
-  notices: { title: "第三方声明", text: noticesText },
-  dependencies: { title: "依赖许可证", text: thirdPartyText },
-};
+import { legalDocuments, type LegalDocumentKey } from "../lib/legalDocuments";
+import AppUpdateCard from "../components/AppUpdateCard";
 
 export default function Settings() {
-  const { engine, engineChecked, refreshEngine, openTask, isTagRunning } = useApp();
+  const { engine, engineChecked, refreshEngine, openTask, isTagRunning, taskRunning } = useApp();
   const installRunning = isTagRunning("settings-install");
   const updateRunning = isTagRunning("settings-update");
   const touchIdRunning = isTagRunning("settings-touchid");
   const [nightly, setNightly] = useState(false);
   const [touchId, setTouchId] = useState<boolean | null>(null);
-  const [legalView, setLegalView] = useState<keyof typeof legalDocuments | null>(null);
+  const [legalView, setLegalView] = useState<LegalDocumentKey | null>(null);
+  const [legalText, setLegalText] = useState<string | null>(null);
+  const [legalError, setLegalError] = useState(false);
+  const [legalRetry, setLegalRetry] = useState(0);
+
+  useEffect(() => {
+    let active = true;
+    setLegalText(null); setLegalError(false);
+    if (legalView) legalDocuments[legalView].load().then(text => {
+      if (active) setLegalText(text);
+    }).catch(() => { if (active) setLegalError(true); });
+    return () => { active = false; };
+  }, [legalView, legalRetry]);
 
   useEffect(() => {
     api
@@ -86,11 +91,13 @@ export default function Settings() {
 
   return (
     <div>
-      <PageHeader eyebrow="PREFERENCES" title="设置" description="管理 Mole 引擎，查看连接状态与应用信息。" />
+      <PageHeader eyebrow="PREFERENCES" title="设置" description="检查应用更新，管理 Mole 引擎与授权，查看版本和许可证。" />
+
+      <AppUpdateCard busy={taskRunning} />
 
       <div className="settings-status"><div className={`status-orb ${engine ? "connected" : ""}`}><IconTerminal size={28} /></div><div><h2>{engine ? "引擎已就绪" : engineChecked ? "连接你的 Mole 引擎" : "正在检测引擎"}</h2><p>{engine ? `Mole ${engine.version} · 已连接本机引擎` : "安装或检测引擎后，即可开始维护 Mac。"}</p></div><span className={`badge ${engine ? "green" : "yellow"}`}>{engine ? "已连接" : "待连接"}</span></div>
       <div className="card">
-        <h3>引擎管理</h3>
+        <h3>Mole 引擎管理</h3>
         {engine ? (
           <table className="list">
             <tbody>
@@ -161,7 +168,11 @@ export default function Settings() {
             <button className="btn small" key={key} aria-expanded={legalView === key} aria-controls="legal-document" onClick={() => setLegalView(legalView === key ? null : key)}>{legalDocuments[key].title}</button>
           ))}
         </div>
-        {legalView && <pre id="legal-document" className="legal-text" tabIndex={0} aria-label={legalDocuments[legalView].title}>{legalDocuments[legalView].text}</pre>}
+        {legalView && <div id="legal-document" aria-live="polite">
+          {legalError ? <div className="error-box" role="alert">许可证加载失败。<button className="btn small" onClick={() => setLegalRetry(value => value + 1)}>重试加载</button></div>
+            : legalText === null ? <p className="note">正在加载{legalDocuments[legalView].title}…</p>
+            : <pre className="legal-text" tabIndex={0} aria-label={legalDocuments[legalView].title}>{legalText}</pre>}
+        </div>}
       </div>
     </div>
   );

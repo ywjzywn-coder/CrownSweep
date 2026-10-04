@@ -46,6 +46,7 @@ jobs:
           npm test
           npm run build
           python3 scripts/test_release.py
+          python3 scripts/test_updater.py
           cargo test --lib --locked --manifest-path src-tauri/Cargo.toml
       - name: Build native App (validation only)
         run: npm run tauri -- build --bundles app

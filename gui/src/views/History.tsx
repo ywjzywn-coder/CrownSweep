@@ -12,14 +12,20 @@ export default function History() {
   const [data, setData] = useState<HistoryData>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadedAt, setLoadedAt] = useState<Date | null>(null);
+  const [stale, setStale] = useState(false);
 
   const load = async () => {
+    if (loading || !engine) return;
     setLoading(true);
     setError(null);
     try {
       setData(await api.historyRun());
+      setLoadedAt(new Date());
+      setStale(false);
     } catch (e) {
       setError(String(e));
+      setStale(data !== null);
     } finally {
       setLoading(false);
     }
@@ -49,11 +55,11 @@ export default function History() {
       <PageHeader eyebrow="ACTIVITY" title="操作历史" description="回顾每一次维护，查看操作记录与删除明细。" />
       <EngineNotice />
 
-      {error && <div className="error-box">{error}</div>}
+      {error && <div className="error-box" role="alert"><div className="row wrap"><strong>{data ? "刷新历史失败" : "历史加载失败"}</strong><button className="btn small" onClick={load} disabled={loading || !engine}>重试加载</button></div><div>{error}</div></div>}
 
       <div className="action-bar">
         <button className="btn primary" onClick={load} disabled={loading || !engine}>
-          {loading ? <span className="spin" /> : <IconClock size={14} />} 加载历史
+          {loading ? <span className="spin" /> : <IconClock size={14} />} {loading ? "正在读取…" : data ? "刷新历史" : "加载历史"}
         </button>
         {data && (
           <span className="note">
@@ -62,7 +68,8 @@ export default function History() {
         )}
       </div>
 
-      {!data && <EmptyState icon={<IconClock size={32} />} busy={loading} title={loading ? "正在读取维护记录" : "每次维护，都有迹可循"} description="点击「加载历史」查看之前的操作。首次使用时，记录会在完成维护后出现。" />}
+      {data && loadedAt && <div className="history-refresh-state" role="status">{stale && <span className="badge yellow">旧数据</span>}<span>最后成功读取：<time dateTime={loadedAt.toISOString()}>{loadedAt.toLocaleString("zh-CN", { hour12: false })}</time>{loading ? " · 正在刷新，暂时显示上次结果。" : stale ? " · 本次刷新未成功，下方保留上次结果。" : ""}</span></div>}
+      {!data && <EmptyState icon={<IconClock size={32} />} busy={loading} title={loading ? "正在读取维护记录" : error ? "暂时无法读取历史" : "每次维护，都有迹可循"} description={error ? "查看错误信息后，点击「重试加载」。" : "点击「加载历史」查看之前的操作。首次使用时，记录会在完成维护后出现。"} />}
       {data && <div className="summary-strip"><div><span>操作记录</span><strong>{sessions.length}<small> 次</small></strong></div><div><span>删除明细</span><strong>{deletions.length}<small> 条</small></strong></div></div>}
       {data && (
         <>

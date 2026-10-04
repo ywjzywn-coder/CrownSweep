@@ -1,4 +1,5 @@
 mod engine;
+mod updates;
 
 use serde_json::Value;
 use tauri::AppHandle;
@@ -42,10 +43,11 @@ where
 }
 
 #[tauri::command]
-async fn analyze_run(path: String) -> Result<Value, String> {
+async fn analyze_run(path: String, task_id: Option<String>) -> Result<Value, String> {
+    let scan = tasks::begin_scan(task_id)?;
     engine_job(move || {
         let engine = engine::engine()?;
-        tasks::analyze(&engine.path, &path)
+        tasks::analyze(&engine.path, &path, &scan)
     })
     .await
 }
@@ -60,12 +62,18 @@ async fn history_run() -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn clean_preview() -> Result<tasks::CleanPreview, String> {
+async fn clean_preview(task_id: Option<String>) -> Result<tasks::CleanPreview, String> {
+    let scan = tasks::begin_scan(task_id)?;
     engine_job(move || {
         let engine = engine::engine()?;
-        tasks::clean_preview(&engine.path)
+        tasks::clean_preview(&engine.path, &scan)
     })
     .await
+}
+
+#[tauri::command]
+fn scan_cancel(id: String) -> Result<(), String> {
+    tasks::cancel_scan(&id)
 }
 
 #[tauri::command]
@@ -159,7 +167,10 @@ fn reveal_path(path: String) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .setup(|_app| {
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || updates::cleanup_previous_backups(&handle));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -175,6 +186,7 @@ pub fn run() {
             analyze_run,
             history_run,
             clean_preview,
+            scan_cancel,
             uninstall_list,
             app_icon,
             whitelist_list,
@@ -189,6 +201,10 @@ pub fn run() {
             pty_kill,
             home_dir,
             reveal_path,
+            updates::app_update_check,
+            updates::app_update_install,
+            updates::app_update_restart,
+            updates::app_update_open_release,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -196,6 +212,7 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { .. } => {
                 engine::status::stop();
                 pty::kill_all();
+                tasks::kill_all_scans();
             }
             tauri::RunEvent::Exit => {
                 let _ = app_handle;

@@ -1,7 +1,7 @@
 {
   "name": "mole-gui",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "CrownSweep — an independent macOS GUI powered by tw93/Mole",
   "type": "module",
   "scripts": {

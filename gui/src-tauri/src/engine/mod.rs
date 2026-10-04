@@ -2,6 +2,7 @@
 // This GUI only discovers the engine, parses its stable JSON interfaces,
 // and drives its interactive wizards through a pty terminal.
 
+pub mod activity;
 pub mod detect;
 pub mod icons;
 pub mod pty;

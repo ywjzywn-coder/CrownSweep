@@ -4,6 +4,9 @@ import { api, EngineInfo, onEvent } from "./lib/api";
 import { MoleLogo, IconGauge, IconSparkles, IconBox, IconPie, IconBolt, IconClock, IconSliders, IconTerminal } from "./components/icons";
 import ConfirmDialog from "./components/ConfirmDialog";
 import TaskProgress from "./components/TaskProgress";
+import ScanProgress from "./components/ScanProgress";
+import { ScanProvider, useScans } from "./lib/scanTasks";
+import { isTaskActive, taskPhaseLabel, type TaskPhase } from "./lib/taskResults";
 import { isPasswordPrompt } from "./lib/terminalPrompt";
 import Dashboard from "./views/Dashboard";
 import Clean from "./views/Clean";
@@ -18,6 +21,7 @@ type Snapshot = any;
 
 export interface TaskSpec {
   id: string;
+  startedAt?: number;
   /** drawer title, e.g. "空间清理" */
   title: string;
   /** optional hint line in the drawer header */
@@ -85,6 +89,11 @@ const VIEWS: { key: string; icon: () => JSX.Element; label: string; el: () => JS
 const MAX_POINTS = 120;
 
 export default function App() {
+  return <ScanProvider><AppContent /></ScanProvider>;
+}
+
+function AppContent() {
+  const { scans, cancelScan, dismissScan } = useScans();
   const [view, setView] = useState("dashboard");
   const [visitedViews, setVisitedViews] = useState(() => new Set(["dashboard"]));
   const navigate = useCallback((key: string) => {
@@ -137,6 +146,7 @@ export default function App() {
         else if (s === "stopped") setWatchState((prev) => (prev === "live" ? "stopped" : prev === "idle" ? "idle" : "stopped"));
       }),
       onEvent<string>("engine-error", (msg) => setEngineError(String(msg))),
+      onEvent<{ id: string; error: string }>("pty-error", ({ error }) => setEngineError(`任务异常：${error}`)),
     ];
     return () => {
       unlisteners.forEach((p) => void p.then((u) => (u as () => void)()));
@@ -157,9 +167,23 @@ export default function App() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [taskStatus, setTaskStatus] = useState<Record<string, "running" | number>>({});
   const [taskOpen, setTaskOpen] = useState(true);
+  const [taskPhases, setTaskPhases] = useState<Record<string, TaskPhase>>({});
+  const phaseRef = useRef<Record<string, TaskPhase>>({});
+  const [stopTokens, setStopTokens] = useState<Record<string, number>>({});
+  const seenScans = useRef(new Set<string>());
+  useEffect(() => {
+    const added = scans.filter(scan => !seenScans.current.has(scan.id));
+    seenScans.current = new Set(scans.map(scan => scan.id));
+    const interaction = Object.values(phaseRef.current).some(phase => phase === "waiting");
+    if (added.length && !interaction && (!activeTaskId || !taskOpen)) {
+      setActiveTaskId(added[added.length - 1].id);
+      if (!activeTaskId) setTaskOpen(false);
+    }
+  }, [scans, activeTaskId, taskOpen]);
   const [needsPwIds, setNeedsPwIds] = useState<Set<string>>(new Set());
   const [closeAskId, setCloseAskId] = useState<string | null>(null);
   const sessionsRef = useRef<Record<string, string>>({});
+  const closeAfterExit = useRef(new Set<string>());
   const tasksRef = useRef<TaskSpec[]>([]);
   tasksRef.current = tasks;
   const needsPwRef = useRef<Set<string>>(new Set());
@@ -175,17 +199,25 @@ export default function App() {
     const id = crypto.randomUUID();
     const next = [
       ...tasksRef.current.filter((t) => !(t.tag != null && t.tag === spec.tag && taskStatus[t.id] !== "running")),
-      { ...spec, id },
+      { ...spec, id, startedAt: Date.now() },
     ];
     setTasks(next);
     tasksRef.current = next;
-    setTaskStatus((prev) => ({ ...prev, [id]: "running" }));
+    const kept = new Set(next.map(task => task.id));
+    setTaskStatus(previous => ({ ...Object.fromEntries(Object.entries(previous).filter(([key]) => kept.has(key))), [id]: "running" }));
+    phaseRef.current = Object.fromEntries(Object.entries(phaseRef.current).filter(([key]) => kept.has(key)));
+    setTaskPhases(phaseRef.current);
+    setStopTokens(previous => Object.fromEntries(Object.entries(previous).filter(([key]) => kept.has(key))));
     setActiveTaskId(id);
     setTaskOpen(spec.mode !== "background");
     void getCurrentWindow().setFocus().catch(() => {});
   }, [taskStatus]);
 
   const removeTask = useCallback((id: string) => {
+    closeAfterExit.current.delete(id);
+    delete phaseRef.current[id];
+    setTaskPhases(previous => { const next = { ...previous }; delete next[id]; return next; });
+    setStopTokens(previous => { const next = { ...previous }; delete next[id]; return next; });
     needsPwRef.current.delete(id);
     setNeedsPwIds(new Set(needsPwRef.current));
     // Unmounting its TaskProgress kills the session's pty.
@@ -208,17 +240,27 @@ export default function App() {
     setNeedsPwIds(new Set(needsPwRef.current));
   }, []);
 
+  const handleTaskPhase = useCallback((taskId: string, phase: TaskPhase) => {
+    phaseRef.current[taskId] = phase;
+    setTaskPhases(previous => previous[taskId] === phase ? previous : ({ ...previous, [taskId]: phase }));
+  }, []);
+
   const handleTaskExit = useCallback((taskId: string, code: number) => {
     clearTaskPrompt(taskId);
     setTaskStatus((prev) => ({ ...prev, [taskId]: code }));
+    const known = phaseRef.current[taskId];
+    if (!known || isTaskActive(known)) handleTaskPhase(taskId, known === "stopping" ? "cancelled" : code === 0 ? "completed" : "failed");
     const spec = tasksRef.current.find((t) => t.id === taskId);
     spec?.onExit?.(code);
+    if (closeAfterExit.current.has(taskId)) removeTask(taskId);
 
-  }, [removeTask, clearTaskPrompt]);
+  }, [clearTaskPrompt, handleTaskPhase, removeTask]);
 
   // Sudo authorization surfaces as a password prompt or the Touch ID flow —
   // pop the drawer open and switch to that task so the user can act on it.
   const handleTaskOutput = useCallback((taskId: string, tail: string) => {
+    const phase = phaseRef.current[taskId];
+    if (phase && (phase === "stopping" || !isTaskActive(phase))) return;
     if (!isPasswordPrompt(tail)) return;
     if (needsPwRef.current.has(taskId)) return;
     needsPwRef.current.add(taskId);
@@ -228,19 +270,38 @@ export default function App() {
   }, []);
 
   const interruptTask = useCallback((taskId: string) => {
-    // Gentle stop: Ctrl+C lets wizards clean up their alternate screen.
-    const ptyId = sessionsRef.current[taskId];
-    if (!ptyId) return;
-    const bytes = new TextEncoder().encode("\u0003");
-    let bin = "";
-    bytes.forEach((b) => (bin += String.fromCharCode(b)));
-    void api.ptyWrite(ptyId, btoa(bin));
+    setStopTokens(previous => ({ ...previous, [taskId]: (previous[taskId] ?? 0) + 1 }));
   }, []);
 
-  const taskRunning = tasks.some((t) => taskStatus[t.id] === "running" || taskStatus[t.id] === undefined);
-  const runningCount = tasks.filter((t) => taskStatus[t.id] === "running" || taskStatus[t.id] === undefined).length;
+  const endAndClose = (taskId: string) => {
+    // Keep the panel and installation gate alive until the whole process group exits.
+    closeAfterExit.current.add(taskId);
+    interruptTask(taskId);
+    const sessionId = sessionsRef.current[taskId];
+    if (sessionId) void api.ptyKill(sessionId).catch(error => setEngineError(`结束任务失败：${String(error)}`));
+  };
+
+  const scanRunning = scans.some(scan => scan.status === "running" || scan.status === "cancelling");
+  const taskRunning = scanRunning || tasks.some(t => taskStatus[t.id] === "running" || taskStatus[t.id] === undefined);
+  const runningCount = scans.filter(scan => scan.status === "running" || scan.status === "cancelling").length
+    + tasks.filter(t => taskStatus[t.id] === "running" || taskStatus[t.id] === undefined).length;
   const anyNeedsPw = tasks.some((t) => taskStatus[t.id] === "running" && needsPwIds.has(t.id));
-  const activeTask = tasks.find((t) => t.id === activeTaskId) ?? tasks[tasks.length - 1] ?? null;
+  const allTasks = [
+    ...tasks.map(task => ({ id: task.id, title: task.title, note: task.note, startedAt: task.startedAt ?? 0, kind: "pty" as const,
+      phase: taskPhases[task.id] ?? ((taskStatus[task.id] ?? "running") === "running" ? "running" : taskStatus[task.id] === 0 ? "completed" : "failed") as TaskPhase })),
+    ...scans.map(scan => ({ id: scan.id, title: scan.title, note: scan.detail, startedAt: scan.startedAt, kind: "scan" as const,
+      phase: (scan.status === "cancelling" ? "stopping" : scan.status) as TaskPhase })),
+  ].sort((a, b) => a.startedAt - b.startedAt);
+  const activeTask = allTasks.find(task => task.id === activeTaskId) ?? allTasks[allTasks.length - 1] ?? null;
+  const closeFinishedTask = (id: string) => {
+    if (scans.some(scan => scan.id === id)) dismissScan(id);
+    else removeTask(id);
+  };
+  const stopActive = () => {
+    if (!activeTask) return;
+    if (activeTask.kind === "scan") void cancelScan(activeTask.id).catch(() => {});
+    else interruptTask(activeTask.id);
+  };
   const isTagRunning = useCallback(
     (tag: string) => tasks.some((t) => t.tag === tag && (taskStatus[t.id] === "running" || taskStatus[t.id] === undefined)),
     [tasks, taskStatus],
@@ -342,6 +403,8 @@ export default function App() {
           </header>
           <main className="main" ref={mainRef} id="main-content">
             <div className="page-content">
+              {engineError && <div className="error-box engine-alert" role="alert"><span>{engineError}</span>
+                <button type="button" className="btn small" onClick={() => setEngineError(null)}>关闭提示</button></div>}
               {/* Keep visited pages mounted so pending jobs and PTYs survive navigation.
                   Unvisited pages stay unmounted to avoid eager API calls. */}
               {VIEWS.filter((item) => visitedViews.has(item.key)).map((item) => (
@@ -351,7 +414,7 @@ export default function App() {
               ))}
             </div>
           </main>
-          {tasks.length > 0 && activeTask && (
+          {allTasks.length > 0 && activeTask && (
             <section className={`task-drawer ${taskOpen ? "" : "collapsed"}`} aria-label="运行中的任务">
               <header className="task-drawer-head">
                 <button
@@ -366,46 +429,25 @@ export default function App() {
                   </svg>
                 </button>
                 <div className="task-tabs" role="tablist" aria-label="任务列表">
-                  {tasks.map((t) => {
-                    const st = taskStatus[t.id] ?? "running";
-                    const isActive = t.id === activeTask.id;
-                    return (
-                      <button
-                        key={t.id}
-                        type="button"
-                        role="tab"
-                        aria-selected={isActive}
-                        className={`task-tab ${isActive ? "on" : ""} ${needsPwIds.has(t.id) && st === "running" ? "pw" : ""}`}
-                        onClick={() => setActiveTaskId(t.id)}
-                      >
-                        {t.title}
-                        {st === "running" ? (
-                          needsPwIds.has(t.id) ? (
-                            <span className="dot pw" />
-                          ) : (
-                            <span className="dot run" />
-                          )
-                        ) : st === 0 ? (
-                          <span className="dot ok" />
-                        ) : (
-                          <span className="dot err" />
-                        )}
-                      </button>
-                    );
-                  })}
+                  {allTasks.map(task => (
+                    <button key={task.id} type="button" role="tab" aria-selected={task.id === activeTask.id}
+                      aria-label={`${task.title} · ${taskPhaseLabel[task.phase]}`}
+                      className={`task-tab ${task.id === activeTask.id ? "on" : ""}`}
+                      onClick={() => setActiveTaskId(task.id)}>
+                      {task.title}
+                      <span className={`dot ${task.phase === "waiting" ? "pw" : task.phase === "running" || task.phase === "stopping" ? "run" : task.phase === "completed" ? "ok" : task.phase === "cancelled" ? "cancelled" : task.phase === "review" ? "review" : "err"}`} aria-hidden="true" />
+                    </button>
+                  ))}
                 </div>
                 {activeTask.note && taskOpen && <span className="drawer-note">{activeTask.note}</span>}
                 <div className="grow" />
-                {(taskStatus[activeTask.id] ?? "running") === "running" && (
-                  <button type="button" className="btn small" onClick={() => interruptTask(activeTask.id)}>
-                    停止任务
+                {isTaskActive(activeTask.phase) && (
+                  <button type="button" className="btn small" onClick={stopActive} disabled={activeTask.phase === "stopping"}>
+                    {activeTask.phase === "stopping" ? "正在停止…" : "停止任务"}
                   </button>
                 )}
-                <button
-                  type="button"
-                  className="btn small danger"
-                  onClick={() => ((taskStatus[activeTask.id] ?? "running") === "running" ? setCloseAskId(activeTask.id) : removeTask(activeTask.id))}
-                >
+                <button type="button" className="btn small danger" disabled={activeTask.kind === "scan" && isTaskActive(activeTask.phase)}
+                  onClick={() => (isTaskActive(activeTask.phase) ? setCloseAskId(activeTask.id) : closeFinishedTask(activeTask.id))}>
                   关闭
                 </button>
               </header>
@@ -417,8 +459,13 @@ export default function App() {
                         program={t.program}
                         args={t.args}
                         runToken={1}
+                        stopToken={stopTokens[t.id] ?? 0}
+                        onPhaseChange={phase => handleTaskPhase(t.id, phase)}
                         registerSession={(id) => {
-                          if (id) sessionsRef.current[t.id] = id;
+                          if (id) {
+                            sessionsRef.current[t.id] = id;
+                            if (closeAfterExit.current.has(t.id)) void api.ptyKill(id).catch(error => setEngineError(`结束任务失败：${String(error)}`));
+                          }
                           else delete sessionsRef.current[t.id];
                         }}
                         onAttention={() => { setActiveTaskId(t.id); setTaskOpen(true); }}
@@ -428,6 +475,9 @@ export default function App() {
                       />
                     </div>
                   ))}
+                  {scans.map(scan => <div key={scan.id} className="task-pane" hidden={scan.id !== activeTask.id}>
+                    <ScanProgress scan={scan} onNavigate={() => { navigate(scan.tag === "analyze" ? "analyze" : "clean"); setTaskOpen(false); }} />
+                  </div>)}
                 </div>
             </section>
           )}
@@ -437,10 +487,10 @@ export default function App() {
           title="任务仍在运行"
           danger
           confirmText="结束并关闭"
-          onConfirm={() => { if (closeAskId) removeTask(closeAskId); setCloseAskId(null); }}
+          onConfirm={() => { if (closeAskId) endAndClose(closeAskId); setCloseAskId(null); }}
           onCancel={() => setCloseAskId(null)}
         >
-          结束后无法撤销已经完成的步骤。建议先点击「停止任务」，等待引擎退出。
+          结束后无法撤销已经完成的步骤。面板将在引擎及其子进程退出后关闭；若无法结束，将保留错误提示。
         </ConfirmDialog>
       </div>
     </Ctx.Provider>
