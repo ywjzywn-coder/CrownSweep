@@ -216,7 +216,7 @@ button.btn.primary {
   font-weight: 600;
 }
 button.btn.primary svg { opacity: 1; }
-button.btn.primary:not(:disabled):hover { filter: brightness(1.07); }
+button.btn.primary:not(:disabled):hover { background: var(--accent); filter: brightness(1.07); }
 button.btn.danger { border-color: rgba(229, 83, 75, 0.5); color: var(--red); }
 button.btn.danger:not(:disabled):hover { background: rgba(229, 83, 75, 0.12); }
 button.btn.small { height: 30px; padding: 0 10px; font-size: 11.5px; border-radius: 7px; }
