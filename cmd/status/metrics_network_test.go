@@ -312,3 +312,90 @@ func TestCollectNetworkDefaultTunnel(t *testing.T) {
 		}
 	}
 }
+
+func TestCollectNetworkKeepsIdleDefaultInterface(t *testing.T) {
+	original := ioCountersFunc
+	t.Cleanup(func() { ioCountersFunc = original })
+	const mb = 1024 * 1024
+	// Kernel order on Apple silicon: Thunderbolt ports come before Wi-Fi en0.
+	names := []string{"en4", "en5", "en6", "en1", "en0"}
+	counters := make([]gopsutilnet.IOCountersStat, len(names))
+	for i, name := range names {
+		counters[i] = gopsutilnet.IOCountersStat{Name: name, BytesRecv: 100 * mb, BytesSent: 100 * mb}
+	}
+	ioCountersFunc = func(bool) ([]gopsutilnet.IOCountersStat, error) {
+		return append([]gopsutilnet.IOCountersStat(nil), counters...), nil
+	}
+	now := time.Now()
+	c := &Collector{prevNet: make(map[string]gopsutilnet.IOCountersStat), defaultNetInterface: "en0", cachedNetIPs: map[string]string{}, lastNetIPAt: now}
+	c.primeNetworkCounters(now)
+	names3 := func(got []NetworkStatus) string {
+		var out []string
+		for _, n := range got {
+			out = append(out, n.Name)
+		}
+		return strings.Join(out, ",")
+	}
+
+	// Every interface idle: tie order is unspecified, but the routed one stays.
+	now = now.Add(time.Second)
+	if got := c.collectNetwork(now); len(got) != 3 || !strings.Contains(","+names3(got)+",", ",en0,") {
+		t.Fatalf("idle routed interface dropped: %s", names3(got))
+	}
+	// Three busier interfaces keep their order; the routed one still shows.
+	for i := range 3 {
+		counters[i].BytesRecv += uint64(3-i) * mb
+	}
+	now = now.Add(time.Second)
+	if got := names3(c.collectNetwork(now)); got != "en4,en5,en0" {
+		t.Fatalf("busy interfaces pushed out the routed one: %s", got)
+	}
+}
+
+func TestNetworkCardShowsRoutedInterfaceIP(t *testing.T) {
+	ipLine := func(rows []NetworkStatus) string {
+		card := renderNetworkCard(rows, NetworkHistory{}, ProxyStatus{}, 40)
+		return card.lines[len(card.lines)-1]
+	}
+	wifi := NetworkStatus{Name: "en0", IP: "192.0.2.10"}
+	ethernet := NetworkStatus{Name: "en7", IP: "198.51.100.7"}
+
+	routedEthernet := ethernet
+	routedEthernet.defaultRoute = true
+	if got := ipLine([]NetworkStatus{wifi, routedEthernet}); got != "198.51.100.7" {
+		t.Fatalf("routed Ethernet IP not shown: %q", got)
+	}
+	if got := ipLine([]NetworkStatus{routedEthernet}); got != "198.51.100.7" {
+		t.Fatalf("routed adapter without en0 shows no IP: %q", got)
+	}
+	// A routed tunnel's address is not the LAN IP; keep en0.
+	tunnel := NetworkStatus{Name: "utun4", IP: "100.64.0.2", defaultRoute: true, defaultTunnel: true}
+	if got := ipLine([]NetworkStatus{tunnel, wifi}); got != "192.0.2.10" {
+		t.Fatalf("routed tunnel replaced the LAN IP: %q", got)
+	}
+	// Unknown route keeps the en0 fallback.
+	if got := ipLine([]NetworkStatus{ethernet, wifi}); got != "192.0.2.10" {
+		t.Fatalf("en0 fallback lost: %q", got)
+	}
+}
+
+func TestCollectNetworkMarksRoutedInterface(t *testing.T) {
+	original := ioCountersFunc
+	t.Cleanup(func() { ioCountersFunc = original })
+	ioCountersFunc = func(bool) ([]gopsutilnet.IOCountersStat, error) {
+		return []gopsutilnet.IOCountersStat{{Name: "en0"}, {Name: "en7"}}, nil
+	}
+	now := time.Now()
+	c := &Collector{
+		prevNet:             make(map[string]gopsutilnet.IOCountersStat),
+		defaultNetInterface: "en7",
+		cachedNetIPs:        map[string]string{"en0": "192.0.2.10", "en7": "198.51.100.7"},
+		lastNetIPAt:         now,
+	}
+	c.primeNetworkCounters(now)
+	got := c.collectNetwork(now.Add(time.Second))
+	card := renderNetworkCard(got, NetworkHistory{}, ProxyStatus{}, 40)
+	if line := card.lines[len(card.lines)-1]; line != "198.51.100.7" {
+		t.Fatalf("collected rows lost the routed interface: %+v, IP line %q", got, line)
+	}
+}

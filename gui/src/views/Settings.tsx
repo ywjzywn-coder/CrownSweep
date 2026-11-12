@@ -161,7 +161,7 @@ export default function Settings() {
           <br />
           <br />
           © 2026 ellaycrown 和 CrownSweep 贡献者。按 GPLv3 发布，不提供担保。上游及依赖的版权和许可证见下方声明。
-          引擎提示适配已针对 Mole 1.56.1 验证，升级引擎后需重新检查兼容性。
+          引擎提示适配基线为 Mole 1.71.0，升级引擎后需重新检查兼容性。
         </p>
         <div className="legal-actions" aria-label="开源许可证">
           {(Object.keys(legalDocuments) as (keyof typeof legalDocuments)[]).map(key => (

@@ -23,6 +23,58 @@ VERSION="1.2.3"
 MOLE
 }
 
+@test "quiet installer loggers do not abort errexit callers" {
+	local logger failed=0
+	for logger in log_info log_success log_warning log_admin log_confirm; do
+		run env PROJECT_ROOT="$PROJECT_ROOT" LOGGER="$logger" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mole_source_installer
+# The source helper restores options captured in command substitution, which
+# disables errexit in Bash 3.2. Restore the real installer's execution mode.
+set -e
+VERBOSE=0
+"$LOGGER" 'hidden message'
+printf 'continued\n'
+EOF
+		if [[ "$status" -ne 0 || "$output" != continued ]]; then
+			printf '%s exited %s instead of continuing silently: %s\n' "$logger" "$status" "$output"
+			failed=1
+		fi
+	done
+	[ "$failed" -eq 0 ]
+}
+
+@test "quiet installer update with a custom prefix finishes and writes its receipt" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mole_source_installer
+set -e
+INSTALL_DIR="$HOME/custom-prefix/bin"
+CONFIG_DIR="$HOME/config"
+SOURCE_DIR="$HOME/source"
+MOLE_INSTALL_RECEIPT=update-123-456-789
+updated=false
+check_requirements() { :; }
+homebrew_owns_mole() { return 1; }
+resolve_source_dir() { :; }
+get_installed_version() { if [[ "$updated" == true ]]; then echo 1.59.2; else echo 1.59.1; fi; }
+get_source_version() { echo 1.59.2; }
+create_directories() { mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"; }
+acquire_install_lock() { :; }
+install_files() { updated=true; }
+verify_installation() { :; }
+resolve_install_channel() { echo stable; }
+# A bare call preserves errexit, unlike invoking the update in an if/|| test.
+[[ ":$PATH:" != *":$INSTALL_DIR:"* ]] || exit 1
+perform_update
+[[ "$VERBOSE" -eq 1 && "$updated" == true ]] || exit 1
+grep -qx 'CHANNEL=stable' "$CONFIG_DIR/install_channel" || exit 1
+grep -qx 'INSTALL_RECEIPT=update-123-456-789' "$CONFIG_DIR/install_channel" || exit 1
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Updated to latest version, 1.59.2"* ]] || return 1
+}
+
 @test "download_binary installs release asset only after checksum verification" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -428,6 +480,56 @@ EOF
 	[[ "$output" == *"SUCCESS:Installed status from V1.2.2"* ]]
 }
 
+@test "download_binary falls back to git release tag when API tag lookup fails" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mole_source_installer
+
+INSTALL_DIR="$HOME/install"
+CONFIG_DIR="$HOME/config"
+SOURCE_DIR="$HOME/source"
+VERBOSE=1
+GREEN='' BLUE='' YELLOW='' RED='' NC=''
+ICON_SUCCESS='ok'
+ICON_ERROR='err'
+
+start_line_spinner() { :; }
+stop_line_spinner() { :; }
+log_success() { echo "SUCCESS:$*"; }
+log_warning() { echo "WARNING:$*"; }
+log_error() { echo "ERROR:$*"; }
+get_latest_release_tag() { return 1; }
+get_latest_release_tag_from_git() { echo "V1.2.2"; }
+verify_release_attestation() { return 2; }
+
+content="fallback-binary"
+asset="status-darwin-$(uname -m | sed 's/x86_64/amd64/')"
+hash=$(printf '%s' "$content" | shasum -a 256 | awk '{print $1}')
+curl() {
+	local out="" url=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-o) out="$2"; shift 2 ;;
+			http*) url="$1"; shift ;;
+			*) shift ;;
+		esac
+	done
+	case "$url" in
+		*"V1.2.3/${asset}") return 22 ;;
+		*"V1.2.2/${asset}") printf '%s' "$content" > "$out" ;;
+		*"V1.2.2/SHA256SUMS") printf '%s  %s\n' "$hash" "$asset" > "$out" ;;
+		*) return 1 ;;
+	esac
+}
+
+download_binary "status"
+grep -q "fallback-binary" "$CONFIG_DIR/bin/status-go"
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"SUCCESS:Installed status from V1.2.2"* ]]
+}
+
 @test "download_binary aborts on fallback-tag checksum mismatch without a source build" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -492,6 +594,129 @@ EOF
 	[[ "$output" == *"aborting instead of falling back"* ]] || return 1
 }
 
+@test "install_files preserves literal shell and sed characters in config paths" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mole_source_installer
+SOURCE_DIR="$HOME/source"
+INSTALL_DIR="$HOME/install"
+CONFIG_DIR="$HOME/"'config &|"$HOME" `printf BACKTICK` $(printf SUBSTITUTED) \ end'"'quote"
+mkdir -p "$CONFIG_DIR/bin" "$CONFIG_DIR/lib"
+printf '%s\n' '#!/bin/bash' 'SCRIPT_DIR="old"' > "$SOURCE_DIR/mole"
+resolve_source_dir() { :; }
+needs_sudo() { return 1; }
+maybe_sudo() { "$@"; }
+download_binary() { return 0; }
+install_files
+actual=$(/bin/bash -c 'source "$1"; printf "%s" "$SCRIPT_DIR"' _ "$INSTALL_DIR/mole")
+[[ "$actual" == "$CONFIG_DIR" ]] || { printf 'WRONG:%s\nEXPECTED:%s\n' "$actual" "$CONFIG_DIR"; exit 1; }
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "install_files replaces read-only files an earlier sudo install left in the config tree" {
+	# A root-owned bin/ or lib/ file inside a user-owned directory cannot be
+	# opened for writing by plain cp -r. The copy failed, install_files carried
+	# on, and mo update printed success beside a stale file (1.67.0 update).
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -uo pipefail
+mole_source_installer
+SOURCE_DIR="$HOME/source"
+INSTALL_DIR="$HOME/install"
+CONFIG_DIR="$HOME/config"
+mkdir -p "$SOURCE_DIR/bin" "$SOURCE_DIR/lib/manage" "$CONFIG_DIR/bin" "$CONFIG_DIR/lib/manage" "$INSTALL_DIR"
+printf '%s\n' '#!/bin/bash' 'SCRIPT_DIR="old"' > "$SOURCE_DIR/mole"
+printf '%s\n' 'new bin' > "$SOURCE_DIR/bin/clean.sh"
+printf '%s\n' 'new lib' > "$SOURCE_DIR/lib/manage/remove.sh"
+printf '%s\n' 'stale bin' > "$CONFIG_DIR/bin/clean.sh"
+printf '%s\n' 'stale lib' > "$CONFIG_DIR/lib/manage/remove.sh"
+chmod 444 "$CONFIG_DIR/bin/clean.sh" "$CONFIG_DIR/lib/manage/remove.sh"
+resolve_source_dir() { :; }
+needs_sudo() { return 1; }
+maybe_sudo() { "$@"; }
+download_binary() { return 0; }
+install_files > /dev/null 2>&1 || true
+[[ "$(cat "$CONFIG_DIR/bin/clean.sh")" == "new bin" ]] || { echo "bin file stayed stale"; exit 1; }
+[[ "$(cat "$CONFIG_DIR/lib/manage/remove.sh")" == "new lib" ]] || { echo "lib file stayed stale"; exit 1; }
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "install_files keeps the pinned launcher and names a safe next step when a config directory refuses the copy" {
+	# cp -f cannot unlink inside a directory the user cannot write, which is
+	# what a root-owned lib/<subdir> from an earlier sudo install looks like.
+	# The copy must fail before the launcher is replaced, so the old pinned
+	# launcher keeps working, and the next step must quote the path and only
+	# suggest a recursive chown on the default config root, never on a shared
+	# custom one such as ~/.local.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -uo pipefail
+mole_source_installer
+resolve_source_dir() { :; }
+needs_sudo() { return 1; }
+maybe_sudo() { "$@"; }
+download_binary() { return 0; }
+SOURCE_DIR="$HOME/source"
+mkdir -p "$SOURCE_DIR/bin" "$SOURCE_DIR/lib/manage"
+printf '%s\n' '#!/bin/bash' 'SCRIPT_DIR="$(dirname "$0")"' 'new launcher' > "$SOURCE_DIR/mole"
+printf '%s\n' 'new bin' > "$SOURCE_DIR/bin/clean.sh"
+printf '%s\n' 'new lib' > "$SOURCE_DIR/lib/manage/remove.sh"
+for CONFIG_DIR in "$HOME/.config/mole" "$HOME/shared root"; do
+    INSTALL_DIR="$HOME/install"
+    rm -rf "$INSTALL_DIR"
+    mkdir -p "$CONFIG_DIR/bin" "$CONFIG_DIR/lib/manage" "$INSTALL_DIR"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_DIR=/pinned/config' 'old launcher' > "$INSTALL_DIR/mole"
+    printf '%s\n' 'stale lib' > "$CONFIG_DIR/lib/manage/remove.sh"
+    chmod 444 "$CONFIG_DIR/lib/manage/remove.sh"
+    chmod 555 "$CONFIG_DIR/lib/manage"
+    rc=0
+    out=$(install_files 2>&1) || rc=$?
+    chmod 755 "$CONFIG_DIR/lib/manage"
+    printf 'config=%s rc=%s\n%s\n' "$CONFIG_DIR" "$rc" "$out"
+    [[ "$rc" -eq 1 ]] || exit 1
+    grep -q '^old launcher$' "$INSTALL_DIR/mole" || { echo "launcher was replaced"; exit 1; }
+    grep -q '^SCRIPT_DIR=/pinned/config$' "$INSTALL_DIR/mole" || { echo "launcher lost its pin"; exit 1; }
+    [[ "$out" == *"Could not replace Mole files in $CONFIG_DIR/lib"* ]] || exit 1
+done
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"sudo chown -R $(id -un) $HOME/.config/mole/lib && mo update"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *'find '*'shared\ root/lib ! -user '* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"chown -R $(id -un) $HOME/shared"* ]] || { echo "$output"; return 1; }
+}
+
+@test "get_installed_version fallback reads VERSION past a pinned line that is not UTF-8" {
+	# A UTF-8 printf %q pinned non-ASCII config paths as raw lead bytes plus \NNN
+	# escapes. A UTF-8 sed stops at that line, before the VERSION line the
+	# fallback needs. The plain pin is the control.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mole_source_installer
+run_install_probe_with_timeout() { return 124; }
+for name in plain hybrid; do
+	INSTALL_DIR="$HOME/install-$name"
+	mkdir -p "$INSTALL_DIR"
+	{
+		printf '%s\n' '#!/bin/bash'
+		if [[ "$name" == hybrid ]]; then
+			# shellcheck disable=SC2016 # The pinned line is data, not an expansion.
+			printf 'SCRIPT_DIR=$'\''%s/\344\270\\211'\''\n' "$HOME"
+		else
+			printf 'SCRIPT_DIR=%s/config\n' "$HOME"
+		fi
+		printf '%s\n' 'VERSION="1.2.3"'
+	} > "$INSTALL_DIR/mole"
+	chmod +x "$INSTALL_DIR/mole"
+	[[ "$(get_installed_version)" == "1.2.3" ]] || { printf 'NO_VERSION:%s\n' "$name"; exit 1; }
+done
+EOF
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+}
+
 @test "install_files fails closed when sudo is unavailable, even under || caller (#update-incident)" {
 	# Old moles invoke `install_files || {...}`, which disables errexit inside
 	# the function. Uncached `sudo -n` then failed on every copy while the
@@ -511,9 +736,13 @@ GREEN='' BLUE='' YELLOW='' RED='' NC=''
 ICON_SUCCESS='ok' ICON_ERROR='err' ICON_ADMIN='adm'
 MOLE_ASSUME_SUDO_AUTH=1
 
-mkdir -p "$CONFIG_DIR" "$SOURCE_DIR"
+mkdir -p "$CONFIG_DIR/bin" "$CONFIG_DIR/lib/core" "$SOURCE_DIR/lib/core"
 printf '#!/bin/bash\nVERSION="9.9.9"\n' > "$SOURCE_DIR/mole"
 printf '#!/bin/bash\n' > "$SOURCE_DIR/mo"
+# A refused sudo must leave the old modules whole, not an old launcher over
+# new ones, so the gate has to run before the module copy.
+printf 'new lib\n' > "$SOURCE_DIR/lib/core/common.sh"
+printf 'old lib\n' > "$CONFIG_DIR/lib/core/common.sh"
 # Non-writable install dir: needs_sudo must answer true for a plain user.
 mkdir -m 555 "$INSTALL_DIR"
 
@@ -528,10 +757,12 @@ sudo() {
 
 # Reproduce the exact caller shape from the update flow.
 install_files || echo "HANDLED_FAILURE"
+echo "CONFIG_LIB:$(cat "$CONFIG_DIR/lib/core/common.sh")"
 EOF
 
 	[ "$status" -eq 0 ] || return 1
 	[[ "$output" == *"HANDLED_FAILURE"* ]] || return 1
+	[[ "$output" == *"CONFIG_LIB:old lib"* ]] || { echo "$output"; return 1; }
 	[[ "$output" == *"sudo -v && mo update"* ]] || return 1
 	[[ "$output" != *"SUCCESS:Installed mole"* ]] || return 1
 	[[ "$output" != *"DOWNLOAD_CALLED"* ]] || return 1
@@ -1119,6 +1350,8 @@ printf 'release-binary' > "$file"
 hash="$(printf 'release-binary' | shasum -a 256 | awk '{print $1}')"
 download_release_checksums() { printf '%s  %s\n' "$hash" "$asset" > "$2"; return 0; }
 
+# Each case uses a distinct tag: one run caches the fetched SHA256SUMS and its
+# attestation per tag, so the same tag would reuse the earlier verdict.
 # attestation verification failed (status 1) -> fatal, never installs
 verify_release_attestation() { return 1; }
 out="$(verify_release_asset_checksum V1.0.0 "$asset" "$file")" && rc=0 || rc=$?
@@ -1127,18 +1360,18 @@ out="$(verify_release_asset_checksum V1.0.0 "$asset" "$file")" && rc=0 || rc=$?
 
 # cannot verify (status 2) + MOLE_REQUIRE_ATTESTATION=1 -> fatal
 verify_release_attestation() { return 2; }
-out="$(MOLE_REQUIRE_ATTESTATION=1 verify_release_asset_checksum V1.0.0 "$asset" "$file")" && rc=0 || rc=$?
+out="$(MOLE_REQUIRE_ATTESTATION=1 verify_release_asset_checksum V1.0.1 "$asset" "$file")" && rc=0 || rc=$?
 [ "$rc" -eq 1 ] || { echo "WRONG: require-gate rc=$rc want 1"; exit 1; }
 [[ "$out" == *"ERROR:MOLE_REQUIRE_ATTESTATION=1 set but gh"* ]] || { echo "WRONG: require-gate error missing: $out"; exit 1; }
 
 # cannot verify (status 2) without the gate -> falls back to checksum-only
 verify_release_attestation() { return 2; }
-out="$(verify_release_asset_checksum V1.0.0 "$asset" "$file")" && rc=0 || rc=$?
+out="$(verify_release_asset_checksum V1.0.2 "$asset" "$file")" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "WRONG: checksum-only rc=$rc want 0"; exit 1; }
 
 # attestation verified (status 0) + checksum match -> success with combined label
 verify_release_attestation() { return 0; }
-out="$(verify_release_asset_checksum V1.0.0 "$asset" "$file")" && rc=0 || rc=$?
+out="$(verify_release_asset_checksum V1.0.3 "$asset" "$file")" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "WRONG: verified rc=$rc want 0"; exit 1; }
 [[ "$out" == *"SUCCESS:Verified ${asset} · sha256 + attestation"* ]] || { echo "WRONG: verified success missing: $out"; exit 1; }
 
@@ -1356,4 +1589,242 @@ EOF
 		echo "frames=$frames"
 		return 1
 	}
+}
+
+@test "get_latest_release_tag_from_git ignores Windows CLI tags" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mole_source_installer
+git() {
+	printf '%s\trefs/tags/%s\n' \
+		aaaa V1.59.1 \
+		bbbb V1.60.0 \
+		cccc V1.60.0-windows \
+		dddd V1.61.0-windows \
+		ffff V1.62.0-linux \
+		eeee v1.30.0-windows
+}
+get_latest_release_tag_from_git
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[ "$output" = "V1.60.0" ]
+}
+
+@test "installer never runs the system git stub without the Command Line Tools" {
+	local fake_bin="$HOME/fake-bin-git-stub"
+	mkdir -p "$fake_bin"
+	cat > "$fake_bin/git" <<'SCRIPT'
+#!/bin/bash
+echo ran >> "$HOME/git-ran"
+printf '%s\trefs/tags/V1.61.0\n' deadbeef
+SCRIPT
+	cat > "$fake_bin/xcode-select" <<'SCRIPT'
+#!/bin/bash
+exit "${XCODE_RC:-2}"
+SCRIPT
+	chmod +x "$fake_bin/git" "$fake_bin/xcode-select"
+
+	for xcode_rc in 2 0; do
+		rm -f "$HOME/git-ran"
+		run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$fake_bin:$PATH" XCODE_RC="$xcode_rc" FAKE_BIN="$fake_bin" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mole_source_installer
+INSTALLER_SYSTEM_GIT_STUB="$FAKE_BIN/git"
+INSTALLER_XCODE_SELECT_BIN="$FAKE_BIN/xcode-select"
+printf 'tag=%s\n' "$(get_latest_release_tag_from_git || true)"
+EOF
+		[ "$status" -eq 0 ] || return 1
+		if [[ "$xcode_rc" == 2 ]]; then
+			[[ "$output" == "tag=" ]] || return 1
+			[[ ! -e "$HOME/git-ran" ]] || return 1
+		else
+			[[ "$output" == "tag=V1.61.0" ]] || return 1
+			[[ -e "$HOME/git-ran" ]] || return 1
+		fi
+	done
+}
+
+@test "get_latest_release_tag rejects non-macOS release tags" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mole_source_installer
+curl() {
+	printf '{"tag_name": "V1.60.0-windows"}\n'
+}
+if get_latest_release_tag; then
+	exit 1
+fi
+EOF
+
+	[ "$status" -eq 0 ]
+}
+
+@test "get_latest_release_tag accepts plain macOS release tags" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mole_source_installer
+curl() {
+	printf '{"tag_name": "V1.60.0"}\n'
+}
+get_latest_release_tag
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[ "$output" = "V1.60.0" ]
+}
+
+@test "download_binary names the GitHub download as the cause when the helper cannot be fetched or built" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF2'
+set -uo pipefail
+mole_source_installer
+
+INSTALL_DIR="$HOME/install"
+CONFIG_DIR="$HOME/config"
+SOURCE_DIR="$HOME/source"
+VERBOSE=1
+GREEN='' BLUE='' YELLOW='' RED='' NC=''
+start_line_spinner() { :; }
+stop_line_spinner() { :; }
+log_success() { echo "SUCCESS:$*"; }
+log_warning() { echo "WARNING:$*"; }
+log_error() { echo "ERROR:$*"; }
+get_latest_release_tag() { echo "V1.2.3"; }
+get_source_version() { echo "1.2.3"; }
+build_binary_from_source() { return 1; }
+curl_download_with_retry() { return 22; }
+
+rc=0
+download_binary "analyze" || rc=$?
+echo "RC=$rc"
+EOF2
+
+	[[ "$output" == *"RC=1"* ]] || {
+		echo "$output"
+		return 1
+	}
+	[[ "$output" == *"ERROR:Failed to install analyze binary"* ]] || {
+		echo "$output"
+		return 1
+	}
+	[[ "$output" == *"github.com did not complete"* && "$output" == *"run mo update again"* ]] || {
+		echo "$output"
+		return 1
+	}
+}
+
+@test "a failed source archive download blames the network before the tag" {
+	run awk '
+		/^[[:space:]]*#/ { next }
+		/Could not download Mole \$\{branch\} from GitHub/ { net = NR }
+		/confirm the tag exists/ { tag = NR }
+		/Check if tag exists/ { stale = 1 }
+		END { exit (!net || !tag || tag <= net || stale) }
+	' "$PROJECT_ROOT/install.sh"
+
+	[ "$status" -eq 0 ]
+}
+
+@test "installer warns instead of uninstalling a Homebrew Mole it did not invoke" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mole_source_installer
+
+log_error() { printf 'ERROR:%s\n' "$*"; }
+log_warning() { printf 'WARNING:%s\n' "$*"; }
+log_info() { :; }
+run_install_probe_with_timeout() {
+	[[ "$1" == 2 && "$2" == "/usr/bin/sw_vers" ]] || return 98
+	printf '14.0\n'
+}
+INSTALL_DIR="$HOME/manual/bin"
+mkdir -p "$INSTALL_DIR" "$HOME/fakebrew/Cellar/mole" "$HOME/fake-bin"
+cp "$PROJECT_ROOT/mole" "$INSTALL_DIR/mole"
+chmod +x "$INSTALL_DIR/mole"
+# The active mole is the manual copy above; brew's Cellar exists separately.
+cat > "$HOME/fake-bin/brew" << 'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$BREW_TRACE"
+exit 0
+STUB
+chmod +x "$HOME/fake-bin/brew"
+export BREW_TRACE="$HOME/brew.calls"
+export PATH="$HOME/manual/bin:$HOME/fake-bin:/usr/bin:/bin"
+export HOMEBREW_PREFIX="$HOME/fakebrew"
+ACTION=install
+OSTYPE=darwin23
+check_requirements
+printf 'CONTINUED=yes\n'
+if [[ -s "$BREW_TRACE" ]]; then
+	printf 'BREW_CALLED:%s\n' "$(cat "$BREW_TRACE")"
+	exit 1
+fi
+EOF
+
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+	[[ "$output" == *"CONTINUED=yes"* ]] || return 1
+	[[ "$output" == *"Homebrew"* ]] || return 1
+	[[ "$output" == *"brew uninstall --force mole"* ]] || return 1
+	[[ "$output" != *"BREW_CALLED"* ]]
+}
+
+@test "release verification fetches SHA256SUMS and its attestation once per tag" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mole_source_installer
+
+log_success() { echo "SUCCESS:$*"; }
+log_error() { echo "ERROR:$*"; }
+start_line_spinner() { :; }
+stop_line_spinner() { :; }
+
+analyze_content='analyze-binary'
+status_content='status-binary'
+analyze_hash=$(printf '%s' "$analyze_content" | shasum -a 256 | awk '{print $1}')
+status_hash=$(printf '%s' "$status_content" | shasum -a 256 | awk '{print $1}')
+
+checksums_calls=0
+attestation_calls=0
+download_release_checksums() {
+	checksums_calls=$((checksums_calls + 1))
+	printf '%s  analyze-darwin-arm64\n%s  status-darwin-arm64\n' "$analyze_hash" "$status_hash" > "$2"
+}
+verify_release_attestation() {
+	attestation_calls=$((attestation_calls + 1))
+	return 0
+}
+calculate_file_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+
+analyze_file="$HOME/analyze-darwin-arm64"
+status_file="$HOME/status-darwin-arm64"
+printf '%s' "$analyze_content" > "$analyze_file"
+printf '%s' "$status_content" > "$status_file"
+
+verify_release_asset_checksum V1.2.3 analyze-darwin-arm64 "$analyze_file"
+verify_release_asset_checksum V1.2.3 status-darwin-arm64 "$status_file"
+printf 'SAME_TAG_COUNTS=%s,%s\n' "$checksums_calls" "$attestation_calls"
+
+# A different tag is a different checksums file and attestation.
+verify_release_asset_checksum V1.2.2 analyze-darwin-arm64 "$analyze_file"
+printf 'NEW_TAG_COUNTS=%s,%s\n' "$checksums_calls" "$attestation_calls"
+
+# The cache must not weaken the per-asset checksum comparison.
+printf 'tampered' > "$status_file"
+if verify_release_asset_checksum V1.2.3 status-darwin-arm64 "$status_file"; then
+	printf 'TAMPERED_ACCEPTED\n'
+	exit 1
+fi
+printf 'TAMPER_REJECTED=yes\n'
+EOF
+
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+	[[ "$output" == *"SAME_TAG_COUNTS=1,1"* ]] || return 1
+	[[ "$output" == *"NEW_TAG_COUNTS=2,2"* ]] || return 1
+	[[ "$output" == *"TAMPER_REJECTED=yes"* ]] || return 1
 }

@@ -34,6 +34,98 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 EOF
 }
 
+run_privileged_trash_deadline_fixture() {
+    run env PROJECT_ROOT="$PROJECT_ROOT" STALL_AT="$1" MOLE_TIMEOUT_DISK_VERIFY_SEC=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+export HOME="$SANDBOX/home"
+mkdir -p "$HOME/.Trash" "$SANDBOX/bin" "$SANDBOX/victim" "$SANDBOX/stage"
+chmod 700 "$HOME/.Trash"
+printf 'payload\n' > "$SANDBOX/victim/data"
+source "$PROJECT_ROOT/lib/core/common.sh"
+cat > "$SANDBOX/bin/sudo" <<'MOCK'
+#!/bin/bash
+[[ "$1" == -n ]] || exit 97
+shift
+command_name="$1"
+shift
+for arg in "$@"; do
+    case "$arg" in /*) [[ "$arg" == "$SANDBOX/"* ]] || exit 98 ;; esac
+done
+printf '%s %s\n' "$command_name" "$*" >> "$SANDBOX/sudo-trace"
+stall() { /usr/bin/perl -e '$SIG{TERM} = "IGNORE"; sleep 5;'; }
+case "$command_name" in
+    /bin/mv)
+        [[ "$STALL_AT" == stage-before ]] && stall
+        /bin/mv "$@" || exit $?
+        [[ "$STALL_AT" == stage-after ]] && stall
+        exit 0 ;;
+    /usr/sbin/chown)
+        if [[ "$STALL_AT" == payload-owner && "$1" == -Rhx ]] ||
+            [[ "$STALL_AT" == stage-owner && "$1" != -Rhx ]]; then stall; fi
+        exit 0 ;;
+    /bin/chmod)
+        [[ "$STALL_AT" == stage-mode ]] && stall
+        exit 0 ;;
+    /bin/rmdir | /bin/rm) exec "$command_name" "$@" ;;
+    *) exit 99 ;;
+esac
+MOCK
+cat > "$SANDBOX/bin/mv" <<'MOCK'
+#!/bin/bash
+[[ "$1" == -n && "$2" == "$SANDBOX/stage/item" && "$3" == "$HOME/.Trash/victim" ]] || exit 97
+printf 'final\n' >> "$SANDBOX/final-trace"
+if [[ "$STALL_AT" == final ]]; then
+    /usr/bin/perl -e '$SIG{TERM} = "IGNORE"; sleep 5;'
+fi
+exec /bin/mv "$@"
+MOCK
+chmod +x "$SANDBOX/bin/sudo" "$SANDBOX/bin/mv"
+export PATH="$SANDBOX/bin:$PATH"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE MOLE_TEST_TRASH_DIR
+_mole_create_privileged_trash_stage() { printf '%s\n' "$SANDBOX/stage"; }
+_mole_privileged_path_has_mutable_ancestor() { return 1; }
+_mole_trash_target_still_safe() { [[ "$1" == "$SANDBOX/victim" ]]; }
+_mole_owned_path_still_valid() { [[ "$1" == "$SANDBOX/victim" ]]; }
+# Both old direct calls and new timed calls resolve the same fixture command.
+# This mapper does not add a deadline: only production calls to
+# run_with_timeout can reach the real timeout wrapper below.
+function /bin/mv() { "$SANDBOX/bin/mv" "$@"; }
+eval "$(declare -f run_with_timeout | sed '1s/run_with_timeout/_fixture_run_with_timeout/')"
+run_with_timeout() {
+    local duration="$1"
+    shift
+    if [[ "$1" == /bin/mv ]]; then
+        shift
+        _fixture_run_with_timeout "$duration" "$SANDBOX/bin/mv" "$@"
+    else
+        _fixture_run_with_timeout "$duration" "$@"
+    fi
+}
+rc=0
+_mole_move_path_to_user_trash "$SANDBOX/victim" true || rc=$?
+printf 'MOVE_STATUS=%s\n' "$rc"
+[[ -s "$SANDBOX/sudo-trace" ]] || exit 1
+mole_rc_timeout "$rc" || exit 1
+if [[ "$STALL_AT" == stage-before ]]; then
+    [[ -f "$SANDBOX/victim/data" && ! -e "$SANDBOX/stage/item" ]] || exit 1
+else
+    [[ ! -e "$SANDBOX/victim" && -f "$SANDBOX/stage/item/data" ]] || exit 1
+fi
+[[ ! -e "$HOME/.Trash/victim" ]] || exit 1
+if [[ "$STALL_AT" == final ]]; then
+    [[ -s "$SANDBOX/final-trace" ]] || exit 1
+else
+    [[ ! -e "$SANDBOX/final-trace" ]] || exit 1
+fi
+printf 'bounded-%s payload-preserved\n' "$STALL_AT"
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"bounded-$1 payload-preserved"* ]] || return 1
+    if [[ "$1" != stage-before ]]; then
+        [[ "$output" == *"item preserved for recovery at: $SANDBOX/stage/item"* ]] || return 1
+    fi
+}
+
 # Exercise the real result handling with only a sandboxed AppleScript fixture.
 run_finder_result_fixture() {
     mkdir -p "$SANDBOX/FinderFixture.app"
@@ -68,6 +160,30 @@ EOF
     [[ "$output" != *"FINDER_STDOUT_MUST_STAY_HIDDEN"* ]] || return 1
     [[ "$output" != *"Finder fixture diagnostic"* ]] || return 1
     [[ -s "$SANDBOX/finder-script" ]]
+}
+
+@test "real privileged Trash sink bounds staging before the rename" {
+    run_privileged_trash_deadline_fixture stage-before
+}
+
+@test "real privileged Trash sink preserves a rename completed before timeout" {
+    run_privileged_trash_deadline_fixture stage-after
+}
+
+@test "real privileged Trash sink bounds staging mode repair" {
+    run_privileged_trash_deadline_fixture stage-mode
+}
+
+@test "real privileged Trash sink bounds recursive payload ownership repair" {
+    run_privileged_trash_deadline_fixture payload-owner
+}
+
+@test "real privileged Trash sink bounds staging ownership handoff" {
+    run_privileged_trash_deadline_fixture stage-owner
+}
+
+@test "real privileged Trash sink bounds the final user move" {
+    run_privileged_trash_deadline_fixture final
 }
 
 @test "mole_delete defaults to permanent mode and removes the target" {
@@ -386,6 +502,16 @@ EOF
 
     mkdir -p "$fake_home" "$victim"
     printf 'payload' > "$victim/data.txt"
+    # shellcheck disable=SC2016 # The executable resolves only sandbox paths at runtime.
+    mole_test_fake_command sudo '
+[[ "${1:-}" == -n ]] && shift
+command_name="$1"
+shift
+for arg in "$@"; do
+    case "$arg" in /*) [[ "$arg" == "$SANDBOX/"* ]] || exit 97 ;; esac
+done
+printf "%s %s\n" "$command_name" "$*" >> "$SANDBOX/recovery-sudo.log"
+"$command_name" "$@"'
 
     run /bin/bash --noprofile --norc <<EOF
 $(prelude)
@@ -398,11 +524,6 @@ _mole_create_privileged_trash_stage() {
     command chmod 500 "$fake_home/.Trash"
     mkdir -p "$stage"
     printf '%s\n' "$stage"
-}
-sudo() {
-    [[ "\${1:-}" == "-n" ]] && shift
-    printf '%s\n' "\$*" >> "$trace"
-    "\$@"
 }
 set +e
 mole_delete "$victim" true
@@ -688,7 +809,7 @@ EOF
     [[ ! -e "$victim" ]] || return 1
     [[ -d "$existing" ]] || return 1
     [[ -n "$(find "$fake_home/.Trash" -mindepth 1 -maxdepth 1 -name 'com.microsoft.Word.*' -print -quit)" ]] || return 1
-    [ "$(stat -f '%Lp' "$fake_home/.Trash")" = "700" ]
+    [ "$(/usr/bin/stat -f '%Lp' "$fake_home/.Trash")" = "700" ]
     [[ "$(grep -c '^trash:' "$trace" 2> /dev/null || true)" -eq 0 ]] || return 1
     [[ "$(grep -c '^osascript:' "$trace" 2> /dev/null || true)" -eq 0 ]]
 }
@@ -721,6 +842,7 @@ EOF
     local trace="$SANDBOX/privacy-denied.log"
     mkdir -p "$victim"
     printf 'document state' > "$victim/state.db"
+    mole_test_fake_command mv 'printf "mv: Operation not permitted\n" >&2; exit 1'
 
     run /bin/bash --noprofile --norc <<EOF
 $(prelude)
@@ -729,10 +851,6 @@ unset MOLE_TEST_NO_AUTH
 export HOME="$fake_home"
 export MOLE_DELETE_MODE=trash
 export MOLE_UNINSTALL_MODE=1
-mv() {
-    printf 'mv: %s: Operation not permitted\n' "\$2" >&2
-    return 1
-}
 trash() {
     printf 'trash\n' >> "$trace"
     return 99
@@ -767,16 +885,13 @@ EOF
     local fake_home="$SANDBOX/home"
     local victim="$fake_home/Library/Group Containers/UBF8T346G9.Office"
     mkdir -p "$victim"
+    mole_test_fake_command mv 'printf "mv: permission denied\n" >&2; exit 1'
 
     run /bin/bash --noprofile --norc <<EOF
 $(prelude)
 unset MOLE_TEST_TRASH_DIR
 unset MOLE_TEST_NO_AUTH
 export HOME="$fake_home"
-mv() {
-    printf 'mv: permission denied\n' >&2
-    return 1
-}
 set +e
 _mole_move_path_to_user_trash "$victim" false
 rc=\$?
@@ -795,6 +910,7 @@ EOF
     local victim="$fake_home/Library/Application Scripts/com.microsoft.Word"
     local trace="$SANDBOX/generic-failure.log"
     mkdir -p "$victim"
+    mole_test_fake_command mv 'printf "mv: input/output error\n" >&2; exit 1'
 
     run /bin/bash --noprofile --norc <<EOF
 $(prelude)
@@ -803,10 +919,6 @@ unset MOLE_TEST_NO_AUTH
 export HOME="$fake_home"
 export MOLE_DELETE_MODE=trash
 export MOLE_UNINSTALL_MODE=1
-mv() {
-    printf 'mv: input/output error\n' >&2
-    return 1
-}
 trash() {
     printf 'trash\n' >> "$trace"
     return 99
@@ -999,6 +1111,60 @@ EOF
     [ "$status_col" = "rejected" ]
 }
 
+@test "validation refusals leave a SKIPPED row with a fixed reason in operations.log" {
+    local victim="$SANDBOX/system-link"
+    ln -s "/System" "$victim"
+    local oplog_home="$SANDBOX/oplog-home"
+    mkdir -p "$oplog_home"
+
+    run env HOME="$oplog_home" /bin/bash --noprofile --norc <<EOF
+$(prelude)
+export MOLE_CURRENT_COMMAND=uninstall
+mole_delete "$victim" || true
+export MOLE_CURRENT_COMMAND=clean
+safe_remove "$victim" true || true
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ -L "$victim" ]] || return 1
+    local oplog="$oplog_home/Library/Logs/mole/operations.log"
+    grep -Fq "] [uninstall] SKIPPED $victim (protected)" "$oplog" || { cat "$oplog"; return 1; }
+    grep -Fq "] [clean] SKIPPED $victim (protected)" "$oplog" || { cat "$oplog"; return 1; }
+}
+
+@test "an unwritable operations.log warns once instead of failing silently" {
+    local oplog_home="$SANDBOX/readonly-oplog-home"
+    mkdir -p "$oplog_home/Library/Logs/mole"
+    : > "$oplog_home/Library/Logs/mole/operations.log"
+    chmod 0444 "$oplog_home/Library/Logs/mole/operations.log"
+
+    run env HOME="$oplog_home" /bin/bash --noprofile --norc <<EOF
+$(prelude)
+log_operation clean REMOVED /tmp/first 1KB
+log_operation clean REMOVED /tmp/second 1KB
+log_operation_session_start clean
+log_operation_session_end clean 2 2
+EOF
+
+    chmod 0644 "$oplog_home/Library/Logs/mole/operations.log"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local warn_count
+    warn_count=$(printf '%s\n' "$output" | grep -c "audit log unavailable" || true)
+    [ "$warn_count" = "1" ] || { echo "$output"; return 1; }
+    [[ ! -s "$oplog_home/Library/Logs/mole/operations.log" ]] || return 1
+}
+
+@test "a test without its own HOME never runs against the account home" {
+    local account account_home=""
+    account="$(id -un)"
+    eval "account_home=~$account"
+    [[ -n "$account_home" && "$HOME" != "$account_home" ]] || {
+        echo "HOME is the account home: $HOME"
+        return 1
+    }
+    [[ "$HOME" == "$BATS_FILE_TMPDIR/"* ]] || return 1
+}
+
 @test "mole_delete dry-run does not touch the filesystem but still logs" {
     local victim="$SANDBOX/dry"
     : > "$victim"
@@ -1042,6 +1208,24 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ ! -s "$MOLE_DELETE_LOG" ]]
+}
+
+@test "mole_delete rejection cannot forge TSV audit records" {
+    run env HOME="$SANDBOX" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/history.sh"
+victim="$SANDBOX/kept"$'\n2026-10-07T10:00:00+0000\ttrash\t999\tok\tforged\r\033'
+touch "$victim"
+if mole_delete "$victim"; then exit 1; fi
+[[ -f "$victim" ]] || exit 1
+history_load_deletions "$MOLE_DELETE_LOG"
+printf 'records=%s\n' "${#HISTORY_DELETE_STATUSES[@]}"
+[[ ${#HISTORY_DELETE_STATUSES[@]} -eq 1 ]] || exit 1
+[[ "${HISTORY_DELETE_STATUSES[0]}" == rejected ]] || exit 1
+[[ "${HISTORY_DELETE_PATHS[0]}" == *'\n2026-'*'\ttrash\t999\tok\tforged\r\x1b' ]] || exit 1
+EOF
+    [ "$status" -eq 0 ]
 }
 
 @test "mole_delete rejects unknown delete mode without touching target" {
@@ -1433,7 +1617,7 @@ EOF
     [ "$status" -eq 0 ]
     # Warning visible exactly once.
     local warn_count
-    warn_count=$(printf '%s\n' "$output" | grep -c "deletions audit log unavailable" || true)
+    warn_count=$(printf '%s\n' "$output" | grep -c "audit log unavailable" || true)
     [ "$warn_count" = "1" ]
 }
 
@@ -1724,4 +1908,106 @@ EOF
     [[ "$output" == *"Privacy & Security > Automation"* ]] || return 1
     [[ "$output" == *"RC=1"* ]] || return 1
     [[ -d "$SANDBOX/FinderFixture.app" ]] || return 1
+}
+
+
+@test "direct Trash batch shares user values while checking every destination" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+export HOME="$SANDBOX/home"
+mkdir -p "$HOME/.Trash" "$SANDBOX/targets"
+chmod 700 "$HOME/.Trash"
+source "$PROJECT_ROOT/lib/core/common.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE MOLE_TEST_TRASH_DIR
+for i in 1 2 3; do touch "$SANDBOX/targets/item-$i"; done
+get_invoking_uid() { echo uid >> "$SANDBOX/uid-calls"; id -u; }
+get_invoking_gid() { echo gid >> "$SANDBOX/gid-calls"; id -g; }
+chmod() { echo mode >> "$SANDBOX/chmod-calls"; command chmod "$@"; }
+date() { echo date >> "$SANDBOX/date-calls"; command date "$@"; }
+_mole_move_to_trash_batch "$SANDBOX/targets/item-1" "$SANDBOX/targets/item-2" "$SANDBOX/targets/item-3" || exit 1
+[[ ${#_MOLE_TRASH_BATCH_MOVED_PATHS[@]} -eq 3 ]] || exit 1
+[[ $(wc -l < "$SANDBOX/uid-calls") -eq 1 && $(wc -l < "$SANDBOX/gid-calls") -eq 1 ]] || exit 1
+[[ ! -e "$SANDBOX/chmod-calls" && ! -e "$SANDBOX/date-calls" ]] || exit 1
+[[ -f "$HOME/.Trash/item-1" && -f "$HOME/.Trash/item-3" ]] || exit 1
+printf 'shared-user-values guarded-moves\n'
+EOF
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"shared-user-values guarded-moves"* ]]
+}
+
+@test "direct Trash batch repairs permissions changed between items" {
+    # shellcheck disable=SC2016 # Paths expand in the fixture subprocess.
+    mole_test_fake_command mv '
+[[ "$1" == -n && "$2" == "$SANDBOX/targets/"* && "$3" == "$HOME/.Trash/"* ]] || exit 97
+/bin/mv "$@" || exit $?
+if [[ "$2" == "$SANDBOX/targets/item-1" ]]; then
+    /bin/chmod 755 "$HOME/.Trash"
+fi'
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+export HOME="$SANDBOX/home"
+mkdir -p "$HOME/.Trash" "$SANDBOX/targets"
+chmod 700 "$HOME/.Trash"
+source "$PROJECT_ROOT/lib/core/common.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE MOLE_TEST_TRASH_DIR
+for i in 1 2; do touch "$SANDBOX/targets/item-$i"; done
+_mole_move_to_trash_batch "$SANDBOX/targets/item-1" "$SANDBOX/targets/item-2" || exit 1
+[[ ${#_MOLE_TRASH_BATCH_MOVED_PATHS[@]} -eq 2 ]] || exit 1
+[[ $(/usr/bin/stat -f%Lp "$HOME/.Trash") == 700 ]] || exit 1
+printf 'destination-rechecked\n'
+EOF
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"destination-rechecked"* ]]
+}
+
+
+@test "direct Trash batch rejects destination symlink introduced between moves" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+export HOME="$SANDBOX/home"
+mkdir -p "$HOME/.Trash" "$SANDBOX/targets" "$SANDBOX/redirected"
+source "$PROJECT_ROOT/lib/core/common.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE MOLE_TEST_TRASH_DIR
+for i in 1 2; do touch "$SANDBOX/targets/item-$i"; done
+eval "$(declare -f _mole_move_path_to_user_trash | sed '1s/_mole_move_path_to_user_trash/_fixture_move_to_trash/')"
+_mole_move_path_to_user_trash() {
+    _fixture_move_to_trash "$@" || return $?
+    if [[ "$1" == "$SANDBOX/targets/item-1" ]]; then
+        command mv "$HOME/.Trash" "$HOME/kept-trash"
+        ln -s "$SANDBOX/redirected" "$HOME/.Trash"
+    fi
+    return 0
+}
+rc=0
+_mole_move_to_trash_batch "$SANDBOX/targets/item-1" "$SANDBOX/targets/item-2" || rc=$?
+[[ $rc == 1 && ${#_MOLE_TRASH_BATCH_MOVED_PATHS[@]} -eq 1 ]] || exit 1
+[[ -f "$HOME/kept-trash/item-1" && -f "$SANDBOX/targets/item-2" ]] || exit 1
+[[ ! -e "$SANDBOX/redirected/item-2" ]] || exit 1
+printf 'destination-swap-refused\n'
+EOF
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"destination-swap-refused"* ]]
+}
+
+@test "MOLE_TEST_TRASH_DIR is honored only while a test mode flag is set" {
+	local sandbox="$SANDBOX/gated-trash"
+	local test_trash="$sandbox/test-trash"
+	local victim="$SANDBOX/gated_victim"
+	mkdir -p "$test_trash"
+	: > "$victim"
+
+	run /bin/bash --noprofile --norc <<EOF
+$(prelude)
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
+export MOLE_DELETE_MODE=trash
+export MOLE_TEST_TRASH_DIR="$test_trash"
+_mole_path_requires_direct_trash() { return 0; }
+_mole_move_path_to_user_trash() { printf 'REAL_TRASH_PATH\n'; return 0; }
+mole_delete "$victim"
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"REAL_TRASH_PATH"* ]] || { echo "$output"; return 1; }
+	[[ -e "$victim" ]] || return 1
+	[[ -z "$(ls -A "$test_trash")" ]] || return 1
 }

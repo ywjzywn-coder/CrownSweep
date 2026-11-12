@@ -36,7 +36,7 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"DS test"* ]] || return 1
-    [[ "$output" == *$'\033[0;33m→\033[0m'* ]]
+    [[ "$output" == *$'\033[0;33m○\033[0m'* ]]
 }
 
 @test "clean_ds_store_tree uses green for successful cleanups" {
@@ -397,6 +397,386 @@ EOF
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
+# Writes a LaunchAgent plist into $AGENT_DIR: $1 label, $2 Program ("" for
+# none), then the ProgramArguments strings.
+_write_launch_agent_fixture() {
+    local label="$1" program="$2"
+    shift 2
+    {
+        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict>' "<key>Label</key><string>$label</string>"
+        [[ -z "$program" ]] || printf '<key>Program</key><string>%s</string>\n' "$program"
+        if [[ $# -gt 0 ]]; then
+            printf '%s\n' '<key>ProgramArguments</key><array>'
+            printf '<string>%s</string>\n' "$@"
+            printf '%s\n' '</array>'
+        fi
+        printf '%s\n' '</dict></plist>'
+    } > "$AGENT_DIR/$label.plist"
+}
+
+# Runs scan_installed_apps under the fixture HOME $1; the rest are extra env
+# assignments. MOLE_TEST_PREAMBLE names a file sourced before the scan.
+_scan_launch_agent_claims() {
+    local agent_home="$1"
+    shift
+    run env HOME="$agent_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 "$@" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+debug_log() { :; }
+[[ -z "${MOLE_TEST_PREAMBLE:-}" ]] || source "$MOLE_TEST_PREAMBLE"
+scan_installed_apps "$HOME/installed.txt"
+cat "$HOME/installed.txt"
+EOF
+}
+
+# Usage: _assert_launch_agent_claims "$output" keep|drop label...
+_assert_launch_agent_claims() {
+    local claims="$1" mode="$2" label=""
+    shift 2
+    for label in "$@"; do
+        if grep -qFx "$label" <<< "$claims"; then
+            [[ "$mode" == keep ]] || { echo "dead agent still claims $label"; grep -F com.example <<< "$claims"; return 1; }
+        else
+            [[ "$mode" == drop ]] || { echo "lost claim $label"; grep -F com.example <<< "$claims"; return 1; }
+        fi
+    done
+}
+
+@test "scan_installed_apps judges Program and never ProgramArguments while the Program key exists" {
+    local agent_home="$HOME/agent-program"
+    rm -rf "$agent_home"
+    mkdir -p "$agent_home/Library/LaunchAgents"
+    local AGENT_DIR="$agent_home/Library/LaunchAgents" gone="$agent_home/old/agent"
+    _write_launch_agent_fixture com.example.noprogram "" "$gone" --run
+    _write_launch_agent_fixture com.example.programescaped "$agent_home/opt/a&amp;b/agent" "$gone" --run
+    local label value
+    for label in programempty programarray; do
+        value='<string></string>'
+        [[ "$label" != programarray ]] || value="<array><string>$gone</string></array>"
+        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<plist version="1.0"><dict>' \
+            "<key>Label</key><string>com.example.$label</string>" "<key>Program</key>$value" \
+            "<key>ProgramArguments</key><array><string>$gone</string></array>" '</dict></plist>' \
+            > "$AGENT_DIR/com.example.$label.plist"
+    done
+
+    _scan_launch_agent_claims "$agent_home"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" drop com.example.noprogram
+    _assert_launch_agent_claims "$output" keep com.example.programescaped com.example.programempty \
+        com.example.programarray
+}
+
+@test "scan_installed_apps compares /Volumes and the prompting folders however the path is spelled" {
+    local agent_home="$HOME/agent-spelling"
+    rm -rf "$agent_home"
+    mkdir -p "$agent_home/Library/LaunchAgents"
+    local AGENT_DIR="$agent_home/Library/LaunchAgents" upper_home=""
+    upper_home=$(tr '[:lower:]' '[:upper:]' <<< "$agent_home")
+    _write_launch_agent_fixture com.example.control "$agent_home/opt/gone"
+    _write_launch_agent_fixture com.example.volumeslower "/volumes/MoleTestNoSuchDisk-$$/bin/agent"
+    _write_launch_agent_fixture com.example.firmvolumes "/System/Volumes/Data/Volumes/MoleTestNoSuchDisk-$$/bin/agent"
+    _write_launch_agent_fixture com.example.nofollowvolumes "/.nofollow/Volumes/MoleTestNoSuchDisk-$$/bin/agent"
+    _write_launch_agent_fixture com.example.resolvevolumes "/.resolve/1/Volumes/MoleTestNoSuchDisk-$$/bin/agent"
+    _write_launch_agent_fixture com.example.firmdocuments "/System/Volumes/Data$agent_home/Documents/gone/agent"
+    _write_launch_agent_fixture com.example.lowerdocuments "$agent_home/documents/gone/agent"
+    _write_launch_agent_fixture com.example.upperhome "$upper_home/DOWNLOADS/gone/agent"
+
+    _scan_launch_agent_claims "$agent_home"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" drop com.example.control
+    _assert_launch_agent_claims "$output" keep com.example.nofollowvolumes com.example.resolvevolumes
+    _assert_launch_agent_claims "$output" keep com.example.volumeslower com.example.firmvolumes \
+        com.example.firmdocuments com.example.lowerdocuments com.example.upperhome
+
+    _write_launch_agent_fixture com.example.slashhome "$agent_home/Documents/gone/agent"
+    rm -f "$agent_home/.cache/mole/installed_apps_cache"
+    _scan_launch_agent_claims "$agent_home/"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" keep com.example.slashhome
+}
+
+@test "scan_installed_apps proves a LaunchAgent path missing by its errno, not by test -e" {
+    local agent_home="$HOME/agent-errno"
+    [[ ! -d "$agent_home" ]] || chmod -R u+rwx "$agent_home"
+    rm -rf "$agent_home"
+    mkdir -p "$agent_home/Library/LaunchAgents" "$agent_home/Library/Mail/V10" "$agent_home/listless"
+    printf '#!/bin/sh\n' > "$agent_home/Library/Mail/V10/agent"
+    chmod +x "$agent_home/Library/Mail/V10/agent"
+    local AGENT_DIR="$agent_home/Library/LaunchAgents"
+    _write_launch_agent_fixture com.example.control "$agent_home/opt/gone"
+    _write_launch_agent_fixture com.example.listless "$agent_home/listless/gone/agent"
+    chmod 311 "$agent_home/listless"
+    _scan_launch_agent_claims "$agent_home"
+    chmod 755 "$agent_home/listless"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" drop com.example.control
+    _assert_launch_agent_claims "$output" keep com.example.listless
+
+    # A stat probe that times out (a stale NFS or autofs path) keeps the claim.
+    rm -f "$agent_home/.cache/mole/installed_apps_cache"
+    _write_launch_agent_fixture com.example.slowprobe "$agent_home/slow/gone/agent"
+    cat > "$agent_home/preamble.sh" <<'SH'
+run_with_timeout() {
+    shift
+    case " $* " in *" /usr/bin/stat "*) return 124 ;; esac
+    "$@"
+}
+SH
+    _scan_launch_agent_claims "$agent_home" MOLE_TEST_PREAMBLE="$agent_home/preamble.sh"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" keep com.example.slowprobe com.example.control
+
+    # A lookup the sandbox denies (as TCC does) is EPERM, not ENOENT.
+    if ! command -v sandbox-exec > /dev/null 2>&1 ||
+        ! sandbox-exec -p '(version 1)(allow default)' /usr/bin/true 2> /dev/null; then
+        skip "sandbox-exec unavailable"
+    fi
+    rm -f "$agent_home/.cache/mole/installed_apps_cache"
+    _write_launch_agent_fixture com.example.denied "$agent_home/Library/Mail/V10/agent"
+    printf '(version 1)\n(allow default)\n(deny file-read-metadata file-read-data (subpath "%s"))\n' \
+        "$agent_home/Library/Mail/V10" > "$agent_home/deny.sb"
+    run sandbox-exec -f "$agent_home/deny.sb" env HOME="$agent_home" PROJECT_ROOT="$PROJECT_ROOT" \
+        MOLE_TEST_MODE=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+debug_log() { :; }
+scan_installed_apps "$HOME/installed.txt"
+cat "$HOME/installed.txt"
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" keep com.example.denied
+}
+
+@test "scan_installed_apps keeps the claim of a LaunchAgent under a configured mount point" {
+    local agent_home="$HOME/agent-mounts"
+    [[ ! -d "$agent_home" ]] || chmod -R u+rwx "$agent_home"
+    rm -rf "$agent_home"
+    mkdir -p "$agent_home/Library/LaunchAgents" "$agent_home/etc"
+    local AGENT_DIR="$agent_home/Library/LaunchAgents" etc="$agent_home/etc"
+    printf '# comment\nUUID=1 %s apfs rw\nLABEL=2 %s hfs rw\nLABEL=3 none hfs rw,noauto\n' \
+        "$agent_home/mnt/disk" "$agent_home/mnt/my\\040disk" > "$etc/fstab"
+    printf '+auto_master\n%s\tauto_home\t-nobrowse\n/-\t-static\n/-\t%s\n' \
+        "$agent_home/auto/home" "$etc/auto_direct" > "$etc/auto_master"
+    printf '%s\tnas:/export\n' "$agent_home/direct/share" > "$etc/auto_direct"
+    cat > "$agent_home/preamble.sh" <<SH
+_mole_launch_agent_mount_config_files() {
+    printf '%s\n' "fstab $etc/fstab" "master $etc/auto_master"
+}
+SH
+    _write_launch_agent_fixture com.example.control "$agent_home/opt/gone"
+    _write_launch_agent_fixture com.example.fstabdisk "$agent_home/mnt/disk/bin/agent"
+    _write_launch_agent_fixture com.example.fstabspace "$agent_home/mnt/my disk/bin/agent"
+    _write_launch_agent_fixture com.example.masterpoint "$agent_home/auto/home/me/agent"
+    _write_launch_agent_fixture com.example.directmap "$agent_home/direct/share/agent"
+
+    _scan_launch_agent_claims "$agent_home" MOLE_TEST_PREAMBLE="$agent_home/preamble.sh"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" drop com.example.control
+    _assert_launch_agent_claims "$output" keep com.example.fstabdisk com.example.fstabspace \
+        com.example.masterpoint com.example.directmap
+
+    rm -f "$agent_home/.cache/mole/installed_apps_cache"
+    chmod 000 "$etc/auto_direct"
+    _scan_launch_agent_claims "$agent_home" MOLE_TEST_PREAMBLE="$agent_home/preamble.sh"
+    chmod 644 "$etc/auto_direct"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" keep com.example.control
+}
+
+@test "scan_installed_apps judges an interpreter's script only past options it knows" {
+    local agent_home="$HOME/agent-options"
+    rm -rf "$agent_home"
+    mkdir -p "$agent_home/Library/LaunchAgents" "$agent_home/opt/bin" "$agent_home/opt/Live.app"
+    local AGENT_DIR="$agent_home/Library/LaunchAgents" opt="$agent_home/opt" tool=""
+    for tool in sh bash zsh fish python python3 ruby perl osascript java node npm uv; do
+        printf '#!/bin/sh\n' > "$opt/bin/$tool"
+        chmod +x "$opt/bin/$tool"
+    done
+    printf '#!/bin/sh\n' > "$opt/live.sh"
+    local bin="$opt/bin" missing="$agent_home/Library/Logs/missing"
+
+    # Not understood: an unknown option, stdin, inline code or a module comes
+    # first, so a missing value or argument is never judged as the script.
+    _write_launch_agent_fixture com.example.noderedirect "" "$bin/node" --redirect-warnings "$missing" "$opt/live.sh"
+    _write_launch_agent_fixture com.example.fishout "" "$bin/fish" -o "$missing" "$opt/live.sh"
+    _write_launch_agent_fixture com.example.npmcache "" "$bin/npm" --cache "$missing" run start
+    _write_launch_agent_fixture com.example.uvcache "" /usr/bin/env uv --cache-dir "$missing" run "$opt/live.sh"
+    _write_launch_agent_fixture com.example.bashstdin "" "$bin/bash" -s "$missing"
+    _write_launch_agent_fixture com.example.pythondash "" "$bin/python3" - "$missing"
+    _write_launch_agent_fixture com.example.perlcode "" "$bin/perl" -E '/x/ and print'
+    _write_launch_agent_fixture com.example.pythonmodule "" "$bin/python3" -m "$missing"
+    _write_launch_agent_fixture com.example.pythonmodulearg "" "$bin/python3" -m runpy "$missing"
+    _write_launch_agent_fixture com.example.bashcluster "" "$bin/bash" -lc "$missing"
+    _write_launch_agent_fixture com.example.openunknown "" /usr/bin/open -X "$opt/Missing.app"
+    _write_launch_agent_fixture com.example.openargs "" /usr/bin/open -e --args "$missing"
+    # node's --name=value forms that run inline code or a package script: the
+    # path after them is an argument to that code, never the script.
+    _write_launch_agent_fixture com.example.nodeevaleq "" "$bin/node" --eval='setInterval(()=>{},1e3)' "$missing"
+    _write_launch_agent_fixture com.example.nodeprinteq "" "$bin/node" --print=1 "$missing"
+    _write_launch_agent_fixture com.example.noderuneq "" "$bin/node" --run=start "$missing"
+    _write_launch_agent_fixture com.example.nodeunknowneq "" "$bin/node" --some-future-flag=x "$missing"
+
+    # Understood: a known value option skips its value and a known flag is
+    # passed, so the gone script behind them drops the claim.
+    local -a dropped=()
+    local n=0
+    _drop_case() {
+        n=$((n + 1))
+        _write_launch_agent_fixture "com.example.known$n" "" "$@" "$opt/gone$n"
+        dropped+=("com.example.known$n")
+    }
+    _drop_case "$bin/sh" -o x
+    _drop_case "$bin/sh" --rcfile x
+    _drop_case "$bin/bash" -O x
+    _drop_case "$bin/bash" --init-file x
+    _drop_case "$bin/zsh" +o x
+    _drop_case "$bin/zsh" -o x
+    _drop_case "$bin/fish" -C x
+    _drop_case "$bin/fish" --init-command x
+    _drop_case "$bin/python" -X x
+    _drop_case "$bin/python" -W x
+    _drop_case "$bin/python3" --check-hash-based-pycs x
+    _drop_case "$bin/python3" -X x
+    _drop_case "$bin/ruby" -I x
+    _drop_case "$bin/ruby" -r x
+    _drop_case "$bin/perl" -I x
+    _drop_case "$bin/osascript" -l x
+    _drop_case "$bin/osascript" -s x
+    _drop_case "$bin/java" -cp x -jar
+    _drop_case "$bin/java" --module-path x -jar
+    _drop_case "$bin/node" --require x
+    _drop_case "$bin/node" --env-file x
+    _drop_case "$bin/bash" -lx --noprofile
+    _drop_case "$bin/fish" --no-config
+    _drop_case "$bin/python3" -uB
+    _drop_case "$bin/ruby" -w
+    _drop_case "$bin/perl" -wT
+    _drop_case "$bin/java" -Xmx1g -Dkey=value -jar
+    _drop_case "$bin/node" --no-warnings --max-old-space-size=64
+    _drop_case /usr/bin/open -n -g -a
+
+    _scan_launch_agent_claims "$agent_home"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" keep com.example.noderedirect com.example.fishout \
+        com.example.npmcache com.example.uvcache com.example.bashstdin com.example.pythondash \
+        com.example.perlcode com.example.pythonmodule com.example.pythonmodulearg \
+        com.example.bashcluster com.example.openunknown com.example.openargs \
+        com.example.nodeevaleq com.example.nodeprinteq com.example.noderuneq com.example.nodeunknowneq
+    _assert_launch_agent_claims "$output" drop "${dropped[@]}"
+}
+
+@test "scan_installed_apps keeps multi-line values, env -S and agents past the judging budget" {
+    local agent_home="$HOME/agent-guards"
+    rm -rf "$agent_home"
+    mkdir -p "$agent_home/Library/LaunchAgents"
+    local AGENT_DIR="$agent_home/Library/LaunchAgents" gone="$agent_home/opt/gone"
+    _write_launch_agent_fixture com.example.control "$gone"
+    _write_launch_agent_fixture com.example.multiline "" /bin/sh $'-x\n' "$gone.sh"
+    _write_launch_agent_fixture com.example.envsplit "" /usr/bin/env -S "$gone arg"
+
+    _scan_launch_agent_claims "$agent_home"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" drop com.example.control
+    _assert_launch_agent_claims "$output" keep com.example.multiline com.example.envsplit
+
+    # A zero budget judges nothing, so even the dead control keeps its claim.
+    rm -f "$agent_home/.cache/mole/installed_apps_cache"
+    _scan_launch_agent_claims "$agent_home" MOLE_TIMEOUT_MEDIUM_PROBE_SEC=0
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    _assert_launch_agent_claims "$output" keep com.example.control
+}
+
+@test "scan_installed_apps drops the claim of a LaunchAgent whose job provably cannot run" {
+    local agent_home="$HOME/agent-dead"
+    rm -rf "$agent_home"
+    mkdir -p "$agent_home/Library/LaunchAgents" "$agent_home/opt/bin" "$agent_home/opt/Live.app"
+    printf '#!/bin/sh\n' > "$agent_home/opt/bin/live"
+    chmod +x "$agent_home/opt/bin/live"
+    printf '#!/bin/sh\n' > "$agent_home/opt/live.sh"
+    local opt="$agent_home/opt"
+
+    local AGENT_DIR="$agent_home/Library/LaunchAgents"
+    _write_launch_agent_fixture com.example.live "$opt/bin/live"
+    _write_launch_agent_fixture com.example.goneprogram "$opt/bin/gone"
+    _write_launch_agent_fixture com.example.goneargv0 "" "$opt/bin/gone" --flag
+    _write_launch_agent_fixture com.example.openmissing "" /usr/bin/open -a "$opt/Missing.app"
+    _write_launch_agent_fixture com.example.openlive "" /usr/bin/open -n --stdout "$opt/gone.log" "$opt/Live.app"
+    _write_launch_agent_fixture com.example.scriptgone "" /bin/sh "$opt/gone.sh"
+    _write_launch_agent_fixture com.example.scriptlive "" /bin/bash --rcfile "$opt/gone.rc" "$opt/live.sh"
+    _write_launch_agent_fixture com.example.envgone "" /usr/bin/env -u NAME node "$opt/gone.js"
+
+    run env HOME="$agent_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+debug_log() { :; }
+scan_installed_apps "$HOME/installed.txt"
+cat "$HOME/installed.txt"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local label
+    for label in com.example.live com.example.openlive com.example.scriptlive; do
+        grep -qFx "$label" <<< "$output" || { echo "missing live claim $label"; grep -F com.example <<< "$output"; return 1; }
+    done
+    for label in com.example.goneprogram com.example.goneargv0 com.example.openmissing \
+        com.example.scriptgone com.example.envgone; do
+        if grep -qFx "$label" <<< "$output"; then
+            echo "dead agent still claims $label"
+            grep -F com.example <<< "$output"
+            return 1
+        fi
+    done
+}
+
+@test "scan_installed_apps keeps the claim of a LaunchAgent it cannot prove dead" {
+    local agent_home="$HOME/agent-doubt"
+    [[ ! -d "$agent_home" ]] || chmod -R u+rwx "$agent_home"
+    rm -rf "$agent_home"
+    mkdir -p "$agent_home/Library/LaunchAgents" "$agent_home/locked/inner"
+
+    local AGENT_DIR="$agent_home/Library/LaunchAgents"
+    _write_launch_agent_fixture com.example.bare "mole-test-no-such-tool"
+    _write_launch_agent_fixture com.example.relative "" "bin/agent"
+    _write_launch_agent_fixture com.example.volumes "/Volumes/MoleTestNoSuchDisk-$$/bin/agent"
+    _write_launch_agent_fixture com.example.inline "" /bin/zsh -lc "$agent_home/gone.sh"
+    _write_launch_agent_fixture com.example.documents "$agent_home/Documents/gone/agent"
+    _write_launch_agent_fixture com.example.locked "$agent_home/locked/inner/agent"
+    _write_launch_agent_fixture com.example.dotted "$agent_home/gone/../Documents/agent"
+    ln -s "$agent_home/nowhere" "$agent_home/link"
+    _write_launch_agent_fixture com.example.linked "$agent_home/link/agent"
+    _write_launch_agent_fixture com.example.escaped "$agent_home/a&amp;b/agent"
+    : > "$agent_home/Library/LaunchAgents/com.example.empty.plist"
+    printf 'not a plist' > "$agent_home/Library/LaunchAgents/com.example.malformed.plist"
+    _write_launch_agent_fixture com.example.unreadable "$agent_home/gone"
+    chmod 000 "$agent_home/Library/LaunchAgents/com.example.unreadable.plist"
+    chmod 000 "$agent_home/locked"
+
+    run env HOME="$agent_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+debug_log() { :; }
+scan_installed_apps "$HOME/installed.txt"
+cat "$HOME/installed.txt"
+EOF
+    chmod 755 "$agent_home/locked"
+    chmod 644 "$agent_home/Library/LaunchAgents/com.example.unreadable.plist"
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local label
+    for label in com.example.bare com.example.relative com.example.volumes \
+        com.example.inline com.example.documents com.example.locked com.example.dotted \
+        com.example.linked com.example.escaped com.example.empty com.example.malformed \
+        com.example.unreadable; do
+        grep -qFx "$label" <<< "$output" || { echo "lost claim $label"; grep -F com.example <<< "$output"; return 1; }
+    done
+}
+
 @test "scan_installed_apps fails closed when scan result aggregation fails" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -510,7 +890,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/apps.sh"
 
 mkdir -p "$HOME/Library/Caches/com.example.LiveApp"
-touch -t "$(date -v-31d +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.example.LiveApp"
+touch -t "$(/bin/date -v-31d +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.example.LiveApp"
 
 scan_installed_apps() {
     : > "$1"
@@ -554,7 +934,7 @@ source "$PROJECT_ROOT/lib/clean/apps.sh"
 mkdir -p "$HOME/Applications/LiveApp.app" \
     "$HOME/Applications/Partial.app/Contents" \
     "$HOME/Library/Caches/com.example.LiveApp"
-touch -t "$(date -v-31d +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.example.LiveApp"
+touch -t "$(/bin/date -v-31d +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.example.LiveApp"
 rm -f "$HOME/.cache/mole/installed_apps_cache"
 
 cat > "$HOME/Applications/Partial.app/Contents/Info.plist" <<'PLIST'
@@ -625,7 +1005,7 @@ source "$PROJECT_ROOT/lib/clean/apps.sh"
 
 mkdir -p "$HOME/Applications/Broken.app/Contents" \
     "$HOME/Library/Caches/com.example.LiveApp"
-touch -t "$(date -v-31d +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.example.LiveApp"
+touch -t "$(/bin/date -v-31d +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.example.LiveApp"
 rm -f "$HOME/.cache/mole/installed_apps_cache"
 
 stub_dir="$HOME/stub-bin-errexit-scan"
@@ -686,7 +1066,7 @@ source "$PROJECT_ROOT/lib/clean/apps.sh"
 bad_name=$'Bad\\033[2J-\033[2J.app'
 mkdir -p "$HOME/Applications/$bad_name/Contents" \
     "$HOME/Library/Caches/com.example.LiveApp"
-touch -t "$(date -v-31d +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.example.LiveApp"
+touch -t "$(/bin/date -v-31d +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.example.LiveApp"
 
 stub_dir="$HOME/stub-bin-control-name"
 mkdir -p "$stub_dir"
@@ -725,12 +1105,13 @@ EOF
 @test "is_bundle_orphaned returns true for old uninstalled bundle" {
     # Spotlight has no app for this bundle id; the real index is never read.
     mole_test_fake_command mdfind
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ORPHAN_AGE_THRESHOLD=30 /bin/bash --noprofile --norc <<'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/apps.sh"
 should_protect_data() { return 1; }
-get_file_mtime() { echo 0; }
+mkdir -p "$HOME/old"
+touch -t 202001010000 "$HOME/old"
 if is_bundle_orphaned "com.example.Old" "$HOME/old" "$HOME/installed.txt"; then
     echo "orphan"
 fi
@@ -741,18 +1122,26 @@ EOF
 }
 
 @test "is_bundle_orphaned keeps the app when mdfind times out (#1584)" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ORPHAN_AGE_THRESHOLD=30 /bin/bash --noprofile --norc <<'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/apps.sh"
 should_protect_data() { return 1; }
-get_file_mtime() { echo 0; }
 : > "$HOME/installed.txt"
 mkdir -p "$HOME/old"
-run_with_timeout() { printf 'MDFIND\n' >&2; return 124; }
+touch -t 202001010000 "$HOME/old"
+run_with_timeout() {
+    case "$2" in
+        mdfind) : > "$HOME/mdfind-timed-out"; return 124 ;;
+    esac
+    shift
+    "$@"
+}
 rc=0
 is_bundle_orphaned "com.example.Old" "$HOME/old" "$HOME/installed.txt" || rc=$?
 printf 'RC=%s\n' "$rc"
+[[ -e "$HOME/mdfind-timed-out" ]] && echo MDFIND
+rm -f "$HOME/mdfind-timed-out"
 if [[ $rc -eq 0 ]]; then
     echo ORPHAN
 else
@@ -770,28 +1159,125 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"RC=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"MDFIND"* ]] || return 1
     [[ "$output" == *"KEEP"* ]] || return 1
     [[ "$output" != *$'\nORPHAN'* ]] || return 1
     [[ "$output" == *"RETRY_ORPHAN"* ]] || return 1
 }
 
 @test "is_bundle_orphaned still cancels on interrupt (#1584)" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ORPHAN_AGE_THRESHOLD=30 /bin/bash --noprofile --norc <<'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/apps.sh"
 should_protect_data() { return 1; }
-get_file_mtime() { echo 0; }
 : > "$HOME/installed.txt"
 mkdir -p "$HOME/old"
-run_with_timeout() { return 130; }
+touch -t 202001010000 "$HOME/old"
+run_with_timeout() {
+    case "$2" in
+        mdfind) : > "$HOME/mdfind-interrupted"; return 130 ;;
+    esac
+    shift
+    "$@"
+}
 rc=0
 is_bundle_orphaned "com.example.Old" "$HOME/old" "$HOME/installed.txt" || rc=$?
 printf 'RC=%s\n' "$rc"
+[[ -e "$HOME/mdfind-interrupted" ]] && echo MDFIND
+rm -f "$HOME/mdfind-interrupted"
 EOF
 
     [ "$status" -eq 0 ]
+    [[ "$output" == *"MDFIND"* ]] || return 1
     [[ "$output" == *"RC=130"* ]]
+}
+
+@test "is_bundle_orphaned reads the age of the files inside the directory" {
+    # Spotlight has no app for this bundle id; the real index is never read.
+    mole_test_fake_command mdfind
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+should_protect_data() { return 1; }
+trap '/bin/chmod -R u+rwx "$HOME/orphan-age" 2> /dev/null || true' EXIT
+
+target="$HOME/orphan-age/com.example.Old"
+mkdir -p "$target/nested"
+echo data > "$target/nested/.hidden"
+: > "$HOME/orphan-age/installed.txt"
+age_all() { find "$target" -exec touch -t 202001010000 {} +; }
+probe() {
+    local rc=0
+    is_bundle_orphaned "com.example.Old" "$target" "$HOME/orphan-age/installed.txt" || rc=$?
+    echo "$1=$rc"
+}
+
+age_all
+probe OLD
+
+echo more >> "$target/nested/.hidden"
+touch -t 202001010000 "$target/nested" "$target"
+probe WRITTEN
+
+age_all
+touch -t "$(/bin/date -v-29d +%Y%m%d%H%M.%S)" "$target/nested/.hidden"
+probe TWENTY_NINE_DAYS
+
+touch -t "$(/bin/date -v-31d +%Y%m%d%H%M.%S)" "$target/nested/.hidden"
+probe THIRTY_ONE_DAYS
+
+chmod 444 "$target/nested"
+probe UNSEARCHABLE
+chmod 755 "$target/nested"
+
+mkdir "$target/unreadable"
+touch -t 202001010000 "$target/unreadable" "$target"
+chmod 000 "$target/unreadable"
+probe UNREADABLE
+chmod 755 "$target/unreadable"
+
+touch -t 202001010000 "$target/unreadable" "$target"
+/bin/chmod +a "$(id -un) deny search" "$target/unreadable"
+probe ACL_DENIED
+/bin/chmod -a "$(id -un) deny search" "$target/unreadable"
+rmdir "$target/unreadable"
+touch -t 202001010000 "$target"
+
+_ORPHAN_AGE_WALK_BUDGET_LEFT=0
+probe BUDGET_SPENT
+printf '#!/bin/sh\nsleep 1\n' > "$HOME/orphan-age/find-slow"
+chmod 755 "$HOME/orphan-age/find-slow"
+FIND_BSD="$HOME/orphan-age/find-slow"
+_ORPHAN_AGE_WALK_BUDGET_LEFT=5
+probe SLOW_WALK
+echo "BUDGET_AFTER_SLOW_WALK=$_ORPHAN_AGE_WALK_BUDGET_LEFT"
+unset _ORPHAN_AGE_WALK_BUDGET_LEFT
+
+for walk_status in 1 124 130; do
+    printf '#!/bin/sh\nexit %s\n' "$walk_status" > "$HOME/orphan-age/find-stub"
+    chmod 755 "$HOME/orphan-age/find-stub"
+    FIND_BSD="$HOME/orphan-age/find-stub"
+    probe "WALK_$walk_status"
+done
+rm -rf "$HOME/orphan-age"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"OLD=0"* ]] || return 1
+    [[ "$output" == *"WRITTEN=1"* ]] || return 1
+    [[ "$output" == *"TWENTY_NINE_DAYS=1"* ]] || return 1
+    [[ "$output" == *"THIRTY_ONE_DAYS=0"* ]] || return 1
+    [[ "$output" == *"UNSEARCHABLE=1"* ]] || return 1
+    [[ "$output" == *"UNREADABLE=1"* ]] || return 1
+    [[ "$output" == *"ACL_DENIED=1"* ]] || return 1
+    [[ "$output" == *"BUDGET_SPENT=1"* ]] || return 1
+    [[ "$output" != *"BUDGET_AFTER_SLOW_WALK=5"* ]] || return 1
+    [[ "$output" == *"BUDGET_AFTER_SLOW_WALK="* ]] || return 1
+    [[ "$output" == *"WALK_1=1"* ]] || return 1
+    [[ "$output" == *"WALK_124=1"* ]] || return 1
+    [[ "$output" == *"WALK_130=130"* ]]
 }
 
 @test "clean_orphaned_app_data size timeout skips that leftover and continues (#1584)" {
@@ -981,7 +1467,7 @@ mkdir -p "$HOME/Library/Saved Application State/com.test.orphan.savedState"
 # Create a file with some content so directory size > 0
 echo "test data" > "$HOME/Library/Saved Application State/com.test.orphan.savedState/data.plist"
 # Set modification time to 31 days ago (older than 30-day threshold)
-touch -t "$(date -v-31d +%Y%m%d%H%M.%S 2>/dev/null || date -d '31 days ago' +%Y%m%d%H%M.%S)" "$HOME/Library/Saved Application State/com.test.orphan.savedState" 2>/dev/null || true
+find "$HOME/Library/Saved Application State/com.test.orphan.savedState" -exec touch -t "$(/bin/date -v-31d +%Y%m%d%H%M.%S 2>/dev/null || date -d '31 days ago' +%Y%m%d%H%M.%S)" {} +
 
 # Disable spinner for test
 start_section_spinner() { :; }
@@ -1032,8 +1518,7 @@ mkdir -p "$HOME/Library/Caches/com.test.orphan2"
 echo "data1" > "$HOME/Library/Caches/com.test.orphan1/data"
 echo "data2" > "$HOME/Library/Caches/com.test.orphan2/data"
 # Set modification time to 31 days ago
-touch -t "$(date -v-31d +%Y%m%d%H%M.%S 2>/dev/null || date -d '31 days ago' +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.test.orphan1" 2>/dev/null || true
-touch -t "$(date -v-31d +%Y%m%d%H%M.%S 2>/dev/null || date -d '31 days ago' +%Y%m%d%H%M.%S)" "$HOME/Library/Caches/com.test.orphan2" 2>/dev/null || true
+find "$HOME/Library/Caches/com.test.orphan1" "$HOME/Library/Caches/com.test.orphan2" -exec touch -t "$(/bin/date -v-31d +%Y%m%d%H%M.%S 2>/dev/null || date -d '31 days ago' +%Y%m%d%H%M.%S)" {} +
 
 # Mock safe_clean to fail on first item, succeed on second
 safe_clean() {
@@ -1124,13 +1609,14 @@ note_activity() { :; }
 
 mkdir -p "$HOME/Library/Caches/com.test.orphan-dry-run"
 echo "data" > "$HOME/Library/Caches/com.test.orphan-dry-run/data"
+find "$HOME/Library/Caches/com.test.orphan-dry-run" -exec touch -t 202001010000 {} +
 
 clean_orphaned_app_data
 EOF
 
     [ "$status" -eq 0 ] || return 1
-    [[ "$output" == *"Would clean 1 items, about 2.0MB"* ]] || return 1
-    [[ "$output" != *"Cleaned 1 items"* ]] || return 1
+    [[ "$output" == *"Would clean 1 item, about 2.1MB"* ]] || return 1
+    [[ "$output" != *"Cleaned 1 item"* ]] || return 1
     [ -d "$test_home/Library/Caches/com.test.orphan-dry-run" ] || return 1
 }
 
@@ -1153,7 +1639,6 @@ pgrep() {
 }
 
 run_with_timeout() { shift; "$@"; }
-get_file_mtime() { echo 0; }
 get_path_size_kb() { echo 4; }
 
 safe_clean() {
@@ -1174,6 +1659,7 @@ stop_section_spinner() { :; }
 mkdir -p "$HOME/Library/Caches"
 mkdir -p "$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle"
 echo "vm data" > "$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle/rootfs.img"
+find "$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle" -exec touch -t 202001010000 {} +
 
 clean_orphaned_app_data
 
@@ -1184,7 +1670,212 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Orphaned Claude workspace VM"* ]] || return 1
+    # HOME is shared across this file, so the count may include earlier fixtures.
+    [[ "$output" =~ Cleaned\ [0-9]+\ items?,\ about\ [0-9]+KB ]] || return 1
     [[ "$output" == *"PASS: Claude VM removed"* ]]
+}
+
+@test "clean_orphaned_app_data treats only vm_bundles entries as the Claude VM" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+scan_installed_apps() { : > "$1"; }
+mdfind() { return 0; }
+pgrep() { return 1; }
+run_with_timeout() { shift; "$@"; }
+get_path_size_kb() { echo 4; }
+safe_clean() {
+    echo "CLEANED:$1"
+    rm -rf "$1"
+}
+bundle_has_installed_app() { return 1; }
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    "$guard" "$1" || return $?
+    safe_clean "$@"
+}
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+
+support="$HOME/Library/Application Support/Claude"
+mkdir -p "$HOME/Library/Caches"
+mkdir -p "$support/vm_bundles/claudevm.bundle"
+mkdir -p "$support/plugin.bundle"
+mkdir -p "$support/Claude Extensions/tool.bundle"
+mkdir -p "$support/Claude Extensions/tool/resources.bundle"
+mkdir -p "$support/vm_bundles/nested/deep.bundle"
+for bundle in \
+    "$support/vm_bundles/claudevm.bundle" \
+    "$support/plugin.bundle" \
+    "$support/Claude Extensions/tool.bundle" \
+    "$support/Claude Extensions/tool/resources.bundle" \
+    "$support/vm_bundles/nested/deep.bundle"; do
+    echo data > "$bundle/payload"
+    find "$bundle" -exec touch -t 202001010000 {} +
+done
+
+clean_orphaned_app_data
+
+[[ ! -e "$support/vm_bundles/claudevm.bundle" ]] || exit 1
+[[ -f "$support/plugin.bundle/payload" ]] || exit 1
+[[ -f "$support/Claude Extensions/tool.bundle/payload" ]] || exit 1
+[[ -f "$support/Claude Extensions/tool/resources.bundle/payload" ]] || exit 1
+[[ -f "$support/vm_bundles/nested/deep.bundle/payload" ]] || exit 1
+echo "PASS: only the VM bundle removed"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"PASS: only the VM bundle removed"* ]]
+}
+
+@test "is_claude_vm_bundle_orphaned reads the age of the files inside the bundle" {
+    # Writing a file leaves the bundle directory's own mtime alone, so the
+    # directory alone cannot show a VM used this week. All-old is the positive
+    # control that the fixture reaches "orphan".
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+pgrep() { return 1; }
+_mdfind_cache_check() { return 1; }
+
+fixture="$HOME/claude-vm-age"
+bundle="$fixture/claudevm.bundle"
+mkdir -p "$bundle/state"
+: > "$fixture/installed"
+echo image > "$bundle/rootfs.img"
+echo lock > "$bundle/.lock"
+echo disk > "$bundle/state/disk.img"
+
+age_all() { find "$bundle" -exec touch -t 202001010000 {} +; }
+report() {
+    local rc=0
+    is_claude_vm_bundle_orphaned "$bundle" "$fixture/installed" || rc=$?
+    echo "$1=$rc"
+}
+
+age_all
+report ALL_OLD
+for written in rootfs.img .lock state/disk.img; do
+    age_all
+    echo more >> "$bundle/$written"
+    # Restore the parent directory, which a shell redirect does not touch anyway.
+    touch -t 202001010000 "$bundle"
+    report "WRITTEN_$written"
+done
+
+age_all
+chmod 000 "$bundle/state"
+report UNREADABLE_ENTRY
+chmod 444 "$bundle/state"
+report UNSEARCHABLE_DIRECTORY
+chmod 755 "$bundle/state"
+age_all
+report READABLE_AGAIN
+
+for walk_status in 1 124 130; do
+    printf '#!/bin/sh\nexit %s\n' "$walk_status" > "$fixture/find-stub"
+    chmod 755 "$fixture/find-stub"
+    FIND_BSD="$fixture/find-stub"
+    report "WALK_$walk_status"
+done
+rm -rf "$fixture"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"ALL_OLD=0"* ]] || return 1
+    [[ "$output" == *"WRITTEN_rootfs.img=1"* ]] || return 1
+    [[ "$output" == *"WRITTEN_.lock=1"* ]] || return 1
+    [[ "$output" == *"WRITTEN_state/disk.img=1"* ]] || return 1
+    [[ "$output" == *"UNREADABLE_ENTRY=1"* ]] || return 1
+    [[ "$output" == *"UNSEARCHABLE_DIRECTORY=1"* ]] || return 1
+    [[ "$output" == *"READABLE_AGAIN=0"* ]] || return 1
+    [[ "$output" == *"WALK_1=1"* ]] || return 1
+    [[ "$output" == *"WALK_124=1"* ]] || return 1
+    [[ "$output" == *"WALK_130=130"* ]]
+}
+
+@test "orphan cleanup guard rechecks the Claude VM age at the final sink" {
+    # A write after discovery changes nothing the identity snapshot binds,
+    # since the directory's own mtime stays put.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+pgrep() { return 1; }
+bundle_has_installed_app() { return 1; }
+trap '/bin/chmod -R u+rwx "$HOME/claude-vm-sink" 2> /dev/null || true' EXIT
+
+bundle="$HOME/claude-vm-sink/claudevm.bundle"
+mkdir -p "$bundle"
+echo image > "$bundle/rootfs.img"
+find "$bundle" -exec touch -t 202001010000 {} +
+
+orphan_cleanup_candidate_snapshot "$bundle"
+_ORPHAN_CLEANUP_EXPECTED_IDENTITY="$_ORPHAN_CANDIDATE_IDENTITY"
+_ORPHAN_CLEANUP_EXPECTED_PARENT="$_ORPHAN_CANDIDATE_PARENT"
+_ORPHAN_CLEANUP_EXPECTED_PARENT_ID="$_ORPHAN_CANDIDATE_PARENT_ID"
+_ORPHAN_CLEANUP_EXPECTED_TARGET_ID="$_ORPHAN_CANDIDATE_TARGET_ID"
+_ORPHAN_CLEANUP_BUNDLE_ID="com.anthropic.claudefordesktop"
+_ORPHAN_CLEANUP_KIND="claude"
+
+rc=0
+orphan_cleanup_candidate_still_eligible "$bundle" || rc=$?
+echo "OLD=$rc"
+
+echo more >> "$bundle/rootfs.img"
+touch -t 202001010000 "$bundle"
+rc=0
+orphan_cleanup_candidate_still_eligible "$bundle" || rc=$?
+echo "WRITTEN=$rc"
+
+find "$bundle" -exec touch -t 202001010000 {} +
+mkdir "$bundle/state"
+touch -t 202001010000 "$bundle/state" "$bundle"
+chmod 444 "$bundle/state"
+orphan_cleanup_candidate_snapshot "$bundle"
+_ORPHAN_CLEANUP_EXPECTED_IDENTITY="$_ORPHAN_CANDIDATE_IDENTITY"
+_ORPHAN_CLEANUP_EXPECTED_TARGET_ID="$_ORPHAN_CANDIDATE_TARGET_ID"
+rc=0
+orphan_cleanup_candidate_still_eligible "$bundle" || rc=$?
+echo "UNSEARCHABLE=$rc"
+chmod 755 "$bundle/state"
+rmdir "$bundle/state"
+touch -t 202001010000 "$bundle"
+orphan_cleanup_candidate_snapshot "$bundle"
+_ORPHAN_CLEANUP_EXPECTED_IDENTITY="$_ORPHAN_CANDIDATE_IDENTITY"
+_ORPHAN_CLEANUP_EXPECTED_TARGET_ID="$_ORPHAN_CANDIDATE_TARGET_ID"
+
+for walk_status in 1 124 130; do
+    printf '#!/bin/sh\nexit %s\n' "$walk_status" > "$HOME/claude-vm-sink/find-stub"
+    chmod 755 "$HOME/claude-vm-sink/find-stub"
+    FIND_BSD="$HOME/claude-vm-sink/find-stub"
+    rc=0
+    orphan_cleanup_candidate_still_eligible "$bundle" || rc=$?
+    echo "WALK_$walk_status=$rc"
+done
+rm -rf "$HOME/claude-vm-sink"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"OLD=0"* ]] || return 1
+    [[ "$output" == *"WRITTEN=1"* ]] || return 1
+    [[ "$output" == *"UNSEARCHABLE=1"* ]] || return 1
+    [[ "$output" == *"WALK_1=1"* ]] || return 1
+    [[ "$output" == *"WALK_124=1"* ]] || return 1
+    [[ "$output" == *"WALK_130=130"* ]]
 }
 
 @test "orphan cleanup guard rejects replacement objects and newly installed apps" {
@@ -1198,6 +1889,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/apps.sh"
 
 candidate="$HOME/Library/Caches/com.test.raced-orphan"
+find "$candidate" -exec touch -t 202001010000 {} +
 orphan_cleanup_candidate_snapshot "$candidate"
 _ORPHAN_CLEANUP_EXPECTED_IDENTITY="$_ORPHAN_CANDIDATE_IDENTITY"
 _ORPHAN_CLEANUP_EXPECTED_PARENT="$_ORPHAN_CANDIDATE_PARENT"
@@ -1209,6 +1901,7 @@ _ORPHAN_CLEANUP_KIND="bundle"
 mv "$candidate" "$candidate.original"
 mkdir -p "$candidate"
 printf 'replacement\n' > "$candidate/data"
+find "$candidate" -exec touch -t 202001010000 {} +
 bundle_has_installed_app() { return 1; }
 rc=0
 orphan_cleanup_candidate_still_eligible "$candidate" || rc=$?
@@ -1230,6 +1923,59 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "orphan cleanup guard rechecks the age of a bundle's files at the final sink" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+bundle_has_installed_app() { return 1; }
+pgrep() { return 1; }
+
+candidate="$HOME/orphan-sink/com.test.sink-age"
+mkdir -p "$candidate"
+echo data > "$candidate/data"
+find "$candidate" -exec touch -t 202001010000 {} +
+
+snapshot() {
+    orphan_cleanup_candidate_snapshot "$candidate"
+    _ORPHAN_CLEANUP_EXPECTED_IDENTITY="$_ORPHAN_CANDIDATE_IDENTITY"
+    _ORPHAN_CLEANUP_EXPECTED_PARENT="$_ORPHAN_CANDIDATE_PARENT"
+    _ORPHAN_CLEANUP_EXPECTED_PARENT_ID="$_ORPHAN_CANDIDATE_PARENT_ID"
+    _ORPHAN_CLEANUP_EXPECTED_TARGET_ID="$_ORPHAN_CANDIDATE_TARGET_ID"
+}
+guard() {
+    local rc=0
+    orphan_cleanup_candidate_still_eligible "$candidate" || rc=$?
+    echo "$1=$rc"
+}
+snapshot
+_ORPHAN_CLEANUP_BUNDLE_ID="com.test.sink-age"
+_ORPHAN_CLEANUP_KIND="bundle"
+guard OLD
+
+# The directory's own time stays put, so the identity snapshot still matches.
+touch -t "$(/bin/date -v-10d +%Y%m%d%H%M.%S)" "$candidate/data"
+guard BUNDLE_TEN_DAYS
+
+_ORPHAN_CLEANUP_KIND="claude"
+guard CLAUDE_TEN_DAYS
+
+_ORPHAN_CLEANUP_KIND="bundle"
+touch -t 202001010000 "$candidate/data"
+printf '#!/bin/sh\nexit 130\n' > "$HOME/orphan-sink/find-stub"
+chmod 755 "$HOME/orphan-sink/find-stub"
+FIND_BSD="$HOME/orphan-sink/find-stub"
+guard INTERRUPTED
+rm -rf "$HOME/orphan-sink"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"OLD=0"* ]] || return 1
+    [[ "$output" == *"BUNDLE_TEN_DAYS=1"* ]] || return 1
+    [[ "$output" == *"CLAUDE_TEN_DAYS=0"* ]] || return 1
+    [[ "$output" == *"INTERRUPTED=130"* ]]
+}
+
 @test "orphan cleanup binds its approved object to the final safe_remove sink" {
     local candidate="$HOME/Library/Caches/com.test.bound-orphan"
     mkdir -p "$candidate"
@@ -1241,6 +1987,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/bin/clean.sh"
 
 candidate="$HOME/Library/Caches/com.test.bound-orphan"
+find "$candidate" -exec touch -t 202001010000 {} +
 orphan_cleanup_candidate_snapshot "$candidate"
 _ORPHAN_CLEANUP_EXPECTED_IDENTITY="$_ORPHAN_CANDIDATE_IDENTITY"
 _ORPHAN_CLEANUP_EXPECTED_PARENT="$_ORPHAN_CANDIDATE_PARENT"
@@ -1300,30 +2047,44 @@ pgrep() {
 }
 
 run_with_timeout() { shift; "$@"; }
-get_file_mtime() { date +%s; }
+get_path_size_kb() { echo 4; }
+bundle_has_installed_app() { return 1; }
 
 safe_clean() {
-    echo "UNEXPECTED:$2"
-    return 1
+    echo "REMOVED:$2"
+    return 0
+}
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    "$guard" "$1" || return $?
+    safe_clean "$@"
 }
 
 start_section_spinner() { :; }
 stop_section_spinner() { :; }
 
+bundle="$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle"
 mkdir -p "$HOME/Library/Caches"
-mkdir -p "$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle"
-echo "vm data" > "$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle/rootfs.img"
+mkdir -p "$bundle"
+echo "vm data" > "$bundle/rootfs.img"
+touch -t 202001010000 "$bundle"
 
 clean_orphaned_app_data
+echo "RECENT_PASS_DONE"
 
-if [[ -d "$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle" ]]; then
-    echo "PASS: Recent Claude VM kept"
-fi
+find "$bundle" -exec touch -t 202001010000 {} +
+clean_orphaned_app_data
+rm -rf "$HOME/Library/Application Support/Claude"
 EOF
 
-    [ "$status" -eq 0 ]
-    [[ "$output" != *"UNEXPECTED:Orphaned Claude workspace VM"* ]] || return 1
-    [[ "$output" == *"PASS: Recent Claude VM kept"* ]]
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"RECENT_PASS_DONE"* ]] || return 1
+    [[ "${output%%RECENT_PASS_DONE*}" != *"REMOVED:Orphaned Claude workspace VM"* ]] || return 1
+    [[ "${output##*RECENT_PASS_DONE}" == *"REMOVED:Orphaned Claude workspace VM"* ]]
 }
 
 @test "is_claude_vm_bundle_orphaned keeps the bundle when the Claude probe cannot tell" {
@@ -1339,10 +2100,10 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/apps.sh"
 pgrep() { return "$PGREP_RC"; }
-get_file_mtime() { echo 0; }
 _mdfind_cache_check() { return 1; }
 fixture="$HOME/claude-vm-probe-$PGREP_RC"
 mkdir -p "$fixture/claudevm.bundle"
+touch -t 202001010000 "$fixture/claudevm.bundle"
 : > "$fixture/installed"
 rc=0
 is_claude_vm_bundle_orphaned "$fixture/claudevm.bundle" "$fixture/installed" || rc=$?
@@ -1406,7 +2167,6 @@ scan_installed_apps() { : > "$1"; }
 mdfind() { return 0; }
 pgrep() { return 1; }
 run_with_timeout() { shift; "$@"; }
-get_file_mtime() { echo 0; }
 get_path_size_kb() { echo 4; }
 safe_clean() { echo "UNEXPECTED_CLEAN:$2"; rm -rf "$1"; }
 start_section_spinner() { :; }
@@ -1415,6 +2175,7 @@ stop_section_spinner() { :; }
 mkdir -p "$HOME/Library/Caches"
 mkdir -p "$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle"
 echo "vm data" > "$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle/rootfs.img"
+find "$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle" -exec touch -t 202001010000 {} +
 
 WHITELIST_PATTERNS=("$HOME/Library/Application Support/Claude/vm_bundles/claudevm.bundle")
 
@@ -1442,7 +2203,6 @@ is_claude_vm_bundle_orphaned() { return 1; }
 mdfind() { return 0; }
 pgrep() { return 1; }
 run_with_timeout() { shift; "$@"; }
-get_file_mtime() { echo 0; }
 get_path_size_kb() { echo 4; }
 safe_clean() { echo "UNEXPECTED_CLEAN:$2"; rm -rf "$1"; }
 start_section_spinner() { :; }
@@ -1556,6 +2316,69 @@ EOF
     # Positive control: every other assertion here is true on empty output, so
     # without this the test cannot distinguish "dry-run behaved" from "nothing ran".
     [[ "$output" == *"Orphaned services · "*" found dry"* ]]
+}
+
+@test "clean_orphaned_system_services never takes a brew services job under either label" {
+    # Homebrew 7 writes sh.brew.<formula>; older services keep homebrew.mxcl.<formula>.
+    # A job whose program is gone is still brew's to manage, never Mole's orphan.
+    mole_test_fake_command mdfind
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 DRY_RUN=true MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { echo "DBG $*"; }
+
+tmp_dir="$(mktemp -d)"
+write_plist() {
+  cat > "$tmp_dir/$1.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$1</string>
+    <key>Program</key>
+    <string>$tmp_dir/missing-binary</string>
+</dict>
+</plist>
+PLIST
+}
+write_plist com.sogou.test
+write_plist sh.brew.redis
+write_plist homebrew.mxcl.postgresql
+
+sudo() {
+  if [[ "$1" == "-n" && "$2" == "true" ]]; then
+    return 0
+  fi
+  [[ "${1:-}" == "-n" ]] && shift
+  if [[ "$1" == "find" ]]; then
+    printf '%s\0' "$tmp_dir/com.sogou.test.plist" "$tmp_dir/sh.brew.redis.plist" "$tmp_dir/homebrew.mxcl.postgresql.plist"
+    return 0
+  fi
+  if [[ "$1" == "du" ]]; then
+    echo "4 ${*: -1}"
+    return 0
+  fi
+  if [[ "$1" == "launchctl" || "$1" == "rm" ]]; then
+    echo "$1-called"
+    return 0
+  fi
+  command "$@"
+}
+
+clean_orphaned_system_services
+EOF
+
+    [ "$status" -eq 0 ]
+    # Positive control: the real orphan beside them is still offered.
+    [[ "$output" != *"Would remove orphaned service: "*"/sh.brew.redis.plist"* ]] || return 1
+    [[ "$output" != *"Would remove orphaned service: "*"/homebrew.mxcl.postgresql.plist"* ]] || return 1
+    [[ "$output" == *"Would remove orphaned service: "*"/com.sogou.test.plist"* ]]
 }
 
 @test "clean_orphaned_system_services reports an authorization timeout" {
@@ -2203,9 +3026,9 @@ safe_sudo_remove() {
 }
 
 # Routed through /Library/LaunchDaemons, which exists on every macOS box. The
-# PrivilegedHelperTools scan is guarded by [[ -d /Library/PrivilegedHelperTools ]]
-# in lib/clean/apps.sh, and that directory is absent on GitHub runners, so a
-# helper fixture makes this case find nothing and pass vacuously in CI.
+# PrivilegedHelperTools scan is guarded by _privileged_helper_root_exists in
+# lib/clean/apps.sh, and that directory is absent on GitHub runners, so a
+# helper fixture without that stub finds nothing and passes vacuously in CI.
 tmp_dir="$(mktemp -d)"
 tmp_helper="$tmp_dir/org.amnezia.awg.plist"
 cat > "$tmp_helper" <<PLIST
@@ -2324,6 +3147,215 @@ EOF
     [[ "$output" != *"UNEXPECTED_PARENT_RESOLVER"* ]] || return 1
     [[ "$output" != *"UNEXPECTED_LAUNCHCTL"* ]] || return 1
     [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+}
+
+@test "clean_orphaned_system_services keeps a live helper whose name is no bundle id" {
+    # A vendor's cloud-print updater installs /Library/PrivilegedHelperTools/
+    # VendorCloudPrintUpdater: a plain file name, not a reverse-DNS id. With
+    # the binary present, asking whether an app with that "bundle id" is
+    # installed always answers no, so the running KeepAlive daemon and its
+    # plist were offered as orphaned (Mole Mac field report 2026-10-20).
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 \
+        DRY_RUN=false MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+should_protect_path() { return 1; }
+bundle_has_installed_app() {
+    printf 'PARENT_RESOLVER:%s\n' "$1"
+    return 1
+}
+
+tmp_dir=$(mktemp -d)
+tmp_plist="$tmp_dir/com.vendor.cloudprint.updater.plist"
+helper_binary="/Library/PrivilegedHelperTools/VendorCloudPrintUpdater"
+/usr/libexec/PlistBuddy -c "Add :Program string $helper_binary" "$tmp_plist" > /dev/null 2>&1
+
+_mole_materialize_bounded_sudo_find() {
+    if [[ "$3" == "/Library/LaunchDaemons" ]]; then
+        printf '%s\0' "$tmp_plist" > "$1"
+    else
+        : > "$1"
+    fi
+}
+sudo() {
+    [[ "${1:-}" == "-n" ]] && shift
+    case "${1:-}" in
+        true) return 0 ;;
+        test)
+            [[ "${2:-}" == "-e" && "${3:-}" == "$helper_binary" ]] || return 1
+            return 0
+            ;;
+        /usr/libexec/PlistBuddy | /usr/bin/stat) command "$@" ;;
+        du) printf '4\n' ;;
+        launchctl)
+            printf 'UNEXPECTED_LAUNCHCTL:%s\n' "$*"
+            return 0
+            ;;
+        *) return 0 ;;
+    esac
+}
+safe_sudo_remove() {
+    printf 'UNEXPECTED_REMOVE:%s\n' "$1"
+    return 0
+}
+
+clean_orphaned_system_services
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"PARENT_RESOLVER:VendorCloudPrintUpdater"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_LAUNCHCTL"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+    [[ "$output" != *"Orphaned services · cleaned"* ]]
+}
+
+@test "clean_orphaned_system_services keeps a live helper built on this Mac" {
+    # A user compiled a helper with clang into /Library/PrivilegedHelperTools/
+    # com.local.lid.helper and registered it as a LaunchDaemon itself. There is
+    # no parent app, so "parent app gone" proved nothing and the running
+    # daemon was offered as orphaned (Mole Mac field report 2026-11-02). Only a
+    # Developer ID signed helper, one an app shipped, can outlive its app.
+    local signed
+    for signed in 0 1; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 \
+            DRY_RUN=false MOLE_DRY_RUN=0 SIGNED="$signed" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+should_protect_path() { return 1; }
+bundle_has_installed_app() { return 1; }
+_privileged_helper_is_developer_id_signed() {
+    printf 'SIGNATURE_CHECK:%s\n' "$1"
+    [[ "$SIGNED" == "1" ]]
+}
+
+tmp_dir=$(mktemp -d)
+tmp_plist="$tmp_dir/com.local.lid.plist"
+helper_binary="/Library/PrivilegedHelperTools/com.local.lid.helper"
+/usr/libexec/PlistBuddy -c "Add :Program string $helper_binary" "$tmp_plist" > /dev/null 2>&1
+
+_mole_materialize_bounded_sudo_find() {
+    if [[ "$3" == "/Library/LaunchDaemons" ]]; then
+        printf '%s\0' "$tmp_plist" > "$1"
+    else
+        : > "$1"
+    fi
+}
+sudo() {
+    [[ "${1:-}" == "-n" ]] && shift
+    case "${1:-}" in
+        true) return 0 ;;
+        test)
+            [[ "${2:-}" == "-e" && "${3:-}" == "$helper_binary" ]] || return 1
+            return 0
+            ;;
+        /usr/libexec/PlistBuddy | /usr/bin/stat) command "$@" ;;
+        du) printf '4\n' ;;
+        launchctl) return 0 ;;
+        *) return 0 ;;
+    esac
+}
+safe_sudo_remove() {
+    printf 'REMOVE:%s\n' "$1"
+    return 0
+}
+
+clean_orphaned_system_services
+EOF
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        [[ "$output" == *"SIGNATURE_CHECK:/Library/PrivilegedHelperTools/com.local.lid.helper"* ]] || { echo "$output"; return 1; }
+        if [[ "$signed" == "0" ]]; then
+            [[ "$output" != *"REMOVE:"* ]] || { echo "$output"; return 1; }
+            [[ "$output" != *"Orphaned services · cleaned"* ]] || { echo "$output"; return 1; }
+        else
+            [[ "$output" == *"REMOVE:"*"com.local.lid.plist"* ]] || { echo "signed vendor helper was not offered: $output"; return 1; }
+        fi
+    done
+}
+
+@test "clean_orphaned_system_services lists a bare helper only when it is Developer ID signed" {
+    # Straight from PrivilegedHelperTools: an unsigned binary and a helper-root
+    # .plist beside one stay; a signed vendor helper whose app is gone is
+    # still offered. GitHub runners have no /Library/PrivilegedHelperTools,
+    # so the root check is stubbed and the listing comes from the sudo mock.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 \
+        DRY_RUN=false MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+should_protect_path() { return 1; }
+bundle_has_installed_app() { return 1; }
+_privileged_helper_is_developer_id_signed() { [[ "$1" == *com.vendor.gone.helper ]]; }
+_privileged_helper_root_exists() { return 0; }
+
+tmp_dir="$(mktemp -d)"
+helpers=("$tmp_dir/com.local.spare" "$tmp_dir/com.local.lid.helper" "$tmp_dir/com.local.lid.helper.plist"
+    "$tmp_dir/com.vendor.gone.helper")
+touch "${helpers[@]}"
+
+safe_sudo_remove() {
+    echo "removed:$1"
+    return 0
+}
+sudo() {
+    [[ "${1:-}" == "-n" ]] && shift
+    case "${1:-}" in
+        true) return 0 ;;
+        find)
+            case "${2:-}" in
+                /Library/PrivilegedHelperTools) printf '%s\0' "${helpers[@]}" ;;
+                *) : ;;
+            esac
+            return 0
+            ;;
+        du) echo "4 ${3:-}"; return 0 ;;
+        launchctl) return 0 ;;
+        *) command "$@" ;;
+    esac
+}
+
+clean_orphaned_system_services
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"removed:"*"com.vendor.gone.helper"* ]] || { echo "$output"; return 1; }
+    local kept
+    for kept in com.local.spare com.local.lid.helper; do
+        [[ "$output" != *"/$kept"* ]] || { echo "offered $kept: $output"; return 1; }
+    done
+}
+
+@test "_privileged_helper_is_developer_id_signed refuses Apple platform and missing binaries" {
+    [[ "$(uname -s)" == "Darwin" ]] || skip "codesign is macOS only"
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+for binary in /bin/ls /nonexistent/helper; do
+    rc=0
+    _privileged_helper_is_developer_id_signed "$binary" || rc=$?
+    printf 'RC:%s:%s\n' "$binary" "$rc"
+done
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC:/bin/ls:1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC:/nonexistent/helper:1"* ]] || { echo "$output"; return 1; }
 }
 
 @test "clean_orphaned_system_services keeps a standalone helper app plist during an executable update gap" {
@@ -2565,6 +3597,144 @@ EOF
     [[ "$output" == *"Orphaned services · cleaned 1"* ]] || return 1
     [[ "$output" == *"removed:"* ]] || return 1
     [[ "$output" != *"skipped 1 protected"* ]] || return 1
+}
+
+@test "clean_orphaned_system_services never nominates a half-removed Symantec or Broadcom agent" {
+    # A half-removed endpoint agent leaves launchd plists whose program is gone
+    # beside daemons that still run. The vendor's own uninstaller is the way to
+    # finish that, so these are never offered as orphans. A genuinely orphaned
+    # service in the same scan must still be found, which proves the scan ran.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 DRY_RUN=false MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+
+tmp_dir="$(mktemp -d)"
+symantec_plist="$tmp_dir/com.symantec.mes.daemon.plist"
+broadcom_plist="$tmp_dir/com.broadcom.mes.agent.plist"
+orphan_plist="$tmp_dir/com.example.gone.daemon.plist"
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing-symantec" "$symantec_plist" > /dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing-broadcom" "$broadcom_plist" > /dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing-binary" "$orphan_plist" > /dev/null 2>&1 || true
+
+safe_sudo_remove() {
+  echo "removed:$1"
+  return 0
+}
+
+sudo() {
+  if [[ "$1" == "-n" && "$2" == "true" ]]; then
+    return 0
+  fi
+  [[ "${1:-}" == "-n" ]] && shift
+  if [[ "$1" == "test" ]]; then
+    return 1
+  fi
+  if [[ "$1" == "find" ]]; then
+    case "$2" in
+      /Library/LaunchDaemons) printf '%s\0' "$symantec_plist" "$broadcom_plist" "$orphan_plist" ;;
+      *) : ;;
+    esac
+    return 0
+  fi
+  if [[ "$1" == "du" ]]; then
+    echo "4 ${3:-}"
+    return 0
+  fi
+  if [[ "$1" == "launchctl" ]]; then
+    return 0
+  fi
+  command "$@"
+}
+
+clean_orphaned_system_services
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Orphaned services · cleaned 1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"com.example.gone.daemon.plist"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"com.symantec.mes.daemon.plist"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"com.broadcom.mes.agent.plist"* ]] || { echo "$output"; return 1; }
+}
+
+@test "clean_orphaned_system_services never nominates AutoUpdate, MDM, security or VPN services" {
+    # Microsoft AutoUpdate serves products no app root proves, and management,
+    # security and VPN daemons keep running after their app looks gone. Mole
+    # Mac never offers them; a genuine orphan in the same scan still is.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 DRY_RUN=false MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+
+tmp_dir="$(mktemp -d)"
+plists=()
+for id in com.microsoft.autoupdate.helper com.west2online.ClashXPro.ProxyConfigHelper \
+    com.jamf.management.daemon io.tailscale.ipn.macsys.network-extension com.example.gone.daemon; do
+    /usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing-$id" "$tmp_dir/$id.plist" > /dev/null 2>&1 || true
+    plists+=("$tmp_dir/$id.plist")
+done
+# Helper binaries listed straight from PrivilegedHelperTools.
+helpers=("$tmp_dir/com.microsoft.autoupdate.helper" "$tmp_dir/io.tailscale.ipn.macsys.helper")
+touch "${helpers[@]}"
+
+safe_sudo_remove() {
+  echo "removed:$1"
+  return 0
+}
+
+sudo() {
+  if [[ "$1" == "-n" && "$2" == "true" ]]; then
+    return 0
+  fi
+  [[ "${1:-}" == "-n" ]] && shift
+  if [[ "$1" == "test" ]]; then
+    # The protection decides before any binary probe, so the installed
+    # helper branch (whose app no root proves) is never reached.
+    echo "probe:${3:-}" >> "$tmp_dir/probes"
+    return 1
+  fi
+  if [[ "$1" == "find" ]]; then
+    case "$2" in
+      /Library/LaunchDaemons) printf '%s\0' "${plists[@]}" ;;
+      /Library/PrivilegedHelperTools) printf '%s\0' "${helpers[@]}" ;;
+      *) : ;;
+    esac
+    return 0
+  fi
+  if [[ "$1" == "du" ]]; then
+    echo "4 ${3:-}"
+    return 0
+  fi
+  if [[ "$1" == "launchctl" ]]; then
+    return 0
+  fi
+  command "$@"
+}
+
+clean_orphaned_system_services
+if grep -v 'missing-com.example.gone' "$tmp_dir/probes" 2> /dev/null; then
+  echo "probed a protected service"
+  exit 1
+fi
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Orphaned services · cleaned 1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"com.example.gone.daemon.plist"* ]] || { echo "$output"; return 1; }
+    local kept
+    for kept in com.microsoft.autoupdate.helper ClashXPro com.jamf.management io.tailscale; do
+        [[ "$output" != *"$kept"* ]] || { echo "nominated $kept: $output"; return 1; }
+    done
 }
 
 @test "clean_orphaned_system_services keeps daemons whose binary is root-only readable (#1188)" {
@@ -3231,6 +4401,45 @@ EOF
 	}
 }
 
+@test "installed-app scan reads a PlayCover launcher alias through its bundle and still fails closed on a look-alike" {
+	# The alias has no Contents/, only a copy of the bundle's Info.plist and
+	# links back into the PlayCover container. Before this it failed the scan
+	# closed and skipped App leftovers for every PlayCover user. Only the strict
+	# alias shape counts; a directory that merely resembles it stays unreadable.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc << 'EOF'
+set -uo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+rm -f "$HOME/.cache/mole/installed_apps_cache"
+apps="$HOME/Applications"
+bundle="$HOME/Library/Containers/io.playcover.PlayCover/Applications/com.example.game.app"
+rm -rf "$apps" "$HOME/Library/Containers/io.playcover.PlayCover"
+mkdir -p "$apps/Good.app/Contents" "$apps/PlayCover/Game.app" "$bundle"
+plist='<?xml version="1.0"?><!DOCTYPE plist><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>%s</string></dict></plist>'
+printf "$plist" com.example.good > "$apps/Good.app/Contents/Info.plist"
+printf "$plist" com.example.game > "$bundle/Info.plist"
+cp "$bundle/Info.plist" "$apps/PlayCover/Game.app/Info.plist"
+: > "$bundle/Assets.car"
+ln -s "$bundle/Assets.car" "$apps/PlayCover/Game.app/Assets.car"
+debug_log() { :; }
+scan_installed_apps "$HOME/installed.txt" || { echo "SCAN_FAILED"; exit 1; }
+grep -Fxq "com.example.good" "$HOME/installed.txt" || { echo "MISSING_GOOD"; exit 1; }
+grep -Fxq "com.example.game" "$HOME/installed.txt" || { echo "MISSING_GAME"; exit 1; }
+
+# A flat directory outside the PlayCover launcher folder is not that alias.
+mkdir -p "$apps/Lookalike.app"
+printf "$plist" com.example.lookalike > "$apps/Lookalike.app/Info.plist"
+rm -f "$HOME/.cache/mole/installed_apps_cache"
+if scan_installed_apps "$HOME/installed2.txt"; then
+	echo "LOOKALIKE_NOT_FAILED"; exit 1
+fi
+EOF
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+}
+
 @test "installed-app scan skips an iOS app with a dangling WrappedBundle symlink" {
 	# AudioCopy.app has no Contents/, a WrappedBundle symlink into a Wrapper/
 	# that does not exist, so no readable plist anywhere. It owns no
@@ -3278,4 +4487,64 @@ EOF
 		echo "$output"
 		return 1
 	}
+}
+
+@test "clean_orphaned_system_services keeps a spinner up while it rechecks candidates" {
+    mole_test_fake_command mdfind
+    local order_log="$BATS_TEST_TMPDIR/orphan-order.log"
+    : > "$order_log"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" ORDER_LOG="$order_log" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 DRY_RUN=true MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+# Every hook appends to one file because the sizing call runs inside a
+# command substitution whose output is captured.
+start_section_spinner() { echo "START:${1:-}" >> "$ORDER_LOG"; }
+stop_section_spinner() { echo "STOP" >> "$ORDER_LOG"; }
+note_activity() { echo "PRINTED" >> "$ORDER_LOG"; }
+debug_log() { :; }
+
+tmp_dir="$(mktemp -d)"
+tmp_plist="$tmp_dir/com.sogou.test.plist"
+cat > "$tmp_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sogou.test</string>
+    <key>Program</key>
+    <string>$tmp_dir/missing-binary</string>
+</dict>
+</plist>
+PLIST
+
+sudo() {
+  if [[ "$1" == "-n" && "$2" == "true" ]]; then
+    return 0
+  fi
+  [[ "${1:-}" == "-n" ]] && shift
+  if [[ "$1" == "find" ]]; then
+    printf '%s\0' "$tmp_plist"
+    return 0
+  fi
+  if [[ "$1" == "du" ]]; then
+    echo "SIZED" >> "$ORDER_LOG"
+    echo "4 $tmp_plist"
+    return 0
+  fi
+  command "$@"
+}
+
+clean_orphaned_system_services
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Orphaned services · "*" found dry"* ]] || { echo "$output"; return 1; }
+    local order
+    order=$(grep -v '^START:Scanning' "$order_log" | tr '\n' '|')
+    # The per-candidate work runs under the "Checking" spinner, and the
+    # result line prints only after that spinner stops.
+    [[ "$order" == *"START:Checking orphaned system services...|SIZED|"*"STOP|PRINTED"* ]] || { echo "$order"; return 1; }
 }

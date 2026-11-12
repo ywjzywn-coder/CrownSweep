@@ -153,6 +153,15 @@ func TestShorten(t *testing.T) {
 		// Edge cases.
 		{"maxLen 1", "hello", 1, "…"},
 		{"maxLen 2", "hello", 2, "h…"},
+
+		// Width is counted in terminal cells, not bytes, and a cut never
+		// splits a multi-byte character.
+		{"curly apostrophe fits", "Kevin’s Mac", 11, "Kevin’s Mac"},
+		{"cut after curly apostrophe", "Kevin’s MacBook Pro", 9, "Kevin’s …"},
+		{"cut inside multi-byte rune", "Kevin’s Mac", 6, "Kevin…"},
+		{"accented name fits", "Café Helper", 11, "Café Helper"},
+		{"wide characters fit", "카카오톡", 8, "카카오톡"},
+		{"wide characters cut", "카카오톡 Helper", 7, "카카오…"},
 	}
 
 	for _, tt := range tests {
@@ -734,6 +743,22 @@ func TestFormatDiskLine(t *testing.T) {
 			label:        "INTR",
 			disk:         DiskStatus{UsedPercent: 110.0, Used: 110 << 30, Total: 100 << 30},
 			wantUsed:     "110G used",
+			wantFree:     "0 free",
+			wantNoSubstr: "%",
+		},
+		{
+			name:         "purgeable space is excluded from immediate free space",
+			label:        "INTR",
+			disk:         DiskStatus{UsedPercent: 64.9, Used: 1226 << 30, Total: 1860 << 30, Purgeable: 141 << 30},
+			wantUsed:     "1T used",
+			wantFree:     "493G free",
+			wantNoSubstr: "%",
+		},
+		{
+			name:         "purgeable exceeds available space clamps free to zero",
+			label:        "INTR",
+			disk:         DiskStatus{UsedPercent: 90, Used: 90 << 30, Total: 100 << 30, Purgeable: 20 << 30},
+			wantUsed:     "90G used",
 			wantFree:     "0 free",
 			wantNoSubstr: "%",
 		},
@@ -1715,6 +1740,23 @@ func TestRenderMemoryCardHidesSwapSizeOnNarrowWidth(t *testing.T) {
 	}
 }
 
+// Now that the level is real (#1963), normal is the usual answer, so only warn
+// and critical earn a line.
+func TestRenderMemoryCardShowsPressureOnlyWhenItNeedsAttention(t *testing.T) {
+	for pressure, want := range map[string]string{"": "", "normal": "", "warn": "Status warn", "critical": "Status critical"} {
+		card := renderMemoryCard(MemoryStatus{Used: 8 << 30, Total: 16 << 30, Available: 8 << 30, UsedPercent: 50, Pressure: pressure}, 60)
+		got := ""
+		for _, line := range card.lines {
+			if text := stripANSI(line); strings.HasPrefix(text, "Status") {
+				got = text
+			}
+		}
+		if got != want {
+			t.Errorf("pressure %q: status line %q, want %q", pressure, got, want)
+		}
+	}
+}
+
 func TestRenderMemoryCardShowsSwapSizeOnWideWidth(t *testing.T) {
 	card := renderMemoryCard(MemoryStatus{
 		Used:        8 << 30,
@@ -1794,8 +1836,8 @@ func TestModelViewPadsToTerminalHeight(t *testing.T) {
 
 			view := m.View()
 			got := lipgloss.Height(view)
-			if got < tt.height {
-				t.Errorf("View() height = %d, want >= %d (terminal height)", got, tt.height)
+			if tt.height > 0 && got != tt.height {
+				t.Errorf("View() height = %d, want %d (terminal height)", got, tt.height)
 			}
 		})
 	}
@@ -1836,4 +1878,39 @@ func stripANSI(s string) string {
 		}
 	}
 	return result.String()
+}
+
+func TestBatteryCardUnknownCapacityPreservesCycles(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		capacity, cycles int
+		want             string
+	}{
+		{"capacity unavailable", 0, 100, "100 cycles"},
+		{"known healthy capacity", 98, 100, "Healthy"},
+		{"known worn capacity", 20, 50, "Service Soon"},
+		{"known cycle warning", 0, 1001, "Fair"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			card := renderBatteryCard([]BatteryStatus{{Percent: 50, Capacity: tc.capacity, CycleCount: tc.cycles, Status: "Discharging"}}, ThermalStatus{}, true)
+			rendered := strings.Join(card.lines, "\n")
+			if !strings.Contains(rendered, tc.want) {
+				t.Fatalf("missing %q in %q", tc.want, rendered)
+			}
+			if tc.capacity == 0 && strings.Contains(rendered, "Healthy") {
+				t.Fatalf("unknown capacity rendered healthy: %q", rendered)
+			}
+			if strings.Contains(rendered, "·  ·") || strings.Contains(rendered, "· ·") {
+				t.Fatalf("empty health label left a separator: %q", rendered)
+			}
+		})
+	}
+}
+
+func TestBatteryCardUnknownCapacityKeepsSystemCondition(t *testing.T) {
+	card := renderBatteryCard([]BatteryStatus{{Percent: 50, CycleCount: 100, Health: "Service Recommended", Status: "Discharging"}}, ThermalStatus{}, true)
+	rendered := strings.Join(card.lines, "\n")
+	if !strings.Contains(rendered, "Service Recommended") || !strings.Contains(rendered, "100 cycles") || strings.Contains(rendered, "Healthy") {
+		t.Fatalf("independent system condition or cycles lost: %q", rendered)
+	}
 }

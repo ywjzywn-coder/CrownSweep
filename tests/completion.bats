@@ -42,7 +42,7 @@ setup() {
 
 @test "completion --help shows usage" {
 	run "$PROJECT_ROOT/bin/completion.sh" --help
-	[ "$status" -ne 0 ]
+	[ "$status" -eq 0 ]
 	[[ "$output" == *"Usage: mole completion"* ]] || return 1
 	[[ "$output" == *"Auto-install"* ]]
 }
@@ -207,3 +207,62 @@ setup() {
     [ "$status" -eq 0 ]
     [[ "$output" == *'__fish_seen_subcommand_from purge" -l yes -d "Confirm unattended cleanup of eligible artifacts"'* ]]
 }
+
+@test "completion auto-install preserves a symlinked zshrc" {
+	mkdir -p "$HOME/dotfiles"
+	printf '# user zsh setting\n' >"$HOME/dotfiles/zshrc"
+	ln -s "$HOME/dotfiles/zshrc" "$HOME/.zshrc"
+
+	run /bin/bash -c "echo 'y' | SHELL=/bin/zsh \"$PROJECT_ROOT/bin/completion.sh\""
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[ -L "$HOME/.zshrc" ] || return 1
+	[ "$(readlink "$HOME/.zshrc")" = "$HOME/dotfiles/zshrc" ] || return 1
+	grep -Fq '# user zsh setting' "$HOME/dotfiles/zshrc" || return 1
+	grep -Eq '(mole|mo)[[:space:]]+completion' "$HOME/dotfiles/zshrc"
+}
+
+@test "completion auto-install does not mistake another tool's completion line for Mole" {
+	printf 'gizmo completion zsh\n' >"$HOME/.zshrc"
+
+	run env SHELL=/bin/zsh "$PROJECT_ROOT/bin/completion.sh" --dry-run
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" != *"Would normalize completion entry"* ]] || return 1
+	[ "$(cat "$HOME/.zshrc")" = "gizmo completion zsh" ]
+}
+
+@test "completion normalization keeps user lines mentioning Mole completion" {
+    cat > "$HOME/expected-user-lines" <<'RC'
+export NOTE="mo completion zsh"
+alias setup='mo completion zsh; echo keep'
+if command -v mole; then source <(mole completion zsh); export KEEP=yes; fi
+# Run mole completion zsh to inspect the script
+RC
+    cat "$HOME/expected-user-lines" > "$HOME/.zshrc"
+    # shellcheck disable=SC2016 # Assert literal shell configuration, not execution.
+    printf '%s\n' '# Mole shell completion' 'eval "$(mole completion zsh)"' >> "$HOME/.zshrc"
+    run env SHELL=/bin/zsh "$PROJECT_ROOT/bin/completion.sh"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    while IFS= read -r line; do
+        grep -Fxq "$line" "$HOME/.zshrc" || return 1
+    done < "$HOME/expected-user-lines"
+    # shellcheck disable=SC2016 # Assert literal shell configuration.
+    ! grep -Fxq 'eval "$(mole completion zsh)"' "$HOME/.zshrc" || return 1
+    # shellcheck disable=SC2016 # Assert literal shell configuration.
+    grep -Fxq 'if output="$(mole completion zsh 2>/dev/null)"; then eval "$output"; fi' "$HOME/.zshrc" || return 1
+}
+
+@test "completion confirmation cancels on closed input (#1837)" {
+	run /bin/bash -c "SHELL=/bin/zsh \"$PROJECT_ROOT/bin/completion.sh\" </dev/null"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"Cancelled"* ]] || return 1
+	[ ! -f "$HOME/.zshrc" ]
+}
+
+@test "completion fish confirmation cancels on closed input (#1837)" {
+	run /bin/bash -c "SHELL=/bin/fish \"$PROJECT_ROOT/bin/completion.sh\" </dev/null"
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"Cancelled"* ]] || return 1
+	[ ! -f "$HOME/.config/fish/completions/mole.fish" ]
+	[ ! -f "$HOME/.config/fish/completions/mo.fish" ]
+}
+

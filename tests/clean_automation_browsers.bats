@@ -185,6 +185,26 @@ EOF
     [[ "$output" != *"SAFE_CLEAN"*"profile-fresh"* ]] || { echo "$output"; return 1; }
 }
 
+@test "GNU stat earlier in PATH does not break stale profile cleanup (#1752)" {
+    make_process_stubs
+    : > "$HOME/kill.trace"
+    mkdir -p "$HOME/tmproot/playwright_chromiumdev_profile-stale"
+    touch -t 202601010000 "$HOME/tmproot/playwright_chromiumdev_profile-stale"
+    # GNU coreutils reads -f as "file system status": it prints a File: block
+    # and fails on the format operand, which aborted mo clean under set -u.
+    cat > "$HOME/bin/stat" <<'SCRIPT'
+#!/bin/bash
+printf '  File: "%s"\n    ID: 0 Namelen: ? Type: apfs\n' "${@: -1}"
+exit 1
+SCRIPT
+    chmod +x "$HOME/bin/stat"
+
+    run_cleanup false
+    rm -f "$HOME/bin/stat"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SAFE_CLEAN"*"profile-stale"* ]] || { echo "$output"; return 1; }
+}
+
 @test "a profile is kept when pgrep cannot answer" {
     make_process_stubs
     : > "$HOME/kill.trace"

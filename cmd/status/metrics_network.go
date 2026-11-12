@@ -102,6 +102,7 @@ func (c *Collector) collectNetwork(now time.Time) []NetworkStatus {
 			TxRateMBs:     tx,
 			IP:            ifAddrs[cur.Name],
 			defaultTunnel: cur.Name == defaultInterface && isTunnelInterface(cur.Name),
+			defaultRoute:  cur.Name == defaultInterface,
 		})
 	}
 
@@ -118,6 +119,14 @@ func (c *Collector) collectNetwork(now time.Time) []NetworkStatus {
 		return result[i].RxRateMBs+result[i].TxRateMBs > result[j].RxRateMBs+result[j].TxRateMBs
 	})
 	if len(result) > 3 {
+		// Idle interfaces tie at zero and the kernel lists Thunderbolt ports
+		// before Wi-Fi en0, so an idle routed interface could fall off the cap.
+		for i := 3; i < len(result); i++ {
+			if result[i].Name == defaultInterface {
+				result[2] = result[i]
+				break
+			}
+		}
 		result = result[:3]
 	}
 

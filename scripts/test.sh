@@ -29,6 +29,7 @@ export MOLE_TEST_NO_AUTH=1
 unset NO_COLOR
 
 TEST_SYSTEM_STUB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mole-test-stubs.XXXXXX")"
+TEST_SYSTEM_STUB_DIR="$(cd -P "$TEST_SYSTEM_STUB_DIR" && pwd -P)"
 TEST_GO_HELPER_DIR=""
 # shellcheck disable=SC2329  # Invoked by trap.
 cleanup_test_stubs() {
@@ -36,8 +37,33 @@ cleanup_test_stubs() {
     if [[ -n "$TEST_GO_HELPER_DIR" ]]; then
         rm -rf "$TEST_GO_HELPER_DIR" # SAFE: exact mktemp-created Go helper directory
     fi
+    prune_test_launchservices || true
+}
+
+# Spotlight indexes tests/tmp-* within seconds and registers every fixture
+# .app with LaunchServices; deleting the fixture leaves the record behind.
+# Thousands of dead records slow every `lsregister -dump`, which Mole Mac's
+# uninstall reads (66,532 of them made each read take 36 to 56 s,
+# 2026-10-26). Unregister only records under tests/ whose bundle is gone.
+# shellcheck disable=SC2329  # Invoked by cleanup_test_stubs.
+prune_test_launchservices() {
+    local lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    [[ -x "$lsregister" ]] || return 0
+    "$lsregister" -dump Bundle 2> /dev/null |
+        sed -n -E 's/^path: +(.*) \(0x[0-9a-f]+\)$/\1/p' |
+        while IFS= read -r path; do
+            [[ "$path" == "$PROJECT_ROOT/tests/"* ]] || continue
+            [[ -e "$path" || -L "$path" ]] || printf '%s\0' "$path"
+        done |
+        xargs -0 -n 200 "$lsregister" -u > /dev/null 2>&1
 }
 trap cleanup_test_stubs EXIT
+
+# Module-loading and installation probes run outside the Bats helper too.
+# Keep their temp registries and stale-temp pruning inside this owned tree.
+mkdir -p "$TEST_SYSTEM_STUB_DIR/tmp"
+export TMPDIR="$TEST_SYSTEM_STUB_DIR/tmp"
+unset MOLE_RESOLVED_TMPDIR MOLE_TEMP_REGISTRY_FILE
 
 cat > "$TEST_SYSTEM_STUB_DIR/sudo" << 'EOF'
 #!/bin/bash
@@ -88,8 +114,8 @@ enforce_timeout_dependency_in_ci() {
         return 0
     fi
 
-    printf "${RED}${ICON_ERROR} Missing timeout binary (gtimeout/timeout) in CI${NC}\n"
-    printf "${YELLOW}${ICON_WARNING} Install coreutils to provide gtimeout${NC}\n"
+    printf '%b' "${RED}${ICON_ERROR} Missing timeout binary (gtimeout/timeout) in CI${NC}\n"
+    printf '%b' "${YELLOW}${ICON_WARNING} Install coreutils to provide gtimeout${NC}\n"
     exit 1
 }
 
@@ -108,9 +134,9 @@ report_slowest_test_files() {
 
 report_unit_result() {
     if [[ $1 -eq 0 ]]; then
-        printf "${GREEN}${ICON_SUCCESS} Unit tests passed${NC}\n"
+        printf '%b' "${GREEN}${ICON_SUCCESS} Unit tests passed${NC}\n"
     else
-        printf "${RED}${ICON_ERROR} Unit tests failed${NC}\n"
+        printf '%b' "${RED}${ICON_ERROR} Unit tests failed${NC}\n"
         FAILED=$((FAILED + 1))
     fi
 }
@@ -150,22 +176,23 @@ prepare_go_test_helpers() {
 
 echo "1. Linting test scripts..."
 if command -v shellcheck > /dev/null 2>&1; then
+    # Concurrent Bats runs own tests/tmp-* fixtures, not lint inputs.
     TEST_FILES=()
     while IFS= read -r file; do
         TEST_FILES+=("$file")
-    done < <(find tests -type f \( -name '*.bats' -o -name '*.bash' -o -name '*.sh' \) | sort)
+    done < <(find tests -type d -path 'tests/tmp-*' -prune -o -type f \( -name '*.bats' -o -name '*.bash' -o -name '*.sh' \) -print | sort)
     if [[ ${#TEST_FILES[@]} -gt 0 ]]; then
         if shellcheck --rcfile "$PROJECT_ROOT/.shellcheckrc" "${TEST_FILES[@]}"; then
-            printf "${GREEN}${ICON_SUCCESS} Test script lint passed${NC}\n"
+            printf '%b' "${GREEN}${ICON_SUCCESS} Test script lint passed${NC}\n"
         else
-            printf "${RED}${ICON_ERROR} Test script lint failed${NC}\n"
+            printf '%b' "${RED}${ICON_ERROR} Test script lint failed${NC}\n"
             FAILED=$((FAILED + 1))
         fi
     else
-        printf "${YELLOW}${ICON_WARNING} No test scripts found, skipping${NC}\n"
+        printf '%b' "${YELLOW}${ICON_WARNING} No test scripts found, skipping${NC}\n"
     fi
 else
-    printf "${YELLOW}${ICON_WARNING} shellcheck not installed, skipping${NC}\n"
+    printf '%b' "${YELLOW}${ICON_WARNING} shellcheck not installed, skipping${NC}\n"
 fi
 echo ""
 
@@ -270,6 +297,12 @@ if command -v bats > /dev/null 2>&1 && [ -d "tests" ]; then
     # Some test files include wall-clock timing assertions that are skewed by
     # CPU contention from parallel test workers. Safety/optimize fixtures also
     # use 1-2s subprocess budgets that must reach their mocked action first.
+    # Project-cache stalled-root probes have a five-second outer alarm.
+    # The uninstall and main-menu PTY cases depend on one-second
+    # escape-sequence reads and real-terminal signal timing, and the history
+    # load-time case compares wall-clock work. cli.bats, uninstall_review.bats
+    # and history.bats each hold such a case and have gone red on main only
+    # under the parallel batch, then passed unchanged on a serial rerun.
     # When parallel mode is active,
     # split them out to run sequentially after the parallel batch completes.
     _sequential_files=()
@@ -279,14 +312,14 @@ if command -v bats > /dev/null 2>&1 && [ -d "tests" ]; then
         if [[ ${#_all[@]} -eq 1 && -d "${_all[0]}" ]]; then
             while IFS= read -r _f; do
                 case "$_f" in
-                    *core_performance.bats | *regression.bats | *core_safe_functions.bats | *optimize.bats) _sequential_files+=("$_f") ;;
+                    *core_performance.bats | *regression.bats | *core_safe_functions.bats | *clean_system_caches.bats | *optimize.bats | *uninstall_menu.bats | *cli.bats | *uninstall_review.bats | *history.bats) _sequential_files+=("$_f") ;;
                     *) _rest+=("$_f") ;;
                 esac
             done < <(find "${_all[0]}" -type f -name '*.bats' | sort)
         else
             for _f in "${_all[@]}"; do
                 case "$_f" in
-                    *core_performance.bats | *regression.bats | *core_safe_functions.bats | *optimize.bats) _sequential_files+=("$_f") ;;
+                    *core_performance.bats | *regression.bats | *core_safe_functions.bats | *clean_system_caches.bats | *optimize.bats | *uninstall_menu.bats | *cli.bats | *uninstall_review.bats | *history.bats) _sequential_files+=("$_f") ;;
                     *) _rest+=("$_f") ;;
                 esac
             done
@@ -345,31 +378,35 @@ if command -v bats > /dev/null 2>&1 && [ -d "tests" ]; then
     report_slowest_test_files
     report_unit_result "$_unit_rc"
 else
-    printf "${YELLOW}${ICON_WARNING} bats not installed or no tests found, skipping${NC}\n"
+    printf '%b' "${YELLOW}${ICON_WARNING} bats not installed or no tests found, skipping${NC}\n"
 fi
 echo ""
 
 echo "3. Running Go tests..."
 if command -v go > /dev/null 2>&1; then
     mkdir -p "$GO_TEST_CACHE"
-    if GOCACHE="$GO_TEST_CACHE" go build ./... > /dev/null 2>&1 &&
-        GOCACHE="$GO_TEST_CACHE" go vet ./... > /dev/null 2>&1 &&
-        GOCACHE="$GO_TEST_CACHE" go test ./... > /dev/null 2>&1; then
-        printf "${GREEN}${ICON_SUCCESS} Go tests passed${NC}\n"
+    # Kept quiet on success; on failure the output names the failing test,
+    # which CI otherwise never shows (a CI-only Go failure on #1839).
+    go_test_log="$TEST_SYSTEM_STUB_DIR/go-test.log"
+    if GOCACHE="$GO_TEST_CACHE" go build ./... > "$go_test_log" 2>&1 &&
+        GOCACHE="$GO_TEST_CACHE" go vet ./... >> "$go_test_log" 2>&1 &&
+        GOCACHE="$GO_TEST_CACHE" go test ./... >> "$go_test_log" 2>&1; then
+        printf '%b' "${GREEN}${ICON_SUCCESS} Go tests passed${NC}\n"
     else
-        printf "${RED}${ICON_ERROR} Go tests failed${NC}\n"
+        cat "$go_test_log"
+        printf '%b' "${RED}${ICON_ERROR} Go tests failed${NC}\n"
         FAILED=$((FAILED + 1))
     fi
 else
-    printf "${YELLOW}${ICON_WARNING} Go not installed, skipping Go tests${NC}\n"
+    printf '%b' "${YELLOW}${ICON_WARNING} Go not installed, skipping Go tests${NC}\n"
 fi
 echo ""
 
 echo "4. Testing module loading..."
 if bash -c 'source lib/core/common.sh && echo "OK"' > /dev/null 2>&1; then
-    printf "${GREEN}${ICON_SUCCESS} Module loading passed${NC}\n"
+    printf '%b' "${GREEN}${ICON_SUCCESS} Module loading passed${NC}\n"
 else
-    printf "${RED}${ICON_ERROR} Module loading failed${NC}\n"
+    printf '%b' "${RED}${ICON_ERROR} Module loading failed${NC}\n"
     FAILED=$((FAILED + 1))
 fi
 echo ""
@@ -377,9 +414,9 @@ echo ""
 echo "5. Running integration tests..."
 # Quick syntax check for main scripts
 if bash -n mole && bash -n bin/clean.sh && bash -n bin/optimize.sh; then
-    printf "${GREEN}${ICON_SUCCESS} Integration tests passed${NC}\n"
+    printf '%b' "${GREEN}${ICON_SUCCESS} Integration tests passed${NC}\n"
 else
-    printf "${RED}${ICON_ERROR} Integration tests failed${NC}\n"
+    printf '%b' "${RED}${ICON_ERROR} Integration tests failed${NC}\n"
     FAILED=$((FAILED + 1))
 fi
 echo ""
@@ -387,13 +424,13 @@ echo ""
 echo "6. Testing installation..."
 # Installation script is macOS-specific; skip this test on non-macOS platforms
 if [[ "$(uname -s)" != "Darwin" ]]; then
-    printf "${YELLOW}${ICON_WARNING} Installation test skipped (non-macOS)${NC}\n"
+    printf '%b' "${YELLOW}${ICON_WARNING} Installation test skipped (non-macOS)${NC}\n"
 else
     # Skip if Homebrew mole is installed (install.sh will refuse to overwrite)
     install_test_home=""
     install_test_prefix=""
     if command -v brew > /dev/null 2>&1 && brew list mole &> /dev/null; then
-        printf "${GREEN}${ICON_SUCCESS} Installation test skipped, Homebrew${NC}\n"
+        printf '%b' "${GREEN}${ICON_SUCCESS} Installation test skipped, Homebrew${NC}\n"
     else
         install_test_home="$(mktemp -d "$PROJECT_ROOT/tests/tmp-install-home.XXXXXX" 2> /dev/null || true)"
         if [[ -z "$install_test_home" ]]; then
@@ -414,13 +451,13 @@ else
         MO_NO_OPLOG=1 \
         ./install.sh --prefix "$install_test_prefix" > /dev/null 2>&1; then
         if [[ -f "$install_test_prefix/mole" ]]; then
-            printf "${GREEN}${ICON_SUCCESS} Installation test passed${NC}\n"
+            printf '%b' "${GREEN}${ICON_SUCCESS} Installation test passed${NC}\n"
         else
-            printf "${RED}${ICON_ERROR} Installation test failed${NC}\n"
+            printf '%b' "${RED}${ICON_ERROR} Installation test failed${NC}\n"
             FAILED=$((FAILED + 1))
         fi
     else
-        printf "${RED}${ICON_ERROR} Installation test failed${NC}\n"
+        printf '%b' "${RED}${ICON_ERROR} Installation test failed${NC}\n"
         FAILED=$((FAILED + 1))
     fi
     if [[ -n "$install_test_prefix" ]]; then
@@ -434,8 +471,8 @@ echo ""
 
 echo "==============================="
 if [[ $FAILED -eq 0 ]]; then
-    printf "${GREEN}${ICON_SUCCESS} All tests passed!${NC}\n"
+    printf '%b' "${GREEN}${ICON_SUCCESS} All tests passed!${NC}\n"
     exit 0
 fi
-printf "${RED}${ICON_ERROR} $FAILED tests failed!${NC}\n"
+printf '%b' "${RED}${ICON_ERROR} $FAILED tests failed!${NC}\n"
 exit 1

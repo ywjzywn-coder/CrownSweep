@@ -14,7 +14,7 @@ source "$PROJECT_ROOT/lib/optimize/outcomes.sh"
 optimize_outcomes_reset
 optimize_task_start
 optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_APPLIED"
-optimize_task_finish system_maintenance
+optimize_task_finish network_optimization
 
 [[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
 [[ "$(optimize_outcome_count unchanged)" == "0" ]] || exit 1

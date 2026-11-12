@@ -14,10 +14,29 @@ brew_autoremove_preview_has_items() {
     grep -Eq '^(==> )?Would autoremove [0-9]+ unneeded formula' "$preview_file"
 }
 
+# Autoremove stays a review line: brew only sees its own dependency graph, so
+# a formula a venv, pyenv build or cargo crate links against can still look
+# unneeded (#1093). Name up to three candidates and count the rest.
 show_brew_autoremove_preview() {
     local preview_file="$1"
-    echo -e "  ${GRAY}${ICON_WARNING}${NC} Homebrew autoremove would remove:"
-    sed 's/^/    /' "$preview_file"
+    local -a names=()
+    local name
+    while IFS= read -r name; do
+        [[ -n "$name" ]] && names+=("$(mole_terminal_safe_text "$name")")
+    done < <(awk 'found && NF && $0 !~ /^==>/ { print $1 } /Would autoremove [0-9]+ unneeded formula/ { found = 1 }' "$preview_file")
+    [[ ${#names[@]} -gt 0 ]] || return 0
+
+    local subject=""
+    if [[ ${#names[@]} -le 3 ]]; then
+        subject="${names[0]}"
+        local i
+        for ((i = 1; i < ${#names[@]}; i++)); do
+            subject+=", ${names[i]}"
+        done
+    else
+        subject="${#names[@]} formulae"
+    fi
+    echo -e "  ${GRAY}${ICON_REVIEW}${NC} Homebrew unused dependencies · ${subject} · remove with ${GRAY}brew autoremove${NC}"
 }
 
 # `brew cleanup --dry-run` shares the real run's arguments, so the preview
@@ -70,7 +89,7 @@ show_brew_cleanup_preview() {
     if [[ -n "$freed" ]]; then
         echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Homebrew cleanup · would free ${freed}"
     else
-        echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Homebrew cleanup · ${#rows[@]} items"
+        echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Homebrew cleanup · $(mole_count_label "${#rows[@]}" item)"
     fi
     printf '    %s\n' "${rows[@]}"
 }
@@ -87,7 +106,8 @@ brew_cleanup_ran_recently() {
     current_time=$(get_epoch_seconds)
     local time_diff=$((current_time - last_cleanup))
     local days_diff=$((time_diff / 86400))
-    [[ $days_diff -lt $cache_valid_days ]] || return 1
+    # A stamp from the future (clock set back) is expired, not recent.
+    [[ $time_diff -ge 0 && $days_diff -lt $cache_valid_days ]] || return 1
     local cleaned_when="cleaned ${days_diff}d ago"
     [[ $days_diff -eq 0 ]] && cleaned_when="cleaned today"
     debug_log "Homebrew cleanup skipped: ${cleaned_when}"
@@ -287,7 +307,9 @@ clean_homebrew() {
                 local dry_run_cleanup_file
                 dry_run_cleanup_file=$(create_temp_file)
                 local dry_run_cleanup_exit=0
+                if [[ -t 1 ]]; then MOLE_SPINNER_PREFIX="  " start_inline_spinner "Homebrew cleanup..."; fi
                 run_brew_cleanup_preview "$cleanup_timeout" "$dry_run_cleanup_file" || dry_run_cleanup_exit=$?
+                if [[ -t 1 ]]; then stop_inline_spinner; fi
                 if [[ $dry_run_cleanup_exit -eq 0 ]]; then
                     show_brew_cleanup_preview "$dry_run_cleanup_file" && note_activity
                 elif mole_rc_timeout "$dry_run_cleanup_exit"; then
@@ -297,15 +319,18 @@ clean_homebrew() {
                     echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Homebrew · would cleanup"
                     note_activity
                 fi
-            fi
-            local dry_run_autoremove_file
-            dry_run_autoremove_file=$(create_temp_file)
-            local dry_run_autoremove_exit=0
-            run_brew_autoremove_preview "$autoremove_preview_timeout" "$dry_run_autoremove_file" || dry_run_autoremove_exit=$?
-            if [[ $dry_run_autoremove_exit -eq 0 ]] && brew_autoremove_preview_has_items "$dry_run_autoremove_file"; then
-                show_brew_autoremove_preview "$dry_run_autoremove_file"
-            elif mole_rc_timeout "$dry_run_autoremove_exit"; then
-                echo -e "  ${GRAY}${ICON_WARNING}${NC} Autoremove preview timed out · run ${GRAY}brew autoremove --dry-run${NC} manually"
+                # Autoremove sits after the window check in the real run too.
+                local dry_run_autoremove_file
+                dry_run_autoremove_file=$(create_temp_file)
+                local dry_run_autoremove_exit=0
+                if [[ -t 1 ]]; then MOLE_SPINNER_PREFIX="  " start_inline_spinner "Checking Homebrew dependencies..."; fi
+                run_brew_autoremove_preview "$autoremove_preview_timeout" "$dry_run_autoremove_file" || dry_run_autoremove_exit=$?
+                if [[ -t 1 ]]; then stop_inline_spinner; fi
+                if [[ $dry_run_autoremove_exit -eq 0 ]] && brew_autoremove_preview_has_items "$dry_run_autoremove_file"; then
+                    show_brew_autoremove_preview "$dry_run_autoremove_file"
+                elif mole_rc_timeout "$dry_run_autoremove_exit"; then
+                    echo -e "  ${GRAY}${ICON_WARNING}${NC} Autoremove preview timed out · run ${GRAY}brew autoremove --dry-run${NC} manually"
+                fi
             fi
         fi
         return 0
@@ -332,6 +357,12 @@ clean_homebrew() {
         run_with_timeout "$cleanup_timeout" brew cleanup --prune=30 > "$brew_tmp_file" 2>&1 || brew_exit=$?
     if [[ -t 1 ]]; then stop_inline_spinner; fi
     restore_homebrew_active_links
+    if mole_rc_signal "$brew_exit"; then
+        # Ctrl-C while brew holds the terminal reaches only the child.
+        debug_log "Homebrew cleanup: owner command interrupted (exit $brew_exit)"
+        _mole_record_clean_cancellation "$brew_exit" "Homebrew cleanup"
+        return "$brew_exit"
+    fi
 
     local brew_success=false
     if [[ $brew_exit -eq 0 ]]; then
@@ -351,7 +382,7 @@ clean_homebrew() {
                 echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup${NC} · ${GREEN}$freed_space${NC}"
                 note_activity
             else
-                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup · ${removed_count} items"
+                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Homebrew cleanup · $(mole_count_label "${removed_count}" item)"
                 note_activity
             fi
         fi
@@ -362,7 +393,9 @@ clean_homebrew() {
     local autoremove_preview_file
     autoremove_preview_file=$(create_temp_file)
     local autoremove_preview_exit=0
+    if [[ -t 1 ]]; then MOLE_SPINNER_PREFIX="  " start_inline_spinner "Checking Homebrew dependencies..."; fi
     run_brew_autoremove_preview "$autoremove_preview_timeout" "$autoremove_preview_file" || autoremove_preview_exit=$?
+    if [[ -t 1 ]]; then stop_inline_spinner; fi
     if mole_rc_timeout "$autoremove_preview_exit"; then
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Autoremove preview timed out · run ${GRAY}brew autoremove --dry-run${NC} manually"
         # Keep the manual-action guidance visible past the idle-section erase.
@@ -372,7 +405,6 @@ clean_homebrew() {
         note_activity
     elif brew_autoremove_preview_has_items "$autoremove_preview_file"; then
         show_brew_autoremove_preview "$autoremove_preview_file"
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Homebrew autoremove · skipped (run ${GRAY}brew autoremove${NC} manually)"
         note_activity
     fi
     # Stamp only a finished cleanup; a timed-out one resumes on the next run.
@@ -380,4 +412,241 @@ clean_homebrew() {
         ensure_user_file "$brew_cache_file"
         get_epoch_seconds > "$brew_cache_file"
     fi
+}
+
+# Homebrew service logs. `brew services` points nginx, php-fpm, redis,
+# postgresql and friends at <prefix>/var/log, `brew cleanup` never touches
+# that tree, and a user with several services can carry tens of MB there
+# untouched for months. Only <prefix>/var/log is scanned; its siblings
+# (var/mysql, var/postgresql@*, var/redis, var/lib, var/run) are databases
+# and runtime state, and nothing below reaches them.
+#
+# A candidate is a log-shaped regular file (*.log, *.log.N, *.log.gz,
+# *.log.N.gz) at most one directory below the root, with one link, owned by
+# the invoking user, and older than MOLE_LOG_AGE_DAYS. A file any process
+# holds open is kept: deleting a log a running service writes frees nothing
+# and leaves the service writing to an unlinked inode. An open state that
+# cannot be proven (no complete process view, timeout, lsof diagnostics) keeps
+# every candidate.
+_BREW_SERVICE_LOG_ROOT=""
+_BREW_SERVICE_LOG_UID=""
+
+brew_service_log_name_is_log() {
+    local name="$1"
+    case "$name" in
+        *.log | *.log.gz) return 0 ;;
+    esac
+    [[ "$name" =~ \.log\.[0-9]+(\.gz)?$ ]]
+}
+
+# Print the physical <prefix>/var/log root. Returns 1 when Homebrew or the
+# root is absent, symlinked, or the prefix lookup fails; a signal passes up.
+brew_service_log_root() {
+    local prefix=""
+    local prefix_rc=0
+    prefix=$(HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 \
+        run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" brew --prefix 2> /dev/null) || prefix_rc=$?
+    if mole_rc_signal "$prefix_rc"; then
+        return "$prefix_rc"
+    fi
+    [[ $prefix_rc -eq 0 && "$prefix" == /* && -d "$prefix" ]] || return 1
+    local physical_prefix=""
+    physical_prefix=$(cd -P "$prefix" 2> /dev/null && pwd -P) || return 1
+    local root="$physical_prefix/var/log"
+    [[ -d "$root" && ! -L "$root" && ! -L "$physical_prefix/var" ]] || return 1
+    local physical_root=""
+    physical_root=$(cd -P "$root" 2> /dev/null && pwd -P) || return 1
+    [[ "$physical_root" == "$root" ]] || return 1
+    printf '%s\n' "$root"
+}
+
+# Re-read one candidate's metadata. Used for the plan and again at the sink,
+# so a log a service reopened or rewrote since the scan is never removed.
+brew_service_log_is_eligible() {
+    local path="$1"
+    local root="$_BREW_SERVICE_LOG_ROOT"
+    [[ -n "$root" && -n "$_BREW_SERVICE_LOG_UID" ]] || return 1
+    [[ "$path" == "$root"/* ]] || return 1
+    local relative="${path#"$root"/}"
+    [[ -n "$relative" && "$relative" != */*/* && "$relative" != *"/../"* &&
+        "$relative" != ../* && "$relative" != */.. ]] || return 1
+    # lsof -F reports one name per line, so a control character in a name
+    # could split it into a record that matches another candidate.
+    [[ "$relative" != *[[:cntrl:]]* ]] || return 1
+    brew_service_log_name_is_log "${path##*/}" || return 1
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    if [[ "$relative" == */* ]]; then
+        local parent="${path%/*}"
+        [[ -d "$parent" && ! -L "$parent" ]] || return 1
+    fi
+
+    local meta=""
+    meta=$("$STAT_BSD" -f '%u %l %m' "$path" 2> /dev/null) || return 1
+    local owner links mtime
+    read -r owner links mtime <<< "$meta"
+    [[ "$owner" == "$_BREW_SERVICE_LOG_UID" && "$links" == "1" ]] || return 1
+    [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+    local now
+    now=$(get_epoch_seconds)
+    [[ "$now" =~ ^[0-9]+$ ]] || return 1
+    # BSD `find -mtime +N`, which builds the plan, rounds up to whole days,
+    # so it means strictly older than N days.
+    [[ $((now - mtime)) -gt $((MOLE_LOG_AGE_DAYS * 86400)) ]]
+}
+
+# Print every candidate some process holds open. 0 = complete answer,
+# 2 = unknown, any signal status passes up. Output is meaningful only on 0.
+brew_service_logs_open_paths() {
+    [[ $# -gt 0 ]] || return 0
+    local visibility_rc=0
+    _mole_complete_lsof_mode || visibility_rc=$?
+    if mole_rc_signal "$visibility_rc"; then
+        return "$visibility_rc"
+    fi
+    [[ $visibility_rc -eq 0 ]] || return 2
+
+    local records=""
+    local lsof_rc=0
+    # MO_DEBUG=0: the captured stream is evidence, see _mole_paths_have_open_handle.
+    records=$(MO_DEBUG=0 _mole_run_complete_lsof "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+        -F n -- "$@" 2>&1) || lsof_rc=$?
+    if mole_rc_timeout "$lsof_rc"; then
+        return 2
+    fi
+    if mole_rc_signal "$lsof_rc"; then
+        return "$lsof_rc"
+    fi
+    # 1 with no records is "none open"; 1 with records is "some open".
+    [[ $lsof_rc -eq 0 || $lsof_rc -eq 1 ]] || return 2
+    [[ $lsof_rc -eq 1 || -n "$records" ]] || return 2
+
+    local -a open_paths=()
+    local line candidate matched
+    while IFS= read -r line; do
+        case "$line" in
+            "") continue ;;
+            p* | f*) continue ;;
+            n*)
+                # A name that is not exactly one candidate means lsof saw the
+                # file through another spelling; nothing can be matched then.
+                matched=false
+                for candidate in "$@"; do
+                    if [[ "${line#n}" == "$candidate" ]]; then
+                        matched=true
+                        break
+                    fi
+                done
+                [[ "$matched" == "true" ]] || return 2
+                open_paths+=("${line#n}")
+                ;;
+            *) return 2 ;;
+        esac
+    done <<< "$records"
+    [[ ${#open_paths[@]} -gt 0 ]] && printf '%s\n' "${open_paths[@]}"
+    return 0
+}
+
+# safe_clean_guarded callback: recheck metadata and, before a real removal,
+# the open state, then bind the approved object for safe_remove's final
+# identity check. A refusal skips only this file.
+_brew_service_log_delete_guard() {
+    local path="$1"
+    _MOLE_SAFE_CLEAN_SKIP_PATH="$path"
+    brew_service_log_is_eligible "$path" || return 1
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        _MOLE_SAFE_CLEAN_SKIP_PATH=""
+        return 0
+    fi
+
+    _mole_snapshot_path_identity "$path" || return 1
+    # The root is physical, so a parent that resolves elsewhere was swapped
+    # for a link after the eligibility check; never bind that object.
+    [[ "$_MOLE_PATH_SNAPSHOT_PARENT" == "${path%/*}" ]] || return 1
+    local expected_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+    local expected_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+    local expected_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+    local open_rc=0
+    _mole_paths_have_open_handle "$path" || open_rc=$?
+    if mole_rc_signal "$open_rc"; then
+        return "$open_rc"
+    fi
+    [[ $open_rc -eq 1 ]] || return 1
+    _mole_path_matches_identity "$path" "$expected_parent" \
+        "$expected_parent_id" "$expected_target_id" || return 1
+
+    _MOLE_SAFE_CLEAN_BOUND_PATH="$path"
+    _MOLE_SAFE_CLEAN_EXPECTED_PARENT="$expected_parent"
+    _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID="$expected_parent_id"
+    _MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID="$expected_target_id"
+    _MOLE_SAFE_CLEAN_SKIP_PATH=""
+    return 0
+}
+
+clean_homebrew_service_logs() {
+    command -v brew > /dev/null 2>&1 || return 0
+    # User-owned files only, never a privileged removal.
+    is_root_user && return 0
+
+    local root=""
+    local root_rc=0
+    root=$(brew_service_log_root) || root_rc=$?
+    if mole_rc_signal "$root_rc"; then
+        return "$root_rc"
+    fi
+    [[ $root_rc -eq 0 && -n "$root" ]] || return 0
+    _BREW_SERVICE_LOG_ROOT="$root"
+    _BREW_SERVICE_LOG_UID=$(id -u)
+
+    local scan_file=""
+    scan_file=$(create_temp_file) || return 0
+    local scan_rc=0
+    run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" find "$root" \
+        -mindepth 1 -maxdepth 2 -type f -links 1 -user "$_BREW_SERVICE_LOG_UID" \
+        \( -name '*.log' -o -name '*.log.*' \) -mtime +"$MOLE_LOG_AGE_DAYS" \
+        -print0 < /dev/null > "$scan_file" 2> /dev/null || scan_rc=$?
+    if [[ $scan_rc -ne 0 ]]; then
+        rm -f -- "$scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+        if mole_rc_signal "$scan_rc"; then
+            return "$scan_rc"
+        fi
+        debug_log "Homebrew service logs: scan incomplete (status $scan_rc), keep all"
+        return 0
+    fi
+
+    local -a candidates=()
+    local path
+    while IFS= read -r -d '' path; do
+        brew_service_log_is_eligible "$path" && candidates+=("$path")
+    done < "$scan_file"
+    rm -f -- "$scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+    [[ ${#candidates[@]} -gt 0 ]] || return 0
+
+    local open_list=""
+    local open_rc=0
+    open_list=$(brew_service_logs_open_paths "${candidates[@]}") || open_rc=$?
+    if mole_rc_signal "$open_rc"; then
+        return "$open_rc"
+    fi
+    if [[ $open_rc -ne 0 ]]; then
+        debug_log "Homebrew service logs: open state unknown, keep ${#candidates[@]} files"
+        return 0
+    fi
+
+    local -a idle=()
+    local padded_open=$'\n'"$open_list"$'\n'
+    for path in "${candidates[@]}"; do
+        if [[ "$padded_open" == *$'\n'"$path"$'\n'* ]]; then
+            debug_log "Homebrew service log in use, keep: $path"
+            continue
+        fi
+        idle+=("$path")
+    done
+    [[ ${#idle[@]} -gt 0 ]] || return 0
+
+    local guarded_rc=0
+    safe_clean_guarded _brew_service_log_delete_guard \
+        "${idle[@]}" "Homebrew service logs" || guarded_rc=$?
+    # 75 means the guard stopped the batch; every refusal above is per file.
+    [[ $guarded_rc -eq 75 ]] && return 0
+    return "$guarded_rc"
 }

@@ -68,12 +68,12 @@ ICON_ADMIN="●"
 ICON_CONFIRM="◎"
 ICON_ERROR="☻"
 
-log_info() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${BLUE}$1${NC}"; }
-log_success() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${GREEN}${ICON_SUCCESS}${NC} $1"; }
-log_warning() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${YELLOW}$1${NC}"; }
+log_info() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${BLUE}$1${NC}"; fi; }
+log_success() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${GREEN}${ICON_SUCCESS}${NC} $1"; fi; }
+log_warning() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${YELLOW}$1${NC}"; fi; }
 log_error() { echo -e "${YELLOW}${ICON_ERROR}${NC} $1"; }
-log_admin() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${BLUE}${ICON_ADMIN}${NC} $1"; }
-log_confirm() { [[ ${VERBOSE} -eq 1 ]] && echo -e "${BLUE}${ICON_CONFIRM}${NC} $1"; }
+log_admin() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${BLUE}${ICON_ADMIN}${NC} $1"; fi; }
+log_confirm() { if [[ ${VERBOSE} -eq 1 ]]; then echo -e "${BLUE}${ICON_CONFIRM}${NC} $1"; fi; }
 
 curl_download_with_retry() {
     local url="$1"
@@ -175,6 +175,13 @@ INSTALL_LOCK_UNSAFE_ANCESTOR=""
 # user to run something that changes nothing and retry into the same refusal.
 INSTALL_LOCK_UNSAFE_ANCESTOR_REASON=""
 INSTALL_SOURCE_TMP=""
+# Release checksums and their attestation verdict are cached per tag for the
+# life of one installer run: analyze and status are verified against the same
+# signed SHA256SUMS, so the file is fetched and attested once. Each asset still
+# gets its own sha256 comparison in verify_release_asset_checksum.
+INSTALL_CHECKSUMS_TAG=""
+INSTALL_CHECKSUMS_FILE=""
+INSTALL_CHECKSUMS_ATTESTATION=2
 
 ACTION="install"
 
@@ -643,6 +650,10 @@ release_install_lock() {
 cleanup_installer() {
     stop_line_spinner 2> /dev/null || true
     release_install_lock
+    if [[ -n "$INSTALL_CHECKSUMS_FILE" ]]; then
+        rm -f "$INSTALL_CHECKSUMS_FILE" || true # SAFE: exact mktemp-created checksums file
+        INSTALL_CHECKSUMS_FILE=""
+    fi
     if [[ -n "$INSTALL_SOURCE_TMP" ]]; then
         # Teardown never decides the exit status. This runs from the EXIT trap
         # under `set -e`, so a refusal here used to turn a finished, verified
@@ -761,7 +772,8 @@ resolve_source_dir() {
             stop_line_spinner
             # Only exit early for version tags (not for main/dev branches)
             if [[ "$branch" != "main" && "$branch" != "dev" ]]; then
-                log_error "Failed to fetch version ${branch}. Check if tag exists."
+                log_error "Could not download Mole ${branch} from GitHub. Check that github.com is reachable from this network"
+                log_error "Retry when it is, or confirm the tag exists on the releases page if the network is fine"
                 exit 1
             fi
         fi
@@ -769,7 +781,7 @@ resolve_source_dir() {
     stop_line_spinner
 
     start_line_spinner "Cloning Mole source..."
-    if command -v git > /dev/null 2>&1; then
+    if installer_git_runs_quietly; then
         local clone_succeeded=false
         if [[ -n "$source_commit" ]]; then
             if git init -q "$tmp/mole" > /dev/null 2>&1 &&
@@ -829,19 +841,38 @@ get_latest_release_tag() {
     tag=$(curl -fsSL --connect-timeout 2 --max-time 3 \
         "https://api.github.com/repos/tw93/mole/releases/latest" 2> /dev/null |
         sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
-    if [[ -z "$tag" ]]; then
+    if [[ -z "$tag" || ! "$tag" =~ ^V[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         return 1
     fi
     printf '%s\n' "$tag"
 }
 
+# /usr/bin/git is a stub until the Command Line Tools are installed, and
+# running it opens their installer. Plain assignments so a test can point both
+# at fixtures after sourcing.
+INSTALLER_SYSTEM_GIT_STUB="/usr/bin/git"
+INSTALLER_XCODE_SELECT_BIN="/usr/bin/xcode-select"
+
+# Succeeds when git can run without popping up the Command Line Tools installer.
+installer_git_runs_quietly() {
+    local git_bin
+    git_bin=$(command -v git 2> /dev/null) || return 1
+    [[ "$git_bin" == "$INSTALLER_SYSTEM_GIT_STUB" ]] || return 0
+    "$INSTALLER_XCODE_SELECT_BIN" -p > /dev/null 2>&1
+}
+
 get_latest_release_tag_from_git() {
-    if ! command -v git > /dev/null 2>&1; then
+    if ! installer_git_runs_quietly; then
         return 1
     fi
-    git ls-remote --tags --refs https://github.com/tw93/mole.git 2> /dev/null |
+    # Only plain macOS tags: the Windows CLI publishes V<x.y.z>-windows in the
+    # same repository, and sort -V ranks V1.60.0-windows above V1.60.0.
+    # install.sh has no timeout helper, so a stalled transfer is cut off by
+    # git's own low-speed limit instead.
+    git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=10 \
+        ls-remote --tags --refs https://github.com/tw93/mole.git 2> /dev/null |
         awk -F/ '{print $NF}' |
-        grep -E '^V[0-9]' |
+        grep -E '^V[0-9]+\.[0-9]+\.[0-9]+$' |
         sort -V |
         tail -n 1
 }
@@ -930,13 +961,10 @@ verify_release_asset_checksum() {
     local tag="$1"
     local asset_name="$2"
     local file="$3"
-    local checksums_file
-    checksums_file="$(mktemp "${TMPDIR:-/tmp}/mole-checksums.XXXXXX")" || return 1
-
     local expected=""
     local actual=""
     local result=1
-    local attestation_status=2
+    local checksums_ready=false
 
     # The checksums fetch and the attestation check are separate network round
     # trips that can take several seconds each. With nothing on screen this is
@@ -944,29 +972,52 @@ verify_release_asset_checksum() {
     # spinner up until the first real line prints.
     start_line_spinner "Verifying ${asset_name}..."
 
-    if download_release_checksums "$tag" "$checksums_file" > /dev/null 2>&1; then
-        # Anchor the SHA256SUMS file to its GitHub Actions build-provenance
-        # attestation before reading checksums from it. If gh is available,
-        # an attestation mismatch is fatal; without gh, fall through to
-        # checksum-only verification (matches prior behavior).
-        verify_release_attestation "$checksums_file"
-        attestation_status=$?
+    if [[ "$tag" == "$INSTALL_CHECKSUMS_TAG" && -n "$INSTALL_CHECKSUMS_FILE" &&
+        -f "$INSTALL_CHECKSUMS_FILE" ]]; then
+        checksums_ready=true
+    else
+        if [[ -n "$INSTALL_CHECKSUMS_FILE" && -f "$INSTALL_CHECKSUMS_FILE" ]]; then
+            rm -f "$INSTALL_CHECKSUMS_FILE" # SAFE: exact mktemp-created checksums file
+        fi
+        INSTALL_CHECKSUMS_TAG=""
+        INSTALL_CHECKSUMS_FILE=""
+        local checksums_file
+        checksums_file="$(mktemp "${TMPDIR:-/tmp}/mole-checksums.XXXXXX")" || {
+            stop_line_spinner
+            return 1
+        }
+        if download_release_checksums "$tag" "$checksums_file" > /dev/null 2>&1; then
+            # Anchor the SHA256SUMS file to its GitHub Actions build-provenance
+            # attestation before reading checksums from it. If gh is available,
+            # an attestation mismatch is fatal; without gh, fall through to
+            # checksum-only verification (matches prior behavior). The verdict
+            # belongs to the file, so it is reused for the run's other assets.
+            verify_release_attestation "$checksums_file"
+            INSTALL_CHECKSUMS_ATTESTATION=$?
+            INSTALL_CHECKSUMS_TAG="$tag"
+            INSTALL_CHECKSUMS_FILE="$checksums_file"
+            checksums_ready=true
+        else
+            rm -f "$checksums_file" # SAFE: exact mktemp-created checksums file
+        fi
+    fi
+
+    if [[ "$checksums_ready" == "true" ]]; then
+        local attestation_status="$INSTALL_CHECKSUMS_ATTESTATION"
 
         if [[ "$attestation_status" -eq 1 ]]; then
             stop_line_spinner
             log_error "Release attestation verification failed for ${asset_name}"
-            rm -f "$checksums_file"
             return 1
         fi
 
         if [[ "$attestation_status" -eq 2 && "${MOLE_REQUIRE_ATTESTATION:-0}" == "1" ]]; then
             stop_line_spinner
             log_error "MOLE_REQUIRE_ATTESTATION=1 set but gh CLI unavailable or unauthenticated"
-            rm -f "$checksums_file"
             return 1
         fi
 
-        expected=$(extract_release_checksum "$checksums_file" "$asset_name" 2> /dev/null || true)
+        expected=$(extract_release_checksum "$INSTALL_CHECKSUMS_FILE" "$asset_name" 2> /dev/null || true)
         actual=$(calculate_file_sha256 "$file" 2> /dev/null || true)
         if [[ -n "$expected" && -n "$actual" && "$expected" == "$actual" ]]; then
             result=0
@@ -978,7 +1029,6 @@ verify_release_asset_checksum() {
     fi
 
     stop_line_spinner
-    rm -f "$checksums_file"
     return "$result"
 }
 
@@ -991,7 +1041,7 @@ get_installed_version() {
         if [[ -n "$version" ]]; then
             echo "$version"
         else
-            sed -n 's/^VERSION="\(.*\)"$/\1/p' "$binary" | head -n1
+            LC_ALL=C sed -n 's/^VERSION="\(.*\)"$/\1/p' "$binary" | head -n1
         fi
     fi
 }
@@ -1204,8 +1254,17 @@ check_requirements() {
             echo ""
             exit 1
         else
-            log_warning "Cleaning up stale Homebrew installation..."
-            brew uninstall --force mole > /dev/null 2>&1 || true
+            # The Cellar holds a Homebrew Mole, but the launcher this shell
+            # resolves is not its symlink: another copy comes first in PATH, or
+            # brew's link is missing. Uninstalling the keg here would delete an
+            # install the user never asked this run to touch, and `brew` resets
+            # sudo's cached ticket, which breaks the pre-authenticated
+            # `mo update` window. Report the conflict with the exact command and
+            # keep installing; a manual copy can coexist with the keg.
+            local active_launcher="${mole_path:-no mole command on PATH}"
+            log_warning "A Homebrew Mole is also installed, but the active launcher is ${active_launcher}"
+            log_warning "Leaving the Homebrew install untouched; this run installs the manual copy beside it"
+            log_warning "To remove the Homebrew copy instead: brew uninstall --force mole"
         fi
     fi
 
@@ -1361,6 +1420,9 @@ download_binary() {
 
     local fallback_tag
     fallback_tag=$(get_latest_release_tag 2> /dev/null || true)
+    if [[ -z "$fallback_tag" ]]; then
+        fallback_tag=$(get_latest_release_tag_from_git 2> /dev/null || true)
+    fi
     if [[ -n "$fallback_tag" && "$fallback_tag" != "$release_tag" ]]; then
         local fallback_url="https://github.com/tw93/mole/releases/download/${fallback_tag}/${asset_name}"
         start_line_spinner "Retrying ${binary_name} from ${fallback_tag}..."
@@ -1392,10 +1454,33 @@ download_binary() {
     fi
     rm -f "$staged_path"
     log_error "Failed to install ${binary_name} binary"
+    log_error "Its release download from github.com did not complete, so ${binary_name} stays unavailable; run mo update again once github.com is reachable"
     return 1
 }
 
 # File installation (bin/lib/scripts + go helpers).
+# A module directory refused the copy, usually because an earlier sudo install
+# left it root-owned. The default config root belongs to Mole alone, so a
+# recursive chown there is safe; a custom --config root such as ~/.local is
+# shared with other software, so only list what the user cannot replace.
+report_config_copy_failure() {
+    local dir="$1" quoted user
+    user="$(id -un)"
+    # C locale for the same reason as the SCRIPT_DIR pin below: bash 3.2 %q
+    # then escapes every non-ASCII byte instead of leaving lead bytes raw.
+    # shellcheck disable=SC2030 # scoped to this command substitution on purpose
+    quoted=$(
+        export LC_ALL=C
+        printf '%q' "$dir"
+    )
+    log_error "Could not replace Mole files in $dir, an earlier sudo install may own them"
+    if [[ "$CONFIG_DIR" == "$HOME/.config/mole" ]]; then
+        log_error "Take ownership, then retry: sudo chown -R $user $quoted && mo update"
+    else
+        log_error "Fix the owner of the files this lists, then run mo update: find $quoted ! -user $user"
+    fi
+}
+
 install_files() {
 
     resolve_source_dir
@@ -1407,58 +1492,52 @@ install_files() {
     install_dir_abs="$(cd "$INSTALL_DIR" && pwd)"
     config_dir_abs="$(cd "$CONFIG_DIR" && pwd)"
 
-    if [[ -f "$SOURCE_DIR/mole" ]]; then
-        if [[ "$source_dir_abs" != "$install_dir_abs" ]]; then
-            if needs_sudo; then
-                log_admin "Admin access required for /usr/local/bin"
-                if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
-                    log_error "Admin access required, blocked in test mode"
-                    return 1
-                fi
-                # Explicit failure checks throughout this function: callers run
-                # `install_files || {...}`, and bash disables errexit inside a
-                # function invoked that way, so a failed sudo would otherwise be
-                # swallowed and the install would report success while leaving
-                # the old entry script in place (the 1.45.0 -> 1.47.0 fake
-                # "Updated to latest version" incident).
-                if ! ensure_sudo_ready; then
-                    log_error "Admin access to $INSTALL_DIR is required but not available"
-                    log_error "Cache credentials first, then retry: sudo -v && mo update"
-                    return 1
-                fi
-            fi
-
-            # Atomic update: copy to temporary name first, then move
-            if ! maybe_sudo cp "$SOURCE_DIR/mole" "$INSTALL_DIR/mole.new" ||
-                ! maybe_sudo chmod +x "$INSTALL_DIR/mole.new" ||
-                ! maybe_sudo mv -f "$INSTALL_DIR/mole.new" "$INSTALL_DIR/mole"; then
-                log_error "Failed to install mole to $INSTALL_DIR (admin access missing or denied)"
-                log_error "Cache credentials first, then retry: sudo -v && mo update"
-                return 1
-            fi
-
-        fi
-    else
+    if [[ ! -f "$SOURCE_DIR/mole" ]]; then
         log_error "mole executable not found in ${SOURCE_DIR:-unknown}"
         exit 1
     fi
 
-    if [[ -f "$SOURCE_DIR/mo" && "$source_dir_abs" != "$install_dir_abs" ]]; then
-        if ! maybe_sudo cp "$SOURCE_DIR/mo" "$INSTALL_DIR/mo.new" ||
-            ! maybe_sudo chmod +x "$INSTALL_DIR/mo.new" ||
-            ! maybe_sudo mv -f "$INSTALL_DIR/mo.new" "$INSTALL_DIR/mo"; then
-            log_error "Failed to install mo alias to $INSTALL_DIR (admin access missing or denied)"
+    # Every refusal that does not depend on the copy happens here, before
+    # anything in $CONFIG_DIR changes, so a missing sudo ticket leaves the old
+    # install whole instead of an old launcher over new modules.
+    if [[ "$source_dir_abs" != "$install_dir_abs" ]] && needs_sudo; then
+        log_admin "Admin access required for /usr/local/bin"
+        if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
+            log_error "Admin access required, blocked in test mode"
+            return 1
+        fi
+        # Explicit failure checks throughout this function: callers run
+        # `install_files || {...}`, and bash disables errexit inside a
+        # function invoked that way, so a failed sudo would otherwise be
+        # swallowed and the install would report success while leaving
+        # the old entry script in place (the 1.45.0 -> 1.47.0 fake
+        # "Updated to latest version" incident).
+        if ! ensure_sudo_ready; then
+            log_error "Admin access to $INSTALL_DIR is required but not available"
+            log_error "Cache credentials first, then retry: sudo -v && mo update"
             return 1
         fi
     fi
 
+    # Copy the modules before the launcher is replaced. A refused copy then
+    # returns while the old launcher is still in place and pinned to this
+    # config directory, so `mo` keeps working and the retry can run. Copying
+    # after the launcher swap left a new launcher whose SCRIPT_DIR was never
+    # pinned, and every `mo` call failed to source lib/core/common.sh.
     if [[ -d "$SOURCE_DIR/bin" ]]; then
         local source_bin_abs="$(cd "$SOURCE_DIR/bin" && pwd)"
         local config_bin_abs="$(cd "$CONFIG_DIR/bin" && pwd)"
         if [[ "$source_bin_abs" != "$config_bin_abs" ]]; then
             local -a bin_files=("$SOURCE_DIR/bin"/*)
-            if [[ ${#bin_files[@]} -gt 0 ]]; then
-                cp -r "${bin_files[@]}" "$CONFIG_DIR/bin/"
+            if [[ -e "${bin_files[0]}" ]]; then
+                # -f replaces a read-only file in a writable directory; a
+                # directory an earlier sudo install left root-owned still
+                # refuses, and without this check the update reported success
+                # beside the stale files.
+                if ! cp -rf "${bin_files[@]}" "$CONFIG_DIR/bin/"; then
+                    report_config_copy_failure "$CONFIG_DIR/bin"
+                    return 1
+                fi
                 for file in "$CONFIG_DIR/bin/"*; do
                     [[ -e "$file" ]] && chmod +x "$file"
                 done
@@ -1471,9 +1550,32 @@ install_files() {
         local config_lib_abs="$(cd "$CONFIG_DIR/lib" && pwd)"
         if [[ "$source_lib_abs" != "$config_lib_abs" ]]; then
             local -a lib_files=("$SOURCE_DIR/lib"/*)
-            if [[ ${#lib_files[@]} -gt 0 ]]; then
-                cp -r "${lib_files[@]}" "$CONFIG_DIR/lib/"
+            if [[ -e "${lib_files[0]}" ]]; then
+                if ! cp -rf "${lib_files[@]}" "$CONFIG_DIR/lib/"; then
+                    report_config_copy_failure "$CONFIG_DIR/lib"
+                    return 1
+                fi
             fi
+        fi
+    fi
+
+    if [[ "$source_dir_abs" != "$install_dir_abs" ]]; then
+        # Atomic update: copy to temporary name first, then move
+        if ! maybe_sudo cp "$SOURCE_DIR/mole" "$INSTALL_DIR/mole.new" ||
+            ! maybe_sudo chmod +x "$INSTALL_DIR/mole.new" ||
+            ! maybe_sudo mv -f "$INSTALL_DIR/mole.new" "$INSTALL_DIR/mole"; then
+            log_error "Failed to install mole to $INSTALL_DIR (admin access missing or denied)"
+            log_error "Cache credentials first, then retry: sudo -v && mo update"
+            return 1
+        fi
+    fi
+
+    if [[ -f "$SOURCE_DIR/mo" && "$source_dir_abs" != "$install_dir_abs" ]]; then
+        if ! maybe_sudo cp "$SOURCE_DIR/mo" "$INSTALL_DIR/mo.new" ||
+            ! maybe_sudo chmod +x "$INSTALL_DIR/mo.new" ||
+            ! maybe_sudo mv -f "$INSTALL_DIR/mo.new" "$INSTALL_DIR/mo"; then
+            log_error "Failed to install mo alias to $INSTALL_DIR (admin access missing or denied)"
+            return 1
         fi
     fi
 
@@ -1492,7 +1594,21 @@ install_files() {
     if [[ "$source_dir_abs" != "$install_dir_abs" ]]; then
         # Use absolute /usr/bin/sed (always BSD on macOS) so PATH-shadowed
         # GNU sed from Homebrew gnu-sed does not break the -i '' syntax.
-        if ! maybe_sudo /usr/bin/sed -i '' "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"$CONFIG_DIR\"|" "$INSTALL_DIR/mole"; then
+        # Serialize a literal Bash word first, then escape the sed replacement.
+        # Config paths may contain shell syntax or sed delimiters as data.
+        # The C locale makes bash 3.2 %q escape every non-ASCII byte as octal;
+        # in a UTF-8 locale it leaves lead bytes raw and escapes only some
+        # continuation bytes, so the pinned line is not valid UTF-8.
+        local config_word config_replacement
+        # shellcheck disable=SC2031 # each command substitution sets its own C locale
+        config_word=$(
+            export LC_ALL=C
+            printf '%q' "$config_dir_abs"
+        )
+        config_replacement=${config_word//\\/\\\\}
+        config_replacement=${config_replacement//&/\\&}
+        config_replacement=${config_replacement//|/\\|}
+        if ! maybe_sudo /usr/bin/sed -i '' "s|^SCRIPT_DIR=.*|SCRIPT_DIR=$config_replacement|" "$INSTALL_DIR/mole"; then
             log_error "Failed to point $INSTALL_DIR/mole at $CONFIG_DIR"
             return 1
         fi

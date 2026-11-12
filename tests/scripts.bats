@@ -199,6 +199,65 @@ BATS
     [[ "$(grep -c "bare '! cmd'" <<< "$output")" -eq 2 ]] || { echo "$output"; return 1; }
 }
 
+@test "bats assertion audit catches bare brackets and arithmetic in test and heredoc bodies" {
+    local audit="$PROJECT_ROOT/scripts/audit_bats_assertions.py"
+    local live_fixture="$BATS_TEST_TMPDIR/bracket-live.bats"
+    local vacuous_fixture="$BATS_TEST_TMPDIR/bracket-vacuous.bats"
+    # Bats would read a literal test header here as a test of this file.
+    sed 's/^TEST /@test /' > "$live_fixture" <<'BATS'
+TEST "assertions that can still fail" {
+    [[ -f "$trace" ]] || return 1
+    (( count++ ))
+    (( bits <<= 1 ))
+    (( bits >>= 1 ))
+    (( elapsed < 5 )) || return 1
+    run env HOME="$HOME" /bin/bash --noprofile --norc <<'EOF'
+stub() {
+    [[ -f "$mock" ]]
+    :
+}
+(( n += 1 ))
+[[ -f "$trace" ]] || exit 1
+(( total > 3 )) || exit 1
+[[ -f "$last" ]]
+EOF
+    cat > "$HOME/data" <<'EOF'
+[[ -f "$data" ]]
+:
+EOF
+    (( elapsed < 5 ))
+}
+BATS
+    sed 's/^TEST /@test /' > "$vacuous_fixture" <<'BATS'
+TEST "assertions that never fail" {
+    [[ -f "$trace" ]]
+    (( elapsed < 5 ))
+    run env HOME="$HOME" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+[[ -f "$trace" ]]
+(( total > 3 ))
+:
+EOF
+    [ "$status" -eq 0 ]
+}
+BATS
+
+    # Positive control: the guarded forms, a mock body, a data heredoc and a
+    # computation without a comparison are all accepted.
+    run python3 "$audit" "$live_fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"bats-assertion-audit-ok"* ]] || return 1
+
+    run python3 "$audit" "$vacuous_fixture"
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    local line
+    for line in 2 3 6 7; do
+        [[ "$output" == *"$vacuous_fixture:$line:"* ]] || { echo "line $line not flagged"; echo "$output"; return 1; }
+    done
+    [[ "$(grep -c "bare \[\[ \]\]" <<< "$output")" -eq 2 ]] || { echo "$output"; return 1; }
+    [[ "$(grep -c "bare (( ))" <<< "$output")" -eq 2 ]] || { echo "$output"; return 1; }
+}
+
 @test "Makefile has build target for Go binaries" {
     run /bin/bash -c "grep -Eq '(^|[[:space:]])(go|\\$\\(GO\\))[[:space:]]+build' '$PROJECT_ROOT/Makefile'"
     [ "$status" -eq 0 ]
@@ -374,6 +433,44 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "release gate inherits path-filtered workflows only through skippable commits" {
+    command -v python3 > /dev/null 2>&1 || skip "python3 not available"
+    run grep -F 'run: python3 scripts/release_workflow_gate.py' "$PROJECT_ROOT/.github/workflows/release.yml"
+    [ "$status" -eq 0 ]
+    run env PYTHONDONTWRITEBYTECODE=1 python3 "$PROJECT_ROOT/tests/release_gate_test.py"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "Validation serial shard lists exactly the files test.sh runs sequentially" {
+    command -v python3 > /dev/null 2>&1 || skip "python3 not available"
+    run python3 - "$PROJECT_ROOT" <<'EOF'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+workflow = (root / ".github/workflows/test.yml").read_text()
+runner = (root / "scripts/test.sh").read_text()
+serial = re.findall(r"^\s+SERIAL: (.+)$", workflow, re.M)
+patterns = re.findall(r"^\s+(\*core_performance\.bats .*)\) _sequential_files\+=", runner, re.M)
+if len(serial) != 1 or len(patterns) != 2 or len(set(patterns)) != 1:
+    sys.exit(f"expected one SERIAL line and two identical case lines, got {serial!r} {patterns!r}")
+want = {p.strip().lstrip("*").removesuffix(".bats") for p in patterns[0].split("|")}
+got = set(serial[0].split())
+if want != got:
+    sys.exit(f"test.sh sequential files {sorted(want)} != workflow SERIAL {sorted(got)}")
+missing = sorted(n for n in got if not (root / "tests" / f"{n}.bats").is_file())
+if missing:
+    sys.exit(f"SERIAL names missing test files: {missing}")
+# test.sh matches by suffix (*cli.bats); the workflow by exact name.
+shadowed = sorted(f.name for f in (root / "tests").glob("*.bats")
+                  if f.stem not in got and any(f.name.endswith(f"{n}.bats") for n in got))
+if shadowed:
+    sys.exit(f"test.sh runs these sequentially but SERIAL misses them: {shadowed}")
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
 @test "release workflow keeps Homebrew distribution on official core only" {
     run grep -q 'update-homebrew-core:' "$PROJECT_ROOT/.github/workflows/release.yml"
     [ "$status" -eq 0 ]
@@ -436,4 +533,379 @@ SCRIPT
             [[ "$output" == $'COUNT=3\nARG=--jobs\nARG=2\nARG=--no-parallelize-within-files' ]] || { echo "$output"; return 1; }
         fi
     done
+}
+
+@test "skill command audit rejects commands and flags the CLI does not have" {
+    local audit="$PROJECT_ROOT/scripts/audit_skill_commands.py"
+    local skill="$BATS_TEST_TMPDIR/skill"
+    mkdir -p "$skill/references"
+    cat > "$skill/SKILL.md" <<'EOF'
+---
+name: mole
+description: "Short."
+when_to_use: "short"
+---
+Run `mo clean --dry-run`, then `mo status --json`.
+EOF
+    cat > "$skill/references/macos.md" <<'EOF'
+```bash
+brew install mole
+mo history --json --limit 5   # recent runs
+mo analyze --json ~/Library
+```
+EOF
+    printf 'Windows notes without commands.\n' > "$skill/references/windows.md"
+
+    run python3 "$audit" --skill-dir "$skill" --windows-ref refs/heads/mole-audit-missing-ref
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Windows side skipped"* ]] || return 1
+    [[ "$output" == *"skill-commands-audit-ok (4 command checks)"* ]] || { echo "$output"; return 1; }
+
+    run python3 "$audit" --skill-dir "$skill" --windows-ref refs/heads/mole-audit-missing-ref --require-windows
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+
+    cat >> "$skill/references/macos.md" <<'EOF'
+Then `mo clean --yes` or `mo frobnicate`.
+EOF
+    run python3 "$audit" --skill-dir "$skill" --windows-ref refs/heads/mole-audit-missing-ref
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"macos.md:6: \`mo clean --yes\` is not in the macOS source"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"macos.md:6: \`mo frobnicate\` is not a macOS command"* ]] || { echo "$output"; return 1; }
+}
+
+@test "skill command audit rejects a Codex plugin copy that drifted from the skill" {
+    local audit="$PROJECT_ROOT/scripts/audit_skill_commands.py"
+    local skill="$BATS_TEST_TMPDIR/skill"
+    local copy="$BATS_TEST_TMPDIR/copy"
+    mkdir -p "$skill/references"
+    cat > "$skill/SKILL.md" <<'EOF'
+---
+name: mole
+description: "Short."
+when_to_use: "short"
+---
+Run `mo clean --dry-run`.
+EOF
+    : > "$skill/references/macos.md"
+    : > "$skill/references/windows.md"
+    cp -R "$skill" "$copy"
+
+    run python3 "$audit" --skill-dir "$skill" --plugin-copy "$copy" --windows-ref refs/heads/mole-audit-missing-ref
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+
+    printf 'stale\n' > "$copy/references/macos.md"
+    run python3 "$audit" --skill-dir "$skill" --plugin-copy "$copy" --windows-ref refs/heads/mole-audit-missing-ref
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"$copy/references/macos.md: differs from $skill"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"fix with: rm -rf $copy && cp -R $skill $copy"* ]] || { echo "$output"; return 1; }
+}
+
+@test "skill command audit rejects a description DeepSeek Harness would cut off" {
+    local audit="$PROJECT_ROOT/scripts/audit_skill_commands.py"
+    local skill="$BATS_TEST_TMPDIR/skill"
+    mkdir -p "$skill/references"
+    : > "$skill/references/macos.md"
+    : > "$skill/references/windows.md"
+    local long
+    long=$(printf 'x%.0s' {1..300})
+    local body="$BATS_TEST_TMPDIR/body.md"
+    cat > "$body" <<'EOF'
+Run `mo clean --dry-run`.
+EOF
+    { printf -- '---\nname: mole\ndescription: "%s"\nwhen_to_use: "%s"\n---\n' "$long" "$long"; cat "$body"; } > "$skill/SKILL.md"
+
+    run python3 "$audit" --skill-dir "$skill" --plugin-copy "$skill" --windows-ref refs/heads/mole-audit-missing-ref
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"join to 611 characters, over 500"* ]] || { echo "$output"; return 1; }
+
+    { printf -- '---\nname: mole\ndescription: "%s"\nwhen_to_use: "short"\n---\n' "$long"; cat "$body"; } > "$skill/SKILL.md"
+    run python3 "$audit" --skill-dir "$skill" --plugin-copy "$skill" --windows-ref refs/heads/mole-audit-missing-ref
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "skill command audit requires a plugin version bump after a skill change" {
+    local repo="$BATS_TEST_TMPDIR/repo"
+    local manifest="$repo/plugins/mole/.claude-plugin/plugin.json"
+    local package="$repo/plugins/mole/package.json"
+    mkdir -p "$repo/skills/mole" "$repo/plugins/mole/.claude-plugin"
+    printf 'one\n' > "$repo/skills/mole/SKILL.md"
+    printf '{\n  "version": "0.1.0"\n}\n' > "$package"
+    cp "$package" "$manifest"
+    git -C "$repo" init -q
+    commit_all() {
+        git -C "$repo" add -A
+        git -C "$repo" -c user.name=t -c user.email=t@example.invalid commit -qm "$1"
+    }
+    audit_versions() {
+        run python3 - "$PROJECT_ROOT/scripts" "$repo" <<'PYTHON'
+import sys
+from pathlib import Path
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+from audit_skill_commands import version_problems
+problems = version_problems(Path(sys.argv[2]))
+print("\n".join(problems))
+sys.exit(1 if problems else 0)
+PYTHON
+    }
+
+    # Skill and version landing in one commit is a release, not drift.
+    commit_all "first"
+    audit_versions
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+
+    printf 'two\n' > "$repo/skills/mole/SKILL.md"
+    commit_all "skill only"
+    audit_versions
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"without a plugin version bump"* ]] || { echo "$output"; return 1; }
+
+    # A manifest edit that leaves the version alone does not count as a bump.
+    printf '{\n  "version": "0.1.0",\n  "license": "GPL-3.0"\n}\n' > "$manifest"
+    commit_all "other manifest field"
+    audit_versions
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+
+    printf '{\n  "version": "0.1.1",\n  "license": "GPL-3.0"\n}\n' > "$manifest"
+    audit_versions
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"they must match"* ]] || { echo "$output"; return 1; }
+
+    printf '{\n  "version": "0.1.1"\n}\n' > "$package"
+    commit_all "bump"
+    audit_versions
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "CI checks the published skill against both CLIs" {
+    run grep -F 'audit_skill_commands.py' "$PROJECT_ROOT/scripts/check.sh"
+    [ "$status" -eq 0 ]
+    run grep -F 'git fetch --no-tags --depth=1 origin windows' "$PROJECT_ROOT/.github/workflows/check.yml"
+    [ "$status" -eq 0 ]
+    run grep -E '^[[:space:]]+failures \+= version_problems\(PROJECT_ROOT\)$' "$PROJECT_ROOT/scripts/audit_skill_commands.py"
+    [ "$status" -eq 0 ]
+    # shellcheck disable=SC2016  # the literal workflow text, not an expansion here
+    run grep -F 'git fetch --no-tags --deepen=100 origin "$GITHUB_SHA"' "$PROJECT_ROOT/.github/workflows/check.yml"
+    [ "$status" -eq 0 ]
+}
+
+@test "test runner isolates module-loading temp state before sourcing core" {
+    local bootstrap="$HOME/runner-bootstrap.sh"
+    # Execute the complete real bootstrap; redirect only its repository path to
+    # a fixture so its orphan-test sweep cannot touch another test's HOME.
+    python3 - "$PROJECT_ROOT/scripts/test.sh" "$bootstrap" <<'PYTHON'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+end = '\necho "==============================="\necho "Mole Test Runner"'
+anchor = 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
+assert source.count(end) == source.count(anchor) == 1
+prefix = source.split(end, 1)[0]
+prefix = prefix.replace(anchor, 'SCRIPT_DIR="$FIXTURE_REPO/scripts"')
+Path(sys.argv[2]).write_text(prefix)
+PYTHON
+    run env BOOTSTRAP="$bootstrap" SOURCE_REPO="$PROJECT_ROOT" \
+        FIXTURE_REPO="$BATS_TEST_TMPDIR/repo" HOME="$BATS_TEST_TMPDIR/runner-home" \
+        TMPDIR="$BATS_TEST_TMPDIR/ambient-link" MOLE_RESOLVED_TMPDIR="$BATS_TEST_TMPDIR/ambient" \
+        MOLE_TEMP_REGISTRY_FILE="$BATS_TEST_TMPDIR/ambient/mole.registry.parent" /bin/bash <<'SCRIPT'
+set -euo pipefail
+mkdir -p "$FIXTURE_REPO/scripts" "$FIXTURE_REPO/tests" "$HOME" "${TMPDIR%-link}"
+ln -s "${TMPDIR%-link}" "$TMPDIR"
+ln -s "$SOURCE_REPO/lib" "$FIXTURE_REPO/lib"
+ambient="$TMPDIR"
+printf keep > "$MOLE_TEMP_REGISTRY_FILE"
+source "$BOOTSTRAP"
+# This is the runner's real module-loading consumer, outside the Bats helper.
+source "$PROJECT_ROOT/lib/core/common.sh"
+test_file=$(create_temp_file)
+# Shell and canonicalizing consumers must see the same root (including /var).
+[[ "$TMPDIR" == "$(cd -P "$TMPDIR" && pwd -P)" ]] || exit 1
+[[ "$TMPDIR" == "$TEST_SYSTEM_STUB_DIR/tmp" ]] || exit 1
+[[ "$test_file" == "$TMPDIR/"* && -f "$test_file" ]] || exit 1
+[[ "$(cat "$ambient/mole.registry.parent")" == keep ]] || exit 1
+printf 'PASS\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *PASS* ]]
+}
+
+incident_ledger() {
+    printf '## Incidents\n\n| ID | Reported | Symptom | Introduced | Fixed | Layer | Caught by |\n|---|---|---|---|---|---|---|\n%s\n' "$1" > "$BATS_TEST_TMPDIR/incidents.md"
+}
+
+@test "incident audit names each broken cell of a ledger row" {
+    local audit="$PROJECT_ROOT/scripts/audit_incidents.py"
+    local head good row expected
+    head=$(git -C "$PROJECT_ROOT" rev-parse --short=8 HEAD)
+    good="| I-01 | 2026-10-26 | A defect | unknown | $head | unit | \`check.sh --help shows usage information\` |"
+
+    incident_ledger "$good"
+    run python3 "$audit" --ledger "$BATS_TEST_TMPDIR/incidents.md"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"incidents-audit-ok rows=1"* ]] || { echo "$output"; return 1; }
+
+    local -a cases=(
+        "layer nightly is not one of=${good/| unit |/| nightly |}"
+        "is not a test or gate=${good/usage information/usage informatio}"
+        "no catcher named=${good/\`check.sh --help shows usage information\`/a test}"
+        "Fixed is not a commit=${good/$head/later}"
+        "Introduced is not a commit=${good/unknown/soon}"
+        "Reported is not a date=${good/2026-10-26/Oct 26}"
+        "I-01 repeats=$good"$'\n'"$good"
+        "expected 7 cells=${good/ unit |/}"
+    )
+    local case_entry
+    for case_entry in "${cases[@]}"; do
+        expected="${case_entry%%=*}"
+        row="${case_entry#*=}"
+        incident_ledger "$row"
+        run python3 "$audit" --ledger "$BATS_TEST_TMPDIR/incidents.md"
+        [ "$status" -eq 1 ] || { echo "$expected: $output"; return 1; }
+        [[ "$(printf '%s\n' "$output" | grep -c .)" -eq 1 ]] || { echo "$expected: $output"; return 1; }
+        [[ "$output" == *"$expected"* ]] || { echo "$expected: $output"; return 1; }
+    done
+}
+
+@test "incident audit finds Bats, Go and Python tests and gate scripts as catchers" {
+    local audit="$PROJECT_ROOT/scripts/audit_incidents.py"
+    local head catchers
+    head=$(git -C "$PROJECT_ROOT" rev-parse --short=8 HEAD)
+    catchers="\`check.sh --help shows usage information\`, \`TestDuIgnoresUseSystemDuWhenGNUDuIsFirstInPath\`, \`test_default_stops_after_first_failure\`, \`scripts/audit_timeout_status.py\`"
+
+    incident_ledger "| I-01 | 2026-10-26 | A defect | $head | $head | review | $catchers |"
+    run python3 "$audit" --ledger "$BATS_TEST_TMPDIR/incidents.md"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+
+    incident_ledger "| I-01 | 2026-10-26 | A defect | unknown | $head | review | \`TestNoSuchCatcher\`, \`scripts/audit_no_such_gate.py\` |"
+    run python3 "$audit" --ledger "$BATS_TEST_TMPDIR/incidents.md"
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"\`TestNoSuchCatcher\` is not a test or gate"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"\`scripts/audit_no_such_gate.py\` is not a test or gate"* ]] || { echo "$output"; return 1; }
+}
+
+@test "incident audit fails a commit that does not resolve" {
+    if [[ "$(git -C "$PROJECT_ROOT" rev-parse --is-shallow-repository)" == "true" ]]; then
+        skip "commits cannot be resolved in a shallow clone"
+    fi
+    incident_ledger "| I-01 | 2026-10-26 | A defect | unknown | 0000000 | unit | \`check.sh --help shows usage information\` |"
+    run python3 "$PROJECT_ROOT/scripts/audit_incidents.py" --ledger "$BATS_TEST_TMPDIR/incidents.md"
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"incidents.md:5: Fixed 0000000 does not resolve"* ]] || { echo "$output"; return 1; }
+}
+
+@test "the incident ledger passes its audit" {
+    run python3 "$PROJECT_ROOT/scripts/audit_incidents.py"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"incidents-audit-ok rows="* ]]
+}
+
+@test "risk tiers follow the paths a change touches, highest first" {
+    local tiers="$PROJECT_ROOT/scripts/risk_tier.py"
+
+    run python3 "$tiers" lib/core/file_ops.sh
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "risk: deletion "*$'\n'"risk: privilege "* ]] || { echo "$output"; return 1; }
+
+    run python3 "$tiers" .github/workflows/release.yml install.sh lib/manage/update.sh
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "risk: release "*$'\n'"risk: ci "*$'\n'"risk: install-update (install.sh and 1 more) "* ]] || { echo "$output"; return 1; }
+
+    run python3 "$tiers" docs/incidents.md .claude/rules/clean.md cmd/status/view.go tests/clean_core.bats
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ -z "$output" ]
+}
+
+@test "every risk tier pattern matches a tracked file" {
+    run python3 "$PROJECT_ROOT/scripts/risk_tier.py" --self-check
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+
+    # The self-check must be able to fail: a pattern left behind by a rename.
+    run env PYTHONDONTWRITEBYTECODE=1 python3 - "$PROJECT_ROOT/scripts" <<'PYTHON'
+import sys
+sys.path.insert(0, sys.argv[1])
+import risk_tier
+risk_tier.TIERS.append(("deletion", "gates", ["lib/core/renamed_away.sh"]))
+print(risk_tier.dead_patterns())
+PYTHON
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "['deletion: lib/core/renamed_away.sh']" ]] || { echo "$output"; return 1; }
+}
+
+@test "the incident breaker trips at five recent rows and shows only beside a tier" {
+    run env PYTHONDONTWRITEBYTECODE=1 python3 - "$PROJECT_ROOT/scripts" <<'PYTHON'
+import datetime
+import io
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, sys.argv[1])
+import risk_tier as risk
+
+
+class BreakerTests(unittest.TestCase):
+    """The incident circuit breaker in risk_tier.py: counted by Reported date, shown only beside a tier."""
+
+    TODAY = datetime.date(2026, 10, 27)
+
+    def ledger(self, dates_and_layers):
+        rows = "\n".join(f"| I-{n:02d} | {day} | symptom | unknown | abc1234 | {layer} | `t` |"
+                         for n, (day, layer) in enumerate(dates_and_layers, 1))
+        text = ("# Incidents\n\n| ID | Reported | Symptom |\n|---|---|---|\n| X-01 | 2026-10-27 | outside |\n\n"
+                "## Incidents\n\n| ID | Reported | Symptom | Introduced | Fixed | Layer | Caught by |\n"
+                f"|---|---|---|---|---|---|---|\n{rows}\n")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "incidents.md"
+        path.write_text(text, "utf-8")
+        return path
+
+    def recent(self, dates_and_layers):
+        return risk.recent_incidents(today=self.TODAY, ledger=self.ledger(dates_and_layers))
+
+    def test_only_rows_reported_in_the_last_seven_days_count(self):
+        recent = self.recent([("2026-10-27", "unit"), ("2026-10-21", "unit"), ("2026-10-20", "unit"),
+                              ("2026-10-28", "unit")])
+        # Day 0 and day 6 count; day 7 has aged out; a future date (a clock set back) is never counted.
+        self.assertEqual(["I-01", "I-02"], [ident for ident, _ in recent])
+
+    def test_it_trips_at_five_rows_and_names_the_layers_by_count(self):
+        self.assertIsNone(risk.breaker_line(self.recent([("2026-10-26", "unit")] * 4)))
+        line = risk.breaker_line(self.recent([("2026-10-26", "review")] * 3 + [("2026-10-25", "unit")] * 2))
+        self.assertIn("5 incidents in the last 7 days", line)
+        self.assertIn(risk.BREAKER_GATE, line)
+        self.assertTrue(line.endswith("(review 3, unit 2)"), line)
+
+    def test_a_missing_ledger_never_trips_it(self):
+        self.assertEqual([], risk.recent_incidents(today=self.TODAY, ledger=Path("/nonexistent/incidents.md")))
+
+    def test_it_is_printed_only_beside_a_tier(self):
+        tripped = [("I-01", "unit")] * risk.BREAKER_ROWS
+        tiered = next(p for _, _, patterns in risk.TIERS for p in patterns if "*" not in p)
+        for paths, shown in ((["zz-untiered/none.txt"], False), ([tiered], True)):
+            with self.subTest(paths=paths), \
+                    mock.patch.object(risk, "recent_incidents", return_value=tripped), \
+                    mock.patch.object(sys, "argv", ["risk_tier.py", *paths]), \
+                    redirect_stdout(io.StringIO()) as out:
+                risk.main(paths) if risk.main.__code__.co_argcount else risk.main()
+                self.assertEqual(shown, "risk: breaker" in out.getvalue(), out.getvalue())
+
+
+result = unittest.TextTestRunner(stream=sys.stdout, verbosity=0).run(
+    unittest.defaultTestLoader.loadTestsFromTestCase(BreakerTests))
+sys.exit(0 if result.wasSuccessful() and result.testsRun == 4 else 1)
+PYTHON
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "CI and local checks run the incident audit and the risk tiers" {
+    run grep -F 'audit_incidents.py' "$PROJECT_ROOT/scripts/check.sh"
+    [ "$status" -eq 0 ]
+    run grep -F 'risk_tier.py' "$PROJECT_ROOT/scripts/check.sh"
+    [ "$status" -eq 0 ]
+    run grep -F 'python3 scripts/audit_incidents.py' "$PROJECT_ROOT/.github/workflows/test.yml"
+    [ "$status" -eq 0 ]
 }

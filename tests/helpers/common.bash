@@ -6,6 +6,12 @@
 # command a test must never run for real turns a forgotten mock into a red
 # test instead of a host-dependent pass. See mole_test_install_unstubbed_path.
 
+# find_app_files treats another installed build of an app's family as the
+# owner of the family's name folders. Point that probe at a folder that never
+# exists, so results never depend on the host's /Applications; a test that
+# needs a sibling sets its own root.
+export MOLE_TEST_APP_FAMILY_ROOT="${MOLE_TEST_APP_FAMILY_ROOT:-${BATS_RUN_TMPDIR:-/tmp}/mole-test-no-app-family}"
+
 # PROJECT_ROOT for files that need nothing else from the shared setup.
 mole_test_setup_project_root() {
 	PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
@@ -59,7 +65,7 @@ export -f mole_source_installer
 # defines a shell function (functions win over PATH) or puts its own stub
 # directory earlier on PATH. Production code that calls an absolute path such
 # as /usr/bin/sudo bypasses these stubs by design.
-MOLE_TEST_UNSTUBBED_COMMANDS=(sudo osascript launchctl mdfind brew xcrun)
+MOLE_TEST_UNSTUBBED_COMMANDS=(sudo osascript launchctl mdfind brew xcrun docker)
 
 # Put an executable test double for <name> first on PATH for the rest of this
 # test, including `run env ... /bin/bash` children and `mole` subprocesses.
@@ -106,3 +112,47 @@ STUB
 }
 
 mole_test_install_unstubbed_path
+
+# A test that never sets HOME runs Mole against the real one, and every
+# operations.log / deletions.log row it writes lands in the user's
+# ~/Library/Logs/mole, which Mole Mac and support read as real history:
+# about 2,900 rows naming tests/tmp-* paths were found in one such log.
+# Point a file that keeps the account's own HOME at a per-file scratch HOME.
+# Files that set their own HOME (mole_test_setup_home, setup, `env HOME=`)
+# are unaffected. Like the stubs above, this needs the file tmpdir.
+mole_test_isolate_account_home() {
+	[[ -n "${BATS_FILE_TMPDIR:-}" ]] || return 0
+	local account account_home=""
+	account="$(id -un 2> /dev/null)" || account=""
+	if [[ "$account" =~ ^[A-Za-z0-9._-]+$ ]]; then
+		eval "account_home=~$account"
+	fi
+	if [[ -z "${HOME:-}" || "$HOME" == "$account_home" ]]; then
+		# Go keeps its caches under HOME; pin them to the account's so a build
+		# neither starts cold nor leaves read-only module files in scratch.
+		if [[ -n "$account_home" ]]; then
+			export GOPATH="${GOPATH:-$account_home/go}"
+			export GOMODCACHE="${GOMODCACHE:-$GOPATH/pkg/mod}"
+			export GOCACHE="${GOCACHE:-$account_home/Library/Caches/go-build}"
+		fi
+		HOME="$BATS_FILE_TMPDIR/account-home"
+		mkdir -p "$HOME"
+		export HOME
+	fi
+}
+
+mole_test_isolate_account_home
+
+# Mole's temp registry and stale-temp pruning otherwise inherit the account's
+# system temp directory even when HOME is isolated. Keep every ordinary Bats
+# scratch file under the runner-owned per-file tree; tests may still override
+# TMPDIR explicitly after loading this helper to exercise fallback behavior.
+mole_test_isolate_tmpdir() {
+    [[ -n "${BATS_FILE_TMPDIR:-}" ]] || return 0
+    TMPDIR="$BATS_FILE_TMPDIR/mole-tmp"
+    mkdir -p "$TMPDIR"
+    export TMPDIR
+    unset MOLE_RESOLVED_TMPDIR MOLE_TEMP_REGISTRY_FILE
+}
+
+mole_test_isolate_tmpdir

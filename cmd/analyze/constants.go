@@ -5,6 +5,7 @@ package main
 import "time"
 
 const (
+	// Bound cached and recursive summaries, not the browsed directory listing.
 	maxEntries    = 30
 	maxLargeFiles = 20
 	barWidth      = 24
@@ -17,11 +18,10 @@ const (
 	analyzerCacheTTL       = 7 * 24 * time.Hour
 	overviewCacheTTL       = 7 * 24 * time.Hour
 	overviewCacheFile      = "overview_sizes.json"
-	duTimeout              = 30 * time.Second
 	mdlsTimeout            = 5 * time.Second
+	duExitWait             = 500 * time.Millisecond
 	maxConcurrentOverview  = 8
 	batchUpdateSize        = 100
-	cacheModTimeGrace      = 30 * time.Minute
 	staleCacheTTL          = 3 * 24 * time.Hour
 
 	// Analyzer cache admission and eviction budget. A subtree is only worth a
@@ -70,6 +70,11 @@ var overviewDuIgnoreNames = map[string]bool{
 	// when most entries are cloud placeholders. Keep the overview responsive;
 	// users can still drill into the folder explicitly when they need it.
 	"Mobile Documents": true,
+	// File Provider domains (Dropbox, Google Drive, OneDrive, Proton Drive)
+	// hold cloud-only folders too, and walking them asks the provider to
+	// materialize each listing. Mole Mac turns materialization off for the
+	// same walk (17143ac4c); the overview skips them like Mobile Documents.
+	"CloudStorage": true,
 }
 
 var foldDirs = map[string]bool{
@@ -290,7 +295,8 @@ var skipExtensions = map[string]bool{
 	".hx":     true,
 }
 
-var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+// Match the shell spinner's centered 2x2 shape in lib/core/ui.sh.
+var spinnerFrames = []string{"⠖", "⠲", "⠴", "⠦"}
 
 const (
 	colorPurple     = "\033[0;35m"

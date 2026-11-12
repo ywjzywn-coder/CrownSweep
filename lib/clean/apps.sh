@@ -2,13 +2,20 @@
 # Application Data Cleanup Module
 set -euo pipefail
 
-readonly ORPHAN_AGE_THRESHOLD=${ORPHAN_AGE_THRESHOLD:-${MOLE_ORPHAN_AGE_DAYS:-30}}
-readonly CLAUDE_VM_ORPHAN_AGE_THRESHOLD=${MOLE_CLAUDE_VM_ORPHAN_AGE_DAYS:-7}
+readonly ORPHAN_AGE_THRESHOLD=${MOLE_ORPHAN_AGE_DAYS:-30}
+readonly CLAUDE_VM_ORPHAN_AGE_THRESHOLD=7
+readonly ORPHAN_AGE_WALK_BUDGET_SEC=60
 readonly INSTALLED_APPS_CACHE_COMPLETE_MARKER="# mole-installed-apps-cache:v3:complete"
-# Args: $1=target_dir, $2=label
+# Args: $1=target_dir, $2=label, optional $3=scan stderr file, $4...=find exclusions
 clean_ds_store_tree() {
     local target="$1"
     local label="$2"
+    local scan_errors="${3:-/dev/null}"
+    if [[ $# -ge 3 ]]; then
+        shift 3
+    else
+        shift 2
+    fi
     [[ -d "$target" ]] || return 0
     local file_count=0
     local total_bytes=0
@@ -26,16 +33,16 @@ clean_ds_store_tree() {
         -path "*/.git" -prune -o
         -path "*/Library/Caches" -prune -o
     )
-    local -a find_cmd=("find" "$target")
+    local -a find_cmd=("find" "-P" "$target")
     if [[ "$target" == "$HOME" ]]; then
         find_cmd+=("-maxdepth" "5")
     fi
-    find_cmd+=("${exclude_paths[@]}" "-type" "f" "-name" ".DS_Store" "-print0")
+    find_cmd+=("$@" "${exclude_paths[@]}" "-type" "f" "-name" ".DS_Store" "-print0")
     local scan_file=""
     scan_file=$(create_temp_file) || return 1
     local scan_rc=0
     run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" "${find_cmd[@]}" \
-        > "$scan_file" 2> /dev/null || scan_rc=$?
+        > "$scan_file" 2> "$scan_errors" || scan_rc=$?
     if [[ $scan_rc -ne 0 ]]; then
         rm -f -- "$scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
         [[ "$spinner_active" == "true" ]] && stop_section_spinner
@@ -99,7 +106,7 @@ clean_ds_store_tree() {
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$size_kb")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} $label${NC} · ${line_color}$file_count files, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} $label${NC} · ${line_color}$file_count files, $(colorize_human_size "${size_human}")"
         fi
         mole_add_cleaned_row "$file_count" "$size_kb"
         note_activity
@@ -139,7 +146,380 @@ publish_installed_apps_cache() {
     return 0
 }
 
-# Orphaned app data (30+ days inactive). Env: ORPHAN_AGE_THRESHOLD, DRY_RUN
+# A LaunchAgent plist's name claims that bundle id's data for the orphan scan
+# only while its job can still run. A dead agent kept its app's leftovers out
+# of `mo clean` forever, as the Mac app found with an agent that opened a
+# deleted helper through /usr/bin/open. Every doubt keeps the claim: a plist
+# that cannot be read or is not understood, a program named without an
+# absolute path (launchd resolves it through PATH), a path on /Volumes (an
+# unplugged disk reads as gone), a path behind a link, inside a folder whose
+# lookup can raise a privacy prompt, or behind a folder that cannot be searched.
+
+# Prints the strings a plist key holds, one per line, in
+# _MOLE_LAUNCH_AGENT_STRINGS. Returns 1 when the key is absent, unreadable, or
+# holds anything but plain one-line strings (a value with "&" is XML-escaped and
+# is not decoded here, so it counts as not understood).
+_mole_launch_agent_plist_strings() {
+    local plist="$1" key="$2" expect="$3"
+    _MOLE_LAUNCH_AGENT_STRINGS=()
+    local xml="" rc=0
+    xml=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" /usr/bin/plutil \
+        -extract "$key" xml1 -expect "$expect" -o - "$plist" < /dev/null 2> /dev/null) || rc=$?
+    [[ $rc -eq 0 && -n "$xml" ]] || return 1
+    local line="" string_re='^[[:space:]]*<string>(.*)</string>$'
+    local empty_re='^[[:space:]]*<string/>$'
+    while IFS= read -r line; do
+        case "$line" in
+            '<?xml '* | '<!DOCTYPE '* | '<plist version='* | '</plist>' | \
+                '<array>' | '</array>' | '<array/>') continue ;;
+        esac
+        if [[ "$line" =~ $string_re ]]; then
+            [[ "${BASH_REMATCH[1]}" != *'&'* ]] || return 1
+            _MOLE_LAUNCH_AGENT_STRINGS+=("${BASH_REMATCH[1]}")
+        elif [[ "$line" =~ $empty_re ]]; then
+            _MOLE_LAUNCH_AGENT_STRINGS+=("")
+        else
+            return 1
+        fi
+    done <<< "$xml"
+    return 0
+}
+
+_mole_launch_agent_is_interpreter() {
+    case "$1" in
+        sh | bash | zsh | fish | env | node | npx | npm | bun | bunx | deno | \
+            python | python3 | uv | uvx | ruby | perl | java | osascript) return 0 ;;
+    esac
+    return 1
+}
+
+# Interpreter options whose next argument is a value, never the script.
+_mole_launch_agent_takes_value() {
+    case "$1:$2" in
+        sh:-o | sh:+o | sh:-O | sh:+O | sh:--rcfile | sh:--init-file) return 0 ;;
+        bash:-o | bash:+o | bash:-O | bash:+O | bash:--rcfile | bash:--init-file) return 0 ;;
+        zsh:-o | zsh:+o | zsh:-O | zsh:+O | zsh:--rcfile | zsh:--init-file) return 0 ;;
+        fish:-C | fish:--init-command) return 0 ;;
+        python:-X | python:-W | python:--check-hash-based-pycs) return 0 ;;
+        python3:-X | python3:-W | python3:--check-hash-based-pycs) return 0 ;;
+        ruby:-I | ruby:-r | ruby:-C | ruby:-E | ruby:--encoding) return 0 ;;
+        perl:-I | osascript:-l | osascript:-s) return 0 ;;
+        java:-cp | java:-classpath | java:--class-path | java:-p | java:--module-path | \
+            java:--upgrade-module-path | java:--add-modules) return 0 ;;
+        node:-r | node:--require | node:--import | node:--loader | node:--experimental-loader | \
+            node:-C | node:--conditions | node:--env-file | node:--inspect-port | node:--title | \
+            node:--input-type) return 0 ;;
+        open:-i | open:--stdin | open:-o | open:--stdout | open:--stderr | open:--env | \
+            open:-s | open:-u | open:--url | open:--arch) return 0 ;;
+    esac
+    return 1
+}
+
+# Options known to take no value and to leave the script (or the app `open`
+# runs) as the next argument; `open --args` and `open -b` are not listed. Anything else before the script is not
+# understood and keeps the claim: an unknown option may take a value that
+# would be judged as the script, and inline code (-c, -e, --eval, perl's -E), a
+# module (-m), stdin (the shells' -s, a bare "-") and printed code (-p) are
+# never listed. Python's -s and -E are listed on purpose: there they mean
+# "no user site" and "ignore the environment" and take no value.
+# npm, npx, bun, bunx, deno, uv and uvx have no list, so any option keeps.
+_mole_launch_agent_flag_known() {
+    local runner="$1" arg="$2" letters="" long=""
+    case "$runner" in
+        sh | bash | zsh) letters="lxvuf" long="--login --noprofile --norc --posix --noediting" ;;
+        fish) letters="lNP" long="--login --no-config --private" ;;
+        python | python3) letters="uBEsSOqIbd" ;;
+        ruby) letters="wWd" ;;
+        perl) letters="wWTtX" ;;
+        node)
+            # `--name=value` is one argument, so nothing after it shifts; only
+            # the forms known to leave the script as the next argument pass.
+            # --eval=, --print= and --run= run inline code or a package
+            # script, and any other spelling is not understood.
+            case "$arg" in
+                --max-old-space-size=* | --max-semi-space-size=* | --stack-size=* | \
+                    --inspect=* | --inspect-brk=* | --inspect-port=* | --title=* | \
+                    --require=* | --import=* | --loader=* | --experimental-loader=* | \
+                    --conditions=* | --env-file=* | --input-type=*) return 0 ;;
+                --*=*) return 1 ;;
+            esac
+            long="--no-warnings --no-deprecation --enable-source-maps --trace-warnings"
+            long="$long --trace-uncaught --expose-gc --abort-on-uncaught-exception"
+            long="$long --preserve-symlinks --inspect --inspect-brk --use-strict"
+            ;;
+        java)
+            case "$arg" in -D?* | -X?*) return 0 ;; esac
+            long="-jar -server -ea -da -esa -dsa --enable-preview -verbose"
+            ;;
+        open) long="-n -g -j -F -W -R -e -t --new --background --hide --fresh --wait-apps --reveal" ;;
+    esac
+    case " $long " in *" $arg "*) return 0 ;; esac
+    [[ -n "$letters" && "$arg" == -?* && "$arg" != --* ]] || return 1
+    local cluster="${arg#-}"
+    while [[ -n "$cluster" ]]; do
+        [[ "$letters" == *"${cluster:0:1}"* ]] || return 1
+        cluster="${cluster:1}"
+    done
+    return 0
+}
+
+# Sets _MOLE_LAUNCH_AGENT_TARGET to the absolute path an `open` or interpreter
+# job runs. $1 is the executable, the rest its arguments after argv[0].
+# Returns 1 when there is none to judge: another executable, an option not
+# understood, inline code, a module, a relative path, a bundle id.
+_mole_launch_agent_target() {
+    _MOLE_LAUNCH_AGENT_TARGET=""
+    local name="" arg=""
+    mole_ascii_lowercase name "${1##*/}"
+    shift
+    if [[ "$name" == "open" ]]; then
+        local expects_app=false skips_value=false
+        for arg in "$@"; do
+            if [[ "$skips_value" == true ]]; then
+                skips_value=false
+                continue
+            fi
+            if [[ "$expects_app" != true && "$arg" == -* ]]; then
+                if [[ "$arg" == "-a" ]]; then
+                    expects_app=true
+                elif _mole_launch_agent_takes_value open "$arg"; then
+                    skips_value=true
+                else
+                    _mole_launch_agent_flag_known open "$arg" || return 1
+                fi
+                continue
+            fi
+            [[ "$arg" == /* ]] || return 1
+            _MOLE_LAUNCH_AGENT_TARGET="$arg"
+            return 0
+        done
+        return 1
+    fi
+    _mole_launch_agent_is_interpreter "$name" || return 1
+    local runner="$name"
+    if [[ "$name" == "env" ]]; then
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -S*) return 1 ;;
+                -u | -P | -L | -U | -C)
+                    shift
+                    [[ $# -eq 0 ]] || shift
+                    ;;
+                -* | *=*) shift ;;
+                *) break ;;
+            esac
+        done
+        [[ $# -gt 0 ]] || return 1
+        local command="$1"
+        shift
+        mole_ascii_lowercase runner "${command##*/}"
+        if ! _mole_launch_agent_is_interpreter "$runner"; then
+            [[ "$command" == /* ]] || return 1
+            _MOLE_LAUNCH_AGENT_TARGET="$command"
+            return 0
+        fi
+    fi
+    local skips_value=false
+    for arg in "$@"; do
+        if [[ "$skips_value" == true ]]; then
+            skips_value=false
+            continue
+        fi
+        [[ "$arg" != "--" ]] || continue
+        if _mole_launch_agent_takes_value "$runner" "$arg"; then
+            skips_value=true
+            continue
+        fi
+        if [[ "$arg" == -* ]]; then
+            _mole_launch_agent_flag_known "$runner" "$arg" || return 1
+            continue
+        fi
+        [[ "$arg" == /* ]] || return 1
+        _MOLE_LAUNCH_AGENT_TARGET="$arg"
+        return 0
+    done
+    return 1
+}
+
+# Sets the variable named $1 to path $2 as the data volume resolves it for a
+# comparison: lowercased (APFS is case-insensitive by default), trailing
+# slashes dropped, and the /System/Volumes/Data firmlink prefix removed.
+_mole_launch_agent_fold_path() {
+    local _mole_fold_value=""
+    mole_ascii_lowercase _mole_fold_value "$2"
+    while [[ "$_mole_fold_value" == */ && "$_mole_fold_value" != / ]]; do
+        _mole_fold_value="${_mole_fold_value%/}"
+    done
+    case "$_mole_fold_value" in
+        /system/volumes/data) _mole_fold_value=/ ;;
+        /system/volumes/data/*) _mole_fold_value="${_mole_fold_value#/system/volumes/data}" ;;
+    esac
+    printf -v "$1" '%s' "$_mole_fold_value"
+}
+
+# Prints "<format> <file>" for each file whose mount points keep a claim, since
+# a disk mounted there reads as gone while unplugged. Tests override it.
+_mole_launch_agent_mount_config_files() {
+    printf '%s\n' "fstab /etc/fstab" "master /etc/auto_master"
+}
+
+# Adds the folded mount points one file names to _MOLE_LAUNCH_AGENT_MOUNT_POINTS.
+# Formats: fstab (field 2), master (field 1, with a "/-" direct map read from
+# its file), direct (field 1). Returns 1 when a file exists but cannot be read.
+_mole_launch_agent_read_mount_file() {
+    local format="$1" file="$2"
+    # Absent only on a proven ENOENT; a file this user is denied from seeing
+    # may name mount points, so it keeps every claim.
+    if [[ ! -e "$file" ]]; then
+        local stat_error=""
+        stat_error=$(LC_ALL=C run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" /usr/bin/stat -f %N "$file" 2>&1 > /dev/null) && return 1
+        [[ "$stat_error" == *": No such file or directory" ]] || return 1
+        return 0
+    fi
+    [[ -r "$file" ]] || return 1
+    local first="" second="" rest="" mount_point="" map="" folded="" rc=0
+    while read -r first second rest || [[ -n "$first" ]]; do
+        case "$first" in "" | "#"* | "+"*) continue ;; esac
+        mount_point="$first"
+        [[ "$format" != fstab ]] || mount_point="$second"
+        if [[ "$format" == master && "$mount_point" == "/-" ]]; then
+            map="$second"
+            case "$map" in "" | -*) continue ;; esac
+            [[ "$map" == /* ]] || map="/etc/$map"
+            _mole_launch_agent_read_mount_file direct "$map" || rc=1
+            continue
+        fi
+        mount_point="${mount_point//\\040/ }"
+        [[ "$mount_point" == /* ]] || continue
+        _mole_launch_agent_fold_path folded "$mount_point"
+        [[ -n "$folded" && "$folded" != / ]] || continue
+        _MOLE_LAUNCH_AGENT_MOUNT_POINTS+=("$folded")
+    done < "$file"
+    return "$rc"
+}
+
+# Loads the configured mount points once per scan. Returns 1 when one of the
+# files could not be read, which keeps every claim.
+_mole_launch_agent_load_mount_points() {
+    if [[ "${_MOLE_LAUNCH_AGENT_MOUNTS_LOADED:-}" != true ]]; then
+        _MOLE_LAUNCH_AGENT_MOUNTS_LOADED=true
+        _MOLE_LAUNCH_AGENT_MOUNTS_RC=0
+        _MOLE_LAUNCH_AGENT_MOUNT_POINTS=()
+        local format="" file=""
+        while read -r format file; do
+            [[ -n "$file" ]] || continue
+            _mole_launch_agent_read_mount_file "$format" "$file" || _MOLE_LAUNCH_AGENT_MOUNTS_RC=1
+        done < <(_mole_launch_agent_mount_config_files)
+    fi
+    return "$_MOLE_LAUNCH_AGENT_MOUNTS_RC"
+}
+
+# Returns 0 only when the path is provably gone: absolute, plainly spelled,
+# reached through no link, outside /Volumes and the privacy-prompting folders,
+# absent, and its nearest existing ancestor is a folder this user can search.
+_mole_launch_agent_path_provably_missing() {
+    local path="$1"
+    [[ "$path" == /* ]] || return 1
+    case "$path" in
+        */./* | */../* | */. | */.. | *//*) return 1 ;;
+        # /.nofollow/, /.resolve/N/ and /.vol/ are other spellings of the
+        # whole tree, so every guard below would be read past.
+        /.*) return 1 ;;
+    esac
+    local lower_path="" lower_home="" folder=""
+    _mole_launch_agent_fold_path lower_path "$path"
+    _mole_launch_agent_fold_path lower_home "$HOME"
+    [[ "$lower_home" != / ]] || lower_home=""
+    case "$lower_path" in
+        /volumes | /volumes/*) return 1 ;;
+    esac
+    for folder in Desktop Documents Downloads "Library/Mobile Documents" \
+        "Library/CloudStorage" "Library/Containers" "Library/Group Containers"; do
+        mole_ascii_lowercase folder "$folder"
+        case "$lower_path" in
+            "$lower_home/$folder" | "$lower_home/$folder"/*) return 1 ;;
+        esac
+    done
+    _mole_launch_agent_load_mount_points || return 1
+    local mount_point=""
+    for mount_point in ${_MOLE_LAUNCH_AGENT_MOUNT_POINTS[@]+"${_MOLE_LAUNCH_AGENT_MOUNT_POINTS[@]}"}; do
+        case "$lower_path" in
+            "$mount_point" | "$mount_point"/*) return 1 ;;
+        esac
+    done
+    # [[ -e ]] reads a denied lookup (a TCC or sandbox EPERM) as missing, so
+    # absence is proven by the errno itself. BSD stat is in every macOS base
+    # system (perl is a deprecated runtime) and reports through strerror, fixed
+    # English under LC_ALL=C; only ENOENT counts. The timeout keeps a stale NFS
+    # or autofs path from blocking the scan, and it runs before any builtin
+    # test touches the path.
+    local stat_error="" stat_rc=0
+    stat_error=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" /usr/bin/env LC_ALL=C \
+        /usr/bin/stat -f %N -- "$path" 2>&1 > /dev/null < /dev/null) || stat_rc=$?
+    [[ $stat_rc -eq 1 && "$stat_error" == *": No such file or directory" ]] || return 1
+    local prefix="" component="" rest="${path#/}"
+    while [[ -n "$rest" ]]; do
+        component="${rest%%/*}"
+        if [[ "$rest" == */* ]]; then
+            rest="${rest#*/}"
+        else
+            rest=""
+        fi
+        prefix="$prefix/$component"
+        [[ ! -L "$prefix" ]] || return 1
+        [[ -e "$prefix" ]] || break
+    done
+    [[ ! -e "$path" ]] || return 1
+    local parent="${path%/*}"
+    while [[ "$parent" == /* ]]; do
+        if [[ -e "$parent" ]]; then
+            [[ -d "$parent" && -x "$parent" ]] || return 1
+            # The nearest existing folder must really list, not only carry the
+            # Unix search bit.
+            run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" /bin/ls -f -- "$parent" \
+                > /dev/null 2>&1 < /dev/null
+            return
+        fi
+        parent="${parent%/*}"
+    done
+    return 0
+}
+
+# Returns 1 only when the agent's job provably cannot run; 0 keeps its claim.
+_mole_launch_agent_job_can_run() {
+    local plist="$1" executable="" whole="" whole_rc=0
+    # launchd runs Program whenever the key exists, so a Program that is there
+    # but not understood keeps the claim rather than falling back to
+    # ProgramArguments[0]; only a plist that reads whole and names no Program
+    # key at all is judged by its arguments.
+    whole=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" /usr/bin/plutil \
+        -convert xml1 -o - "$plist" < /dev/null 2> /dev/null) || whole_rc=$?
+    [[ $whole_rc -eq 0 && -n "$whole" ]] || return 0
+    if [[ "$whole" == *"<key>Program</key>"* ]]; then
+        _mole_launch_agent_plist_strings "$plist" Program string || return 0
+        [[ ${#_MOLE_LAUNCH_AGENT_STRINGS[@]} -eq 1 && -n "${_MOLE_LAUNCH_AGENT_STRINGS[0]}" ]] || return 0
+        executable="${_MOLE_LAUNCH_AGENT_STRINGS[0]}"
+    fi
+    local -a arguments=()
+    local arguments_known=false
+    if _mole_launch_agent_plist_strings "$plist" ProgramArguments array; then
+        arguments_known=true
+        if [[ ${#_MOLE_LAUNCH_AGENT_STRINGS[@]} -gt 0 ]]; then
+            arguments=("${_MOLE_LAUNCH_AGENT_STRINGS[@]}")
+        fi
+    fi
+    if [[ -z "$executable" && "$arguments_known" == true && ${#arguments[@]} -gt 0 ]]; then
+        executable="${arguments[0]}"
+    fi
+    [[ -n "$executable" ]] || return 0
+    ! _mole_launch_agent_path_provably_missing "$executable" || return 1
+    [[ "$arguments_known" == true ]] || return 0
+    _mole_launch_agent_target "$executable" ${arguments[@]+"${arguments[@]:1}"} || return 0
+    ! _mole_launch_agent_path_provably_missing "$_MOLE_LAUNCH_AGENT_TARGET" || return 1
+    return 0
+}
+
+# Orphaned app data (30+ days inactive). Env: DRY_RUN
 # Usage: scan_installed_apps "output_file"
 scan_installed_apps() {
     local installed_bundles="$1"
@@ -248,6 +628,14 @@ scan_installed_apps() {
                         fi
                     done
                 fi
+                # A PlayCover launcher alias has no Contents/ either; the strict
+                # alias check names the installed bundle that owns its id.
+                if [[ ! -f "$plist_path" ]]; then
+                    local playcover_bundle=""
+                    if playcover_bundle=$(mole_playcover_alias_target "$app_path" 2> /dev/null); then
+                        plist_path="$playcover_bundle/Info.plist"
+                    fi
+                fi
                 local bundle_id=""
                 if [[ ! -f "$plist_path" || ! -r "$plist_path" ]] ||
                     ! bundle_id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$plist_path" 2> /dev/null) ||
@@ -338,10 +726,25 @@ scan_installed_apps() {
             -name "*.plist" -type f -print0 > "$agent_paths_file" 2> /dev/null; then
             exit 1
         fi
-        local agent_path=""
+        # Judging reads at most a few plutil answers per plist (about 5ms
+        # each); past the budget the remaining agents keep their claim.
+        local agent_path="" agents_judged=0 agents_dead=0
+        local agents_started_at=$SECONDS judge_budget="${MOLE_TIMEOUT_MEDIUM_PROBE_SEC%%.*}"
+        [[ "$judge_budget" =~ ^[0-9]+$ ]] || judge_budget=5
         while IFS= read -r -d '' agent_path; do
+            if ((SECONDS - agents_started_at < judge_budget)); then
+                agents_judged=$((agents_judged + 1))
+                if ! _mole_launch_agent_job_can_run "$agent_path"; then
+                    agents_dead=$((agents_dead + 1))
+                    printf 'launch agent cannot run, claims nothing: %s\n' "$agent_path" \
+                        >> "$scan_tmp_dir/perf.list"
+                    continue
+                fi
+            fi
             basename "$agent_path" .plist
         done < "$agent_paths_file" > "$scan_tmp_dir/agents.txt"
+        printf 'launch agents: %s judged, %s dead, %ss\n' "$agents_judged" "$agents_dead" \
+            "$((SECONDS - agents_started_at))" >> "$scan_tmp_dir/perf.list"
     ) < /dev/null &
     auxiliary_pids+=($!)
     debug_log "Waiting for $((${#app_scan_pids[@]} + ${#auxiliary_pids[@]})) background processes"
@@ -459,7 +862,7 @@ is_bundle_orphaned() {
 
     # 2. Fast path: check sensitive data patterns (in-memory, instant)
     local bundle_lower
-    bundle_lower=$(echo "$bundle_id" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    mole_ascii_lowercase bundle_lower "$bundle_id"
     for pattern in "${ORPHAN_NEVER_DELETE_PATTERNS[@]}"; do
         # shellcheck disable=SC2053
         if [[ "$bundle_lower" == $pattern ]]; then
@@ -479,16 +882,10 @@ is_bundle_orphaned() {
             ;;
     esac
 
-    # 5. Fast path: 30-day modification check (stat call, fast)
-    if [[ -e "$directory_path" ]]; then
-        local last_modified_epoch=$(get_file_mtime "$directory_path")
-        local current_epoch
-        current_epoch=$(get_epoch_seconds)
-        local days_since_modified=$(((current_epoch - last_modified_epoch) / 86400))
-        if [[ $days_since_modified -lt ${ORPHAN_AGE_THRESHOLD:-30} ]]; then
-            return 1
-        fi
-    fi
+    # 5. Nothing inside changed within the threshold (bounded walk)
+    local stale_rc=0
+    _orphan_path_is_stale "$directory_path" "$ORPHAN_AGE_THRESHOLD" || stale_rc=$?
+    [[ $stale_rc -eq 0 ]] || return "$stale_rc"
 
     # 6. Slow path: mdfind fallback with in-memory caching (Bash 3.2 compatible)
     # This catches apps installed in non-standard locations
@@ -523,6 +920,38 @@ is_bundle_orphaned() {
     return 0
 }
 
+# Returns 0 only when the whole path was read and nothing in it changed within
+# the given days. Writing a file leaves its directory's own mtime alone, so the
+# walk covers every entry. find passes over a directory it cannot search and
+# still exits 0, so one counts as a match; only a directory this user does not
+# own, has no owner search bit on, or that carries an ACL pays for the test
+# process. A walk that fails, times out or finds the section's walk budget spent
+# returns 1, keeping the path; an interrupt returns its signal status. Only walk
+# time spends the budget, not sizing or removal between walks.
+_orphan_path_is_stale() {
+    local path="$1"
+    local age_days="$2"
+    local recent_entry="" walk_rc=0 walk_timeout="" walk_started=$SECONDS
+    local budget_left="${_ORPHAN_AGE_WALK_BUDGET_LEFT:-}"
+    if ! walk_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
+        "${budget_left:+$((SECONDS + budget_left))}"); then
+        debug_log "Keeping orphan candidate, age walk budget spent: $path"
+        return 1
+    fi
+    recent_entry=$(run_with_timeout "$walk_timeout" "$FIND_BSD" "$path" \
+        \( -mmin "-$((age_days * 1440))" -o \
+        \( -type d \( ! -uid "$UID" -o ! -perm -u+x -o -acl \) ! -exec /bin/test -x {} \; \) \) \
+        -print -quit 2> /dev/null) || walk_rc=$?
+    [[ -z "$budget_left" ]] ||
+        _ORPHAN_AGE_WALK_BUDGET_LEFT=$((budget_left - (SECONDS - walk_started)))
+    [[ $walk_rc -lt 128 ]] || return "$walk_rc"
+    if [[ $walk_rc -ne 0 ]]; then
+        debug_log "Keeping orphan candidate, age walk status $walk_rc: $path"
+        return 1
+    fi
+    [[ -z "$recent_entry" ]]
+}
+
 is_claude_vm_bundle_orphaned() {
     local vm_bundle_path="$1"
     local installed_bundles="$2"
@@ -540,16 +969,9 @@ is_claude_vm_bundle_orphaned() {
         return 1
     fi
 
-    if [[ -e "$vm_bundle_path" ]]; then
-        local last_modified_epoch
-        last_modified_epoch=$(get_file_mtime "$vm_bundle_path")
-        local current_epoch
-        current_epoch=$(get_epoch_seconds)
-        local days_since_modified=$(((current_epoch - last_modified_epoch) / 86400))
-        if [[ $days_since_modified -lt ${CLAUDE_VM_ORPHAN_AGE_THRESHOLD:-7} ]]; then
-            return 1
-        fi
-    fi
+    local stale_rc=0
+    _orphan_path_is_stale "$vm_bundle_path" "$CLAUDE_VM_ORPHAN_AGE_THRESHOLD" || stale_rc=$?
+    [[ $stale_rc -eq 0 ]] || return "$stale_rc"
 
     local _cache_rc=0
     _mdfind_cache_check "$claude_bundle_id" || _cache_rc=$?
@@ -611,13 +1033,16 @@ orphan_cleanup_candidate_snapshot() {
 # trusting the negative mdfind cache used during the broad discovery pass.
 orphan_cleanup_candidate_still_eligible() {
     local path="$1"
+    local age_days="$ORPHAN_AGE_THRESHOLD"
 
     if [[ "${_ORPHAN_CLEANUP_KIND:-bundle}" == "claude" ]]; then
         local process_rc=0
         pgrep -x "Claude" > /dev/null 2>&1 || process_rc=$?
         mole_rc_timeout_or_signal "$process_rc" && return "$process_rc"
         [[ $process_rc -eq 1 ]] || return 1
+        age_days="$CLAUDE_VM_ORPHAN_AGE_THRESHOLD"
     fi
+    _orphan_path_is_stale "$path" "$age_days" || return $?
 
     local resolver_rc=0
     bundle_has_installed_app "${_ORPHAN_CLEANUP_BUNDLE_ID:-}" \
@@ -685,19 +1110,20 @@ clean_orphaned_app_data() {
     debug_log "Found $app_count active/installed apps"
     local orphaned_count=0
     local total_orphaned_kb=0
+    local _ORPHAN_AGE_WALK_BUDGET_LEFT="$ORPHAN_AGE_WALK_BUDGET_SEC"
     start_section_spinner "Scanning orphaned app resources..."
 
-    # Dynamically discover Claude VM bundles (path may vary across versions).
-    local claude_support_dir="$HOME/Library/Application Support/Claude"
-    if [[ -d "$claude_support_dir" ]]; then
+    # The bundle name may vary across versions; only vm_bundles holds the VM.
+    local claude_vm_root="$HOME/Library/Application Support/Claude/vm_bundles"
+    if [[ -d "$claude_vm_root" ]]; then
         local claude_scan_file=""
         claude_scan_file=$(create_temp_file) || {
             rm -f -- "$installed_bundles" 2> /dev/null || true # SAFE: exact tracked temp file created above
             return 1
         }
         local claude_scan_rc=0
-        run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" find "$claude_support_dir" \
-            -maxdepth 3 -name "*.bundle" -type d -print0 \
+        run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" find "$claude_vm_root" \
+            -mindepth 1 -maxdepth 1 -name "*.bundle" -type d -print0 \
             > "$claude_scan_file" 2> /dev/null || claude_scan_rc=$?
         if [[ $claude_scan_rc -ge 128 ]]; then
             rm -f -- "$claude_scan_file" 2> /dev/null || true  # SAFE: exact tracked temp file created above
@@ -814,7 +1240,7 @@ clean_orphaned_app_data() {
                     if [[ $iteration_count -gt $MOLE_MAX_ORPHAN_ITERATIONS ]]; then
                         break
                     fi
-                    local bundle_id=$(basename "$match")
+                    local bundle_id="${match##*/}"
                     bundle_id="${bundle_id%.savedState}"
                     bundle_id="${bundle_id%.binarycookies}"
                     bundle_id="${bundle_id%.plist}"
@@ -880,15 +1306,46 @@ clean_orphaned_app_data() {
     done
     stop_section_spinner
     if [[ $orphaned_count -gt 0 ]]; then
-        local orphaned_mb=$(echo "$total_orphaned_kb" | awk '{printf "%.1f", $1/1024}')
+        local orphaned_human
+        orphaned_human=$(bytes_to_human_kb "$total_orphaned_kb")
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Would clean $orphaned_count items, about ${orphaned_mb}MB"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Would clean $(mole_count_label "$orphaned_count" item), about ${orphaned_human}"
         else
-            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $orphaned_count items, about ${orphaned_mb}MB"
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $(mole_count_label "$orphaned_count" item), about ${orphaned_human}"
         fi
         note_activity
     fi
     rm -f "$installed_bundles"
+}
+
+# The bare-helper pass runs only where this root exists. A function rather
+# than an inline test so Bats can reach the pass on runners without the
+# folder (GitHub's); the scan root itself stays the literal system path.
+_privileged_helper_root_exists() {
+    [[ -d /Library/PrivilegedHelperTools ]]
+}
+
+# A helper an app shipped validates as Developer ID. One a user built on this
+# Mac (clang plus a hand-written LaunchDaemon, an ad-hoc or self-signed
+# signature, a personal Apple Development certificate) has no parent app to
+# go missing, so it is never an orphan. A Team ID alone is not proof:
+# development certificates carry one too. 0 signed, 1 unproven, 124 or a
+# signal status when the probe was cut short.
+_privileged_helper_is_developer_id_signed() {
+    local binary="$1"
+    local deadline_seconds="${2:-}"
+    local verify_timeout="$MOLE_TIMEOUT_QUICK_DETECT_SEC"
+    local verify_rc=0
+    verify_timeout=$(_mole_timeout_with_deadline "$verify_timeout" "$deadline_seconds") || verify_rc=$?
+    [[ $verify_rc -eq 0 ]] || return "$verify_rc"
+    [[ -x /usr/bin/codesign ]] || return 1
+    run_with_timeout "$verify_timeout" /usr/bin/codesign --verify \
+        -R='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' \
+        "$binary" < /dev/null > /dev/null 2>&1 || verify_rc=$?
+    if mole_rc_timeout_or_signal "$verify_rc"; then
+        return "$verify_rc"
+    fi
+    [[ $verify_rc -eq 0 ]]
 }
 
 _privileged_helper_bundle_id_from_binary() {
@@ -928,9 +1385,26 @@ _privileged_helper_bundle_id_from_binary() {
     printf '%s\n' "$helper_bundle_id"
 }
 
+# Device-management, endpoint-security and VPN services keep running when their
+# app looks gone (an MDM profile, a half-removed agent, a VPN daemon), and only
+# the vendor's own tool may remove them. Never an orphan, matching Mole Mac.
+_orphan_service_vendor_protected() {
+    local identity token
+    for identity in "$@"; do
+        [[ -n "$identity" ]] || continue
+        mole_ascii_lowercase identity "$identity"
+        for token in mdm jamf crowdstrike sentinelone carbonblack defender eset sophos \
+            littlesnitch tailscale wireguard protonvpn nordvpn mullvad surge clash mihomo; do
+            [[ "$identity" == *"$token"* ]] && return 0
+        done
+    done
+    return 1
+}
+
 # Clean orphaned system-level services (LaunchDaemons, LaunchAgents, PrivilegedHelperTools)
 # These are left behind when apps are uninstalled but their system services remain
 clean_orphaned_system_services() {
+    [[ "${SYSTEM_CLEAN:-true}" == "true" ]] || return 0
     # Requires sudo
     if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
         return 0
@@ -993,8 +1467,18 @@ clean_orphaned_system_services() {
         # /Library/Intego tree is root-only readable; never treat its services
         # as orphans while any Intego install evidence exists. See #1188.
         "com.intego.*:/Library/Intego|/Applications/Intego|/Library/Application Support/Intego"
-        # Homebrew-managed services (managed by brew services, not .app bundles)
+        # Symantec and Broadcom endpoint agents: a half-removed install leaves plists
+        # whose program is gone beside daemons that still run, and only the vendor's
+        # own uninstaller finishes that. Empty evidence = never an orphan.
+        "com.symantec.*:"
+        "com.broadcom.*:"
+        # Microsoft AutoUpdate serves Edge, Teams, OneDrive and Defender too,
+        # and lives outside every app root, so no installed app proves it.
+        "com.microsoft.autoupdate.helper:"
+        # Homebrew-managed services (managed by brew services, not .app bundles);
+        # current Homebrew labels them sh.brew.<formula>, older ones homebrew.mxcl.<formula>
         "homebrew.mxcl.*:"
+        "sh.brew.*:"
     )
 
     # Returns 0 (found/protected) when any app backing a system service is installed.
@@ -1179,6 +1663,28 @@ clean_orphaned_system_services() {
                 ;;
         esac
 
+        # Check protect patterns before the binary probes: an installed helper
+        # whose app cannot be resolved (Microsoft AutoUpdate serves products
+        # outside every app root) would otherwise be called orphaned below.
+        # A matching pattern declares the app as installed.
+        local pattern_entry
+        _orphan_service_vendor_protected "$bundle_id" "${binary##*/}" && return 1
+        for pattern_entry in "${known_protect_patterns[@]}"; do
+            local file_pattern="${pattern_entry%%:*}"
+            local app_path="${pattern_entry#*:}"
+            # shellcheck disable=SC2053
+            [[ "$bundle_id" == $file_pattern ]] || continue
+            local protect_rc=0
+            _system_service_app_exists "$bundle_id" "$app_path" || protect_rc=$?
+            if [[ $protect_rc -eq 0 ]]; then
+                return 1
+            elif [[ $protect_rc -ge 128 ]]; then
+                return "$protect_rc"
+            fi
+            # Pattern matched and app is gone → don't protect (fall through).
+            break
+        done
+
         # Self-protecting software (Intego and similar antivirus / endpoint
         # agents) makes its install directories root-only readable, so an
         # unprivileged -e probe reports the daemon binary missing even though
@@ -1235,6 +1741,11 @@ clean_orphaned_system_services() {
                 if mole_rc_timeout_or_signal "$helper_id_rc"; then
                     return "$helper_id_rc"
                 fi
+                # Only a reverse-DNS helper id can be asked about its parent
+                # app, the rule the bare-helper pass uses. A plain file name
+                # (VendorCloudPrintUpdater) is no bundle id, so it always read
+                # as "parent app gone" and a live KeepAlive daemon was offered.
+                [[ "$helper_bundle_id" =~ ^(com|org|net|io)\. ]] || return 1
                 local helper_resolver_rc=0
                 bundle_has_installed_app "$helper_bundle_id" \
                     "$service_cleanup_deadline" || helper_resolver_rc=$?
@@ -1243,7 +1754,14 @@ clean_orphaned_system_services() {
                 elif [[ $helper_resolver_rc -ge 128 ]]; then
                     return "$helper_resolver_rc"
                 fi
-                # Parent app is gone, binary is orphaned, so plist is orphaned
+                # Parent app is gone; only a vendor's signed helper is orphaned.
+                local helper_signed_rc=0
+                _privileged_helper_is_developer_id_signed "$binary" \
+                    "$service_cleanup_deadline" || helper_signed_rc=$?
+                if mole_rc_timeout_or_signal "$helper_signed_rc"; then
+                    return "$helper_signed_rc"
+                fi
+                [[ $helper_signed_rc -eq 0 ]] || return 1
                 return 0
             fi
             return 1 # Binary exists and not in PrivilegedHelperTools, plist is healthy
@@ -1251,25 +1769,6 @@ clean_orphaned_system_services() {
 
         # If the binary is in a package-manager / system path, skip.
         _is_package_managed_binary "$binary" && return 1
-
-        # Check protect patterns: if any matching pattern declares the app as
-        # installed, this plist is protected.
-        local pattern_entry
-        for pattern_entry in "${known_protect_patterns[@]}"; do
-            local file_pattern="${pattern_entry%%:*}"
-            local app_path="${pattern_entry#*:}"
-            # shellcheck disable=SC2053
-            [[ "$bundle_id" == $file_pattern ]] || continue
-            local protect_rc=0
-            _system_service_app_exists "$bundle_id" "$app_path" || protect_rc=$?
-            if [[ $protect_rc -eq 0 ]]; then
-                return 1
-            elif [[ $protect_rc -ge 128 ]]; then
-                return "$protect_rc"
-            fi
-            # Pattern matched and app is gone → don't protect (fall through).
-            break
-        done
 
         return 0 # orphaned
     }
@@ -1439,6 +1938,7 @@ clean_orphaned_system_services() {
             _plist_is_orphaned "$candidate" "$bundle_id" || return $?
         else
             local pattern_entry
+            _orphan_service_vendor_protected "$bundle_id" "$filename" && return 1
             for pattern_entry in "${known_protect_patterns[@]}"; do
                 local file_pattern="${pattern_entry%%:*}"
                 local app_path="${pattern_entry#*:}"
@@ -1583,7 +2083,7 @@ clean_orphaned_system_services() {
     fi
 
     # Scan PrivilegedHelperTools
-    if [[ $service_scan_status -eq 0 && -d /Library/PrivilegedHelperTools ]]; then
+    if [[ $service_scan_status -eq 0 ]] && _privileged_helper_root_exists; then
         local helper_scan_rc=0
         local helper_scan_timeout=""
         helper_scan_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
@@ -1621,6 +2121,7 @@ clean_orphaned_system_services() {
                 local is_protected=false
                 local protect_interrupt_rc=0
                 local pattern_entry
+                _orphan_service_vendor_protected "$bundle_id" "$filename" && is_protected=true
                 for pattern_entry in "${known_protect_patterns[@]}"; do
                     local file_pattern="${pattern_entry%%:*}"
                     local app_path="${pattern_entry#*:}"
@@ -1657,6 +2158,23 @@ clean_orphaned_system_services() {
                         service_scan_status=$helper_resolver_rc
                         break
                     elif [[ $helper_resolver_rc -eq 1 ]]; then
+                        # Judge the binary itself; a helper-root .plist follows
+                        # its same-named binary when that binary is present.
+                        local helper_binary="$helper"
+                        [[ "$filename" == *.plist ]] && helper_binary="${helper%.plist}"
+                        if [[ "$helper_binary" != "$helper" && ! -e "$helper_binary" ]]; then
+                            helper_binary=""
+                        fi
+                        if [[ -n "$helper_binary" ]]; then
+                            local helper_signed_rc=0
+                            _privileged_helper_is_developer_id_signed "$helper_binary" \
+                                "$service_cleanup_deadline" || helper_signed_rc=$?
+                            if mole_rc_timeout_or_signal "$helper_signed_rc"; then
+                                service_scan_status=$helper_signed_rc
+                                break
+                            fi
+                            [[ $helper_signed_rc -eq 0 ]] || continue
+                        fi
                         local helper_record_rc=0
                         _record_orphan_service_candidate "$helper" || helper_record_rc=$?
                         if mole_rc_timeout_or_signal "$helper_record_rc"; then
@@ -1676,9 +2194,8 @@ clean_orphaned_system_services() {
     fi
     rm -f -- "$service_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
 
-    stop_section_spinner
-
     if [[ $service_scan_status -ne 0 ]]; then
+        stop_section_spinner
         debug_log "Skipping orphaned system services: privileged scan incomplete (status $service_scan_status)"
         if [[ $service_scan_status -ge 128 ]]; then
             return "$service_scan_status"
@@ -1728,8 +2245,12 @@ clean_orphaned_system_services() {
         fi
     fi
 
-    # Report and clean
-    if [[ $orphaned_count -gt 0 ]]; then
+    # Report and clean. Each candidate is resolved again before it is listed
+    # or removed, about a second apiece, so keep the spinner up until output.
+    if [[ $orphaned_count -eq 0 ]]; then
+        stop_section_spinner
+    else
+        start_section_spinner "Checking orphaned system services..."
         debug_log "Found $orphaned_count orphaned system services"
 
         local removed_count=0
@@ -1747,11 +2268,13 @@ clean_orphaned_system_services() {
             local eligibility_rc=0
             _orphan_service_candidate_still_eligible "$orphan_file" "$expected_identity" || eligibility_rc=$?
             if mole_rc_timeout "$eligibility_rc"; then
+                stop_section_spinner
                 echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
                 debug_log "Orphaned services stopped by deadline at stage: eligibility recheck"
                 note_activity
                 return 0
             elif [[ $eligibility_rc -ge 128 ]]; then
+                stop_section_spinner
                 return "$eligibility_rc"
             elif [[ $eligibility_rc -ne 0 ]]; then
                 debug_log "Keeping changed or no-longer-orphaned service: $orphan_file"
@@ -1779,12 +2302,14 @@ clean_orphaned_system_services() {
                         -n du -skP "$orphan_file" < /dev/null 2> /dev/null | awk '{print $1}') || orphan_size_rc=$?
                 fi
                 if mole_rc_timeout "$orphan_size_rc"; then
+                    stop_section_spinner
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
                     debug_log "Orphaned services stopped by deadline at stage: dry-run sizing"
                     note_activity
                     return 0
                 fi
                 if [[ $orphan_size_rc -ge 128 ]]; then
+                    stop_section_spinner
                     return "$orphan_size_rc"
                 fi
                 [[ $orphan_size_rc -eq 0 && "$orphan_size_kb" =~ ^[0-9]+$ ]] || orphan_size_kb=0
@@ -1805,12 +2330,14 @@ clean_orphaned_system_services() {
                         -n du -skP "$orphan_file" < /dev/null 2> /dev/null | awk '{print $1}') || file_size_rc=$?
                 fi
                 if mole_rc_timeout "$file_size_rc"; then
+                    stop_section_spinner
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
                     debug_log "Orphaned services stopped by deadline at stage: plist removal"
                     note_activity
                     return 0
                 fi
                 if [[ $file_size_rc -ge 128 ]]; then
+                    stop_section_spinner
                     return "$file_size_rc"
                 fi
                 [[ $file_size_rc -eq 0 && "$file_size_kb" =~ ^[0-9]+$ ]] || file_size_kb=0
@@ -1825,11 +2352,13 @@ clean_orphaned_system_services() {
                 _orphan_service_candidate_still_eligible "$orphan_file" \
                     "$expected_identity" || final_eligibility_rc=$?
                 if mole_rc_timeout "$final_eligibility_rc"; then
+                    stop_section_spinner
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
                     debug_log "Orphaned services stopped by deadline at stage: helper binary removal"
                     note_activity
                     return 0
                 elif [[ $final_eligibility_rc -ge 128 ]]; then
+                    stop_section_spinner
                     return "$final_eligibility_rc"
                 elif [[ $final_eligibility_rc -ne 0 ]]; then
                     debug_log "Keeping changed or no-longer-orphaned service before removal: $orphan_file"
@@ -1846,10 +2375,12 @@ clean_orphaned_system_services() {
                     debug_log "Skipping protected orphaned service: $orphan_file"
                     skipped_protected_count=$((skipped_protected_count + 1))
                 elif mole_rc_timeout "$remove_rc"; then
+                    stop_section_spinner
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}removal timed out, stopped cleanup${NC}"
                     note_activity
                     return 0
                 elif [[ $remove_rc -ge 128 ]]; then
+                    stop_section_spinner
                     return "$remove_rc"
                 else
                     debug_log "Failed to remove orphaned service: $orphan_file"
@@ -1857,6 +2388,7 @@ clean_orphaned_system_services() {
                 fi
             fi
         done
+        stop_section_spinner
 
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Orphaned services · ${YELLOW}${orphaned_count} found dry${NC}"

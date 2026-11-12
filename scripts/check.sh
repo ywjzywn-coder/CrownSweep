@@ -247,6 +247,19 @@ fi
 printf '%s\n' "$timeout_status_output"
 echo -e "${GREEN}${ICON_SUCCESS} Timeout status check passed${NC}\n"
 
+# The published agent skill names commands and flags for both CLIs; a stale one
+# sends other people's agents into rejected commands. CI fetches the windows
+# branch and sets MOLE_SKILL_AUDIT_REQUIRE_WINDOWS so that side cannot be skipped.
+skill_audit_args=()
+[[ "${MOLE_SKILL_AUDIT_REQUIRE_WINDOWS:-0}" == "1" ]] && skill_audit_args+=(--require-windows)
+if ! skill_audit_output=$(python3 "$SCRIPT_DIR/audit_skill_commands.py" "${skill_audit_args[@]+"${skill_audit_args[@]}"}" 2>&1); then
+    printf '%s\n' "$skill_audit_output"
+    echo -e "${RED}${ICON_ERROR} The published agent skill failed its audit, see the lines above${NC}\n"
+    exit 1
+fi
+printf '%s\n' "$skill_audit_output"
+echo -e "${GREEN}${ICON_SUCCESS} Agent skill command check passed${NC}\n"
+
 diagnostic_public_files=(README.md CONTRIBUTING.md docs/*.md .github/ISSUE_TEMPLATE/*)
 if ! diagnostic_placement_output=$(check_diagnostic_placement "${diagnostic_public_files[@]}"); then
     [[ -n "$diagnostic_placement_output" ]] && printf '%s\n' "$diagnostic_placement_output"
@@ -254,5 +267,22 @@ if ! diagnostic_placement_output=$(check_diagnostic_placement "${diagnostic_publ
     exit 1
 fi
 echo -e "${GREEN}${ICON_SUCCESS} Diagnostic placement check passed${NC}\n"
+
+# Every incident row names real commits, a known layer and a catcher the code
+# defines (docs/incidents.md says why the table is the eval set for review).
+if ! incidents_output=$(python3 "$SCRIPT_DIR/audit_incidents.py" 2>&1); then
+    printf '%s\n' "$incidents_output"
+    echo -e "${RED}${ICON_ERROR} The incident ledger names a commit, layer or catcher that does not hold${NC}\n"
+    exit 1
+fi
+printf '%s\n' "$incidents_output"
+echo -e "${GREEN}${ICON_SUCCESS} Incident ledger check passed${NC}\n"
+
+# Advice only: the gates a change needs follow the paths it touches.
+risk_output=$(python3 "$SCRIPT_DIR/risk_tier.py" 2>&1) || true
+if [[ -n "$risk_output" ]]; then
+    echo -e "${YELLOW}${ICON_LIST} Verification this change needs beyond check.sh:${NC}"
+    printf '%s\n\n' "$risk_output"
+fi
 
 echo -e "${GREEN}=== Checks Completed ===${NC}"

@@ -84,6 +84,65 @@ setup() {
     [[ $exit_code -eq 124 ]]
 }
 
+@test "run_with_timeout: timeout backend kills a command that ignores TERM (#1787)" {
+    if ! command -v gtimeout >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
+        skip "gtimeout/timeout not available"
+    fi
+
+    start_time=$(date +%s)
+    set +e
+    /bin/bash -c "
+        set +e
+        source '$PROJECT_ROOT/lib/core/timeout.sh'
+        run_with_timeout 1 perl -e '\$SIG{TERM} = \"IGNORE\"; sleep 10'
+        exit \$?
+    "
+    exit_code=$?
+    set -e
+    duration=$(($(date +%s) - start_time))
+    [[ $exit_code -eq 124 ]] || return 1
+    [[ $duration -lt 7 ]]
+}
+
+@test "run_with_timeout: an early SIGKILL is not reported as a timeout" {
+    if ! command -v gtimeout >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
+        skip "gtimeout/timeout not available"
+    fi
+
+    set +e
+    /bin/bash -c "
+        set +e
+        source '$PROJECT_ROOT/lib/core/timeout.sh'
+        run_with_timeout 5 perl -e 'kill 9, \$\$'
+        exit \$?
+    "
+    exit_code=$?
+    set -e
+    [[ $exit_code -eq 137 ]]
+}
+
+@test "run_with_timeout: fractional deadlines preserve an early SIGKILL" {
+    if ! command -v gtimeout >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
+        skip "gtimeout/timeout not available"
+    fi
+
+    # Both a sub-second budget and a kill after its whole-second portion must
+    # retain the signal status rather than looking like timeout escalation.
+    run /bin/bash -c 'source "$1/lib/core/timeout.sh"; run_with_timeout 0.4 /bin/bash -c '\''kill -9 $$'\''' bash "$PROJECT_ROOT"
+    [[ $status -eq 137 ]] || return 1
+    run /bin/bash -c 'source "$1/lib/core/timeout.sh"; run_with_timeout 1.9 /bin/bash -c '\''sleep 1.1; kill -9 $$'\''' bash "$PROJECT_ROOT"
+    [[ $status -eq 137 ]]
+}
+
+@test "run_with_timeout: fractional deadlines still classify forced timeout escalation" {
+    if ! command -v gtimeout >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
+        skip "gtimeout/timeout not available"
+    fi
+
+    run /bin/bash -c 'source "$1/lib/core/timeout.sh"; run_with_timeout 0.4 /bin/bash -c '\''trap "" TERM; sleep 10'\''' bash "$PROJECT_ROOT"
+    [[ $status -eq 124 ]]
+}
+
 @test "run_with_timeout: kills long-running command" {
     start_time=$(date +%s)
     set +e
@@ -150,13 +209,16 @@ setup() {
 }
 
 @test "run_with_timeout: debug logging when MO_DEBUG=1" {
-    output=$(/bin/bash -c "
+    # On a terminal the notice is still printed; captured output is covered by
+    # "run_with_timeout keeps its debug notice out of captured command output".
+    output=$(script -q /dev/null /bin/bash -c "
         set -euo pipefail
         export MO_DEBUG=1
         source '$PROJECT_ROOT/lib/core/timeout.sh'
-        run_with_timeout 5 echo 'test' 2>&1
-    ")
-    [[ "$output" =~ TIMEOUT ]]
+        run_with_timeout 5 echo 'test'
+    " < /dev/null)
+    # The per-call notice, not the one-time backend line printed at source.
+    [[ "$output" =~ \[TIMEOUT\]\ (Running\ with\ 5s\ timeout|Perl\ fallback,\ 5s|Shell\ fallback,\ 5s):\ echo\ test ]] || return 1
 }
 
 @test "run_with_timeout: no debug logging when MO_DEBUG=0" {
@@ -448,4 +510,351 @@ _tty_bg_field() {
 
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [[ "$output" == "0:no:no 1:no:no 2:no:no 123:no:no 124:yes:yes 125:no:no 127:no:no 128:no:yes 130:no:yes 143:no:yes empty:no:no " ]]
+}
+
+@test "mole_rc_signal accepts only statuses that name a real signal" {
+    # An owner command may exit with an errno-derived status above 127 (npm's
+    # 243, for one). That is an ordinary failure, and a timeout is not a signal.
+    run /bin/bash --noprofile --norc -c '
+        set -euo pipefail
+        source "$1/lib/core/timeout.sh"
+        for rc in 0 1 124 127 128 129 130 143 159 160 192 243 255 ""; do
+            a=no
+            mole_rc_signal "$rc" && a=yes
+            printf "%s:%s " "${rc:-empty}" "$a"
+        done
+    ' _ "${BATS_TEST_DIRNAME}/.."
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "0:no 1:no 124:no 127:no 128:no 129:yes 130:yes 143:yes 159:yes 160:no 192:no 243:no 255:no empty:no " ]]
+}
+
+@test "run_with_timeout keeps its debug notice out of captured command output" {
+    # Callers parse `$(run_with_timeout ... cmd 2>&1)`; under --debug the
+    # wrapper's own notice used to arrive inside that capture, and purge read
+    # it as an lsof warning.
+    mkdir -p "$HOME/fake-timeout"
+    cat > "$HOME/fake-timeout/timeout" <<'SCRIPT'
+#!/bin/bash
+shift 3
+exec "$@"
+SCRIPT
+    chmod +x "$HOME/fake-timeout/timeout"
+    run env HOME="$HOME" PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." MO_DEBUG=1 FAKE_TIMEOUT="$HOME/fake-timeout/timeout" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+for backend in binary perl shell; do
+    case "$backend" in
+        binary) MO_TIMEOUT_BIN="$FAKE_TIMEOUT" MO_TIMEOUT_PERL_BIN="" ;;
+        perl) MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN="$(command -v perl)" ;;
+        shell) MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN="" ;;
+    esac
+    : > "$DEBUG_LOG_FILE"
+    out=$(run_with_timeout 5 /bin/sh -c 'echo OUT; echo ERR >&2' 2>&1)
+    [[ "$out" == $'OUT\nERR' ]] || { printf 'CAPTURED:%s:%s\n' "$backend" "$out"; exit 1; }
+    grep -q '^\[TIMEOUT\] ' "$DEBUG_LOG_FILE" || { echo "NOT_LOGGED:$backend"; exit 1; }
+    # An unwritable debug log must not put its write error in the capture.
+    chmod 444 "$DEBUG_LOG_FILE"
+    out=$(run_with_timeout 5 /bin/sh -c 'echo OUT' 2>&1)
+    chmod 644 "$DEBUG_LOG_FILE"
+    [[ "$out" == OUT ]] || { printf 'UNWRITABLE:%s:%s\n' "$backend" "$out"; exit 1; }
+done
+echo CLEAN
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *CLEAN* ]] || { echo "$output"; return 1; }
+}
+
+@test "run_with_timeout shell fallback stops the command when interrupted" {
+    # A background command ignores SIGINT without job control, so forwarding
+    # INT left it running with no deadline after Ctrl-C. The double case runs
+    # under an exiting caller trap like bin/clean.sh's and presses Ctrl-C again
+    # inside the grace period, which used to skip the KILL.
+    cat > "$HOME/interrupt.sh" <<'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN=""
+rc_file="$1"
+caller_trap="$2"
+shift 2
+[[ "$caller_trap" == exit ]] && trap 'exit 130' INT
+rc=0
+run_with_timeout 40 "$@" || rc=$?
+echo "$rc" > "$rc_file"
+EOF
+    local mode pid_file rc_file runner_pid cmd_pid ticks caller_trap
+    for mode in plain ignores-term double-interrupt; do
+        pid_file="$HOME/cmd-$mode.pid"
+        rc_file="$HOME/cmd-$mode.rc"
+        rm -f "$pid_file" "$rc_file" # SAFE: test-owned scratch files
+        caller_trap=none
+        [[ "$mode" == double-interrupt ]] && caller_trap="exit"
+        if [[ "$mode" == plain ]]; then
+            # shellcheck disable=SC2016 # $$ and $1 belong to the inner sh.
+            /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' \
+                env PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." /bin/bash "$HOME/interrupt.sh" "$rc_file" "$caller_trap" \
+                /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 39' sh "$pid_file" > /dev/null 2>&1 3>&- &
+        else
+            # shellcheck disable=SC2016 # Perl variables, not Bash.
+            /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' \
+                env PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." /bin/bash "$HOME/interrupt.sh" "$rc_file" "$caller_trap" \
+                /usr/bin/perl -e 'open(my $f, ">", $ARGV[0]) or die; print $f $$; close $f; $SIG{TERM} = "IGNORE"; sleep 39' "$pid_file" > /dev/null 2>&1 3>&- &
+        fi
+        runner_pid=$!
+        ticks=0
+        while [[ ! -s "$pid_file" && $ticks -lt 50 ]]; do
+            sleep 0.1
+            ticks=$((ticks + 1))
+        done
+        cmd_pid=$(cat "$pid_file")
+        [[ "$cmd_pid" =~ ^[0-9]+$ ]] || { echo "NO_PID:$mode"; return 1; }
+        kill -INT "$runner_pid"
+        if [[ "$mode" == double-interrupt ]]; then
+            sleep 0.5
+            kill -INT "$runner_pid" 2> /dev/null || true
+        fi
+        ticks=0
+        while kill -0 "$cmd_pid" 2> /dev/null && [[ $ticks -lt 40 ]]; do
+            sleep 0.1
+            ticks=$((ticks + 1))
+        done
+        if kill -0 "$cmd_pid" 2> /dev/null; then
+            kill -KILL "$cmd_pid" 2> /dev/null || true
+            echo "ORPHANED:$mode"
+            return 1
+        fi
+        wait "$runner_pid" 2> /dev/null || true
+        [[ "$(cat "$rc_file" 2> /dev/null)" == 130 ]] || { echo "RC:$mode:$(cat "$rc_file" 2> /dev/null)"; return 1; }
+    done
+}
+
+@test "run_with_timeout shell fallback traps INT before the command starts" {
+    # A Ctrl-C between the command's start and the trap took bash's default
+    # exit and left the command, which ignores INT in the background, running
+    # until the killer's deadline (CI 2026-11-04, ORPHANED:plain above). The
+    # shim waits for the command's marker when the INT trap is set: present
+    # means the command started first.
+    run env PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." MARKER="$HOME/started-before-trap" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN=""
+rm -f "$MARKER" # SAFE: test-owned scratch file
+trap() {
+    if [[ "${1:-}" != "-p" && "${1:-}" != "-" && "${*: -1}" == "INT" && -z "${TRAP_SEEN:-}" ]]; then
+        TRAP_SEEN=1
+        local ticks=0
+        while [[ ! -e "$MARKER" && $ticks -lt 20 ]]; do
+            sleep 0.05
+            ticks=$((ticks + 1))
+        done
+        if [[ -e "$MARKER" ]]; then echo "ORDER=command-first"; else echo "ORDER=trap-first"; fi
+    fi
+    builtin trap "$@"
+}
+run_with_timeout 5 /bin/sh -c 'touch "$1"' sh "$MARKER"
+echo "RC=$?"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"ORDER=trap-first"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0"* ]] || { echo "$output"; return 1; }
+}
+
+@test "run_with_timeout shell fallback never starts a command after an early interrupt" {
+    # The shim delivers Ctrl-C the moment the INT trap is in place, before the
+    # command is forked. The command must not run at all, the caller's own INT
+    # trap must come back, and the call must return 130 at once.
+    run env PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." MARKER="$HOME/started-after-interrupt" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN=""
+rm -f "$MARKER" # SAFE: test-owned scratch file
+builtin trap 'echo CALLER_TRAP' INT
+# An ignored TERM is inherited across fork and exec, so a command that was
+# started at all leaves its marker instead of dying to the follow-up TERM.
+builtin trap '' TERM
+trap() {
+    builtin trap "$@"
+    if [[ "${1:-}" != "-p" && "${1:-}" != "-" && "${*: -1}" == "INT" && -z "${INT_SENT:-}" ]]; then
+        INT_SENT=1
+        kill -INT $$
+    fi
+}
+start=$SECONDS
+rc=0
+run_with_timeout 10 /bin/sh -c 'touch "$1"; exec /bin/sleep 8' sh "$MARKER" || rc=$?
+echo "RC=$rc ELAPSED=$((SECONDS - start))"
+sleep 0.3
+[[ -e "$MARKER" ]] && echo "COMMAND_STARTED"
+builtin trap -p INT
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=130 ELAPSED="[0-2]* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"COMMAND_STARTED"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"echo CALLER_TRAP"* ]] || { echo "$output"; return 1; }
+}
+
+@test "run_with_timeout shell fallback leaves the caller's errexit as it was" {
+    run env PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN=""
+set +e
+rc=0
+run_with_timeout 5 /bin/sh -c 'exit 3' || rc=$?
+[[ $- == *e* ]] && echo "ERREXIT_ON" || echo "ERREXIT_OFF"
+echo "RC_OFF=$rc"
+set -e
+rc=0
+run_with_timeout 5 /bin/sh -c 'exit 3' || rc=$?
+[[ $- == *e* ]] && echo "ERREXIT_ON" || echo "ERREXIT_OFF"
+echo "RC_ON=$rc"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"ERREXIT_OFF"$'\n'"RC_OFF=3"$'\n'"ERREXIT_ON"$'\n'"RC_ON=3"* ]] || { echo "$output"; return 1; }
+}
+
+@test "run_with_timeout passes the caller's stdin through every backend" {
+    # The simulator metadata check feeds awk and the Finder and login item
+    # paths feed osascript through stdin; the shell backend used to hand them
+    # /dev/null, which read every simulator as running.
+    mkdir -p "$HOME/fake-timeout"
+    cat > "$HOME/fake-timeout/timeout" <<'SCRIPT'
+#!/bin/bash
+shift 3
+exec "$@"
+SCRIPT
+    chmod +x "$HOME/fake-timeout/timeout"
+    run env HOME="$HOME" PROJECT_ROOT="${BATS_TEST_DIRNAME}/.." FAKE_TIMEOUT="$HOME/fake-timeout/timeout" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+for backend in binary perl shell; do
+    case "$backend" in
+        binary) MO_TIMEOUT_BIN="$FAKE_TIMEOUT" MO_TIMEOUT_PERL_BIN="" ;;
+        perl) MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN="$(command -v perl)" ;;
+        shell) MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN="" ;;
+    esac
+    out=$(run_with_timeout 5 /usr/bin/awk '{ print "GOT:" $0 }' <<< "hello")
+    [[ "$out" == "GOT:hello" ]] || { printf 'HERESTRING:%s:%s\n' "$backend" "$out"; exit 1; }
+    out=$(run_with_timeout 5 /bin/cat << 'DOC'
+line one
+line two
+DOC
+    )
+    [[ "$out" == $'line one\nline two' ]] || { printf 'HEREDOC:%s:%s\n' "$backend" "$out"; exit 1; }
+done
+echo CLEAN
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *CLEAN* ]] || { echo "$output"; return 1; }
+}
+
+# Sources timeout.sh with only the fake directory ahead of the system paths and
+# prints the backend it picked, then the status of a one-second timeout.
+_probe_timeout_backend() {
+    local fake_dir="$1"
+    # shellcheck disable=SC2016 # The child shell expands its own positional parameters.
+    run /bin/bash -c '
+        set -euo pipefail
+        unset MO_TIMEOUT_INITIALIZED MO_TIMEOUT_BIN MO_TIMEOUT_PERL_BIN
+        export PATH="$2:/usr/bin:/bin"
+        source "$1/lib/core/timeout.sh"
+        printf "bin=%s\n" "$MO_TIMEOUT_BIN"
+        run_with_timeout 1 /bin/echo COMMAND_RAN
+        rc=0
+        run_with_timeout 1 /bin/sleep 5 || rc=$?
+        printf "rc=%s\n" "$rc"
+    ' bash "${BATS_TEST_DIRNAME}/.." "$fake_dir" < /dev/null
+}
+
+@test "timeout.sh skips a PATH timeout shim that reports its deadline as 143" {
+    local fake_dir="$BATS_TEST_TMPDIR/fake-timeout-143"
+    mkdir -p "$fake_dir"
+    # Kills the command on its deadline and exits with the child's status, as
+    # a hand-written shim does, instead of the 124 every caller relies on.
+    cat > "$fake_dir/timeout" << 'SHIM'
+#!/bin/bash
+shift
+"$@" &
+pid=$!
+(/bin/sleep 0.2; kill -TERM "$pid" 2> /dev/null) &
+wait "$pid"
+exit $?
+SHIM
+    chmod +x "$fake_dir/timeout"
+
+    _probe_timeout_backend "$fake_dir"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"bin=$fake_dir/timeout"* ]] || return 1
+    [[ "$output" == *"rc=124"* ]]
+}
+
+@test "timeout.sh skips a PATH timeout shim that rejects fractional durations" {
+    local fake_dir="$BATS_TEST_TMPDIR/fake-timeout-125"
+    mkdir -p "$fake_dir"
+    cat > "$fake_dir/timeout" << 'SHIM'
+#!/bin/bash
+[[ "$1" =~ ^[0-9]+$ ]] || exit 125
+exec /usr/bin/perl -e 'alarm shift; exec @ARGV' "$@"
+SHIM
+    chmod +x "$fake_dir/timeout"
+
+    _probe_timeout_backend "$fake_dir"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"bin=$fake_dir/timeout"* ]] || return 1
+    [[ "$output" == *"rc=124"* ]]
+}
+
+@test "timeout.sh skips a PATH timeout shim without kill-after support" {
+    local fake_dir="$BATS_TEST_TMPDIR/fake-timeout-124"
+    mkdir -p "$fake_dir"
+    # This passes the old deadline probe, but run_with_timeout's -k 2 makes
+    # it try to execute "2" and report a timeout without running the command.
+    cat > "$fake_dir/timeout" << 'SHIM'
+#!/bin/bash
+shift
+"$@" &
+pid=$!
+(/bin/sleep 0.2; kill -TERM "$pid" 2> /dev/null) &
+wait "$pid" && exit 0
+exit 124
+SHIM
+    chmod +x "$fake_dir/timeout"
+
+    _probe_timeout_backend "$fake_dir"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"bin=$fake_dir/timeout"* ]] || return 1
+    [[ "$output" == *COMMAND_RAN* ]] || return 1
+    [[ "$output" == *"rc=124"* ]]
+}
+
+@test "timeout.sh keeps a PATH timeout that supports the wrapper arguments" {
+    local fake_dir="$BATS_TEST_TMPDIR/fake-timeout-compatible"
+    mkdir -p "$fake_dir"
+    cat > "$fake_dir/timeout" << 'SHIM'
+#!/bin/bash
+[[ "$1" == "-k" && "$2" == "2" ]] || exit 125
+shift 3
+"$@" &
+pid=$!
+(/bin/sleep 0.2; kill -TERM "$pid" 2> /dev/null) &
+killer=$!
+rc=0
+wait "$pid" || rc=$?
+kill "$killer" 2> /dev/null || true
+wait "$killer" 2> /dev/null || true
+[[ $rc -eq 0 ]] && exit 0
+exit 124
+SHIM
+    chmod +x "$fake_dir/timeout"
+
+    _probe_timeout_backend "$fake_dir"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"bin=$fake_dir/timeout"* ]] || return 1
+    [[ "$output" == *COMMAND_RAN* ]] || return 1
+    [[ "$output" == *"rc=124"* ]]
 }

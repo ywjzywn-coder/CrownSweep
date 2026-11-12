@@ -72,13 +72,15 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 
 	var (
 		disks      []DiskStatus
+		probes     []*diskPlistProbe
 		seenDevice = make(map[string]bool)
-		seenVolume = make(map[string]bool)
 	)
 	for _, part := range partitions {
 		if shouldSkipDiskPartition(part) {
 			continue
 		}
+		// APFS volumes and snapshots in one container share a diskN base.
+		// Capacity is not an identity: independent disks can be equally sized.
 		baseDevice := baseDeviceName(part.Device)
 		if baseDevice == "" {
 			baseDevice = part.Device
@@ -91,23 +93,24 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 			continue
 		}
 		total := usage.Total
+		var plistProbe *diskPlistProbe
 		if useCorrections && runtime.GOOS == "darwin" {
-			total = correctDiskTotalBytes(part.Mountpoint, total)
+			// The total-size correction and the APFS container-free correction
+			// both read the same `diskutil info -plist` document, so one bounded
+			// probe per mount serves both instead of spawning diskutil twice.
+			plistProbe = newDiskPlistProbe(part.Mountpoint)
+			total = correctDiskTotalBytesWithProbe(total, plistProbe)
 		}
 		// Skip <1GB volumes.
 		if total < 1<<30 {
-			continue
-		}
-		// Use size-based dedupe key for shared pools.
-		volKey := fmt.Sprintf("%s:%d", part.Fstype, total)
-		if seenVolume[volKey] {
 			continue
 		}
 		used := usage.Used
 		usedPercent := usage.UsedPercent
 		purgeable := uint64(0)
 		if useCorrections && runtime.GOOS == "darwin" && strings.ToLower(part.Fstype) == "apfs" {
-			used, usedPercent, purgeable = correctAPFSDiskUsage(part.Mountpoint, total, usage.Used, usage.Free)
+			used, usedPercent, purgeable = correctAPFSDiskUsageWithProbe(
+				part.Mountpoint, total, usage.Used, usage.Free, plistProbe)
 		}
 
 		disks = append(disks, DiskStatus{
@@ -121,12 +124,12 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 			SmartStatus: smartStatusUnknown,
 			Purgeable:   purgeable,
 		})
+		probes = append(probes, plistProbe)
 		seenDevice[baseDevice] = true
-		seenVolume[volKey] = true
 	}
 
 	if useCorrections {
-		annotateDiskMetadata(disks)
+		annotateDiskMetadataWithProbes(disks, probes)
 	}
 
 	sort.Slice(disks, func(i, j int) bool {
@@ -201,6 +204,15 @@ var (
 )
 
 func annotateDiskMetadata(disks []DiskStatus) {
+	annotateDiskMetadataWithProbes(disks, nil)
+}
+
+// annotateDiskMetadataWithProbes fills External and SmartStatus. probes, when
+// given, is parallel to disks and holds the `diskutil info -plist` read the
+// collection pass already made for that volume; its Internal and SMARTStatus
+// keys answer without a second diskutil call. A volume whose plist lacks
+// either key keeps the text `diskutil info <disk>` read and its fallbacks.
+func annotateDiskMetadataWithProbes(disks []DiskStatus, probes []*diskPlistProbe) {
 	if len(disks) == 0 || runtime.GOOS != "darwin" || !commandExists("diskutil") {
 		return
 	}
@@ -224,7 +236,15 @@ func annotateDiskMetadata(disks []DiskStatus) {
 			continue
 		}
 
-		metadata, err := readDiskMetadata(base)
+		var probe *diskPlistProbe
+		if i < len(probes) {
+			probe = probes[i]
+		}
+		metadata, ok := diskMetadataFromPlistProbe(probe)
+		var err error
+		if !ok {
+			metadata, err = readDiskMetadata(base)
+		}
 		if err != nil {
 			metadata.External = strings.HasPrefix(disks[i].Mount, "/Volumes/")
 		}
@@ -276,17 +296,7 @@ func parseDiskMetadata(out string) (diskMetadata, error) {
 			locationValue = strings.Contains(trim, "External")
 		}
 		if smartValue, ok := strings.CutPrefix(trim, "SMART Status:"); ok {
-			value := strings.ToLower(strings.TrimSpace(smartValue))
-			switch value {
-			case "verified":
-				metadata.SmartStatus = smartStatusVerified
-			case "failing", "failed":
-				metadata.SmartStatus = smartStatusFailing
-			case "not supported", "unsupported":
-				metadata.SmartStatus = smartStatusUnsupported
-			default:
-				metadata.SmartStatus = smartStatusUnknown
-			}
+			metadata.SmartStatus = normalizeSmartStatus(smartValue)
 		}
 	}
 	if !externalFound && locationFound {
@@ -299,15 +309,95 @@ func parseDiskMetadata(out string) (diskMetadata, error) {
 	return metadata, nil
 }
 
-// correctDiskTotalBytes uses diskutil's plist output when macOS reports a
-// meaningfully different disk size than gopsutil. This fixes external APFS
-// volumes that can show doubled capacities through statfs/gopsutil.
-func correctDiskTotalBytes(mountpoint string, rawTotal uint64) uint64 {
+func normalizeSmartStatus(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "verified":
+		return smartStatusVerified
+	case "failing", "failed":
+		return smartStatusFailing
+	case "not supported", "unsupported":
+		return smartStatusUnsupported
+	default:
+		return smartStatusUnknown
+	}
+}
+
+// diskMetadataFromPlistProbe reads External and SmartStatus from the plist
+// probe. ok is false when there is no probe, it failed, or either key is
+// absent (some external disks and disk images omit SMARTStatus).
+func diskMetadataFromPlistProbe(probe *diskPlistProbe) (diskMetadata, bool) {
+	if probe == nil {
+		return diskMetadata{}, false
+	}
+	out, err := probe.output()
+	if err != nil {
+		return diskMetadata{}, false
+	}
+	internal, ok := extractPlistBool(out, "Internal")
+	if !ok {
+		return diskMetadata{}, false
+	}
+	smart, ok := extractPlistString(out, "SMARTStatus")
+	if !ok {
+		return diskMetadata{}, false
+	}
+	return diskMetadata{External: !internal, SmartStatus: normalizeSmartStatus(smart)}, true
+}
+
+// diskPlistProbe memoizes one bounded `diskutil info -plist <mount>` read for
+// a single collection pass. The total-size correction and the APFS
+// container-free correction ask about the same mountpoint and the plist
+// already carries both values, so sharing the probe removes one diskutil
+// subprocess per volume without changing either fallback chain.
+type diskPlistProbe struct {
+	mountpoint string
+	once       sync.Once
+	raw        string
+	err        error
+}
+
+func newDiskPlistProbe(mountpoint string) *diskPlistProbe {
+	return &diskPlistProbe{mountpoint: mountpoint}
+}
+
+// output runs the probe at most once; concurrent callers are not expected (the
+// collection loop is serial) but sync.Once keeps it safe and idempotent.
+func (p *diskPlistProbe) output() (string, error) {
+	p.once.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		p.raw, p.err = runCmd(ctx, "diskutil", "info", "-plist", p.mountpoint)
+	})
+	return p.raw, p.err
+}
+
+func (p *diskPlistProbe) totalBytes() (uint64, error) {
+	out, err := p.output()
+	if err != nil {
+		return 0, err
+	}
+	// Prefer TotalSize, but keep older/plainer keys as fallbacks.
+	return extractPlistUint(out, "TotalSize", "DiskSize", "Size")
+}
+
+func (p *diskPlistProbe) containerFreeBytes() (uint64, error) {
+	out, err := p.output()
+	if err != nil {
+		return 0, err
+	}
+	return extractPlistUint(out, "APFSContainerFree")
+}
+
+// correctDiskTotalBytesWithProbe uses diskutil's plist output when macOS
+// reports a meaningfully different disk size than gopsutil. This fixes
+// external APFS volumes that can show doubled capacities through
+// statfs/gopsutil.
+func correctDiskTotalBytesWithProbe(rawTotal uint64, probe *diskPlistProbe) uint64 {
 	if rawTotal == 0 || !commandExists("diskutil") {
 		return rawTotal
 	}
 
-	diskutilTotal, err := getDiskutilTotalBytes(mountpoint)
+	diskutilTotal, err := probe.totalBytes()
 	if err != nil || diskutilTotal == 0 {
 		return rawTotal
 	}
@@ -319,27 +409,14 @@ func correctDiskTotalBytes(mountpoint string, rawTotal uint64) uint64 {
 	return rawTotal
 }
 
-func getDiskutilTotalBytes(mountpoint string) (uint64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	out, err := runCmd(ctx, "diskutil", "info", "-plist", mountpoint)
-	if err != nil {
-		return 0, err
-	}
-
-	// Prefer TotalSize, but keep older/plainer keys as fallbacks.
-	return extractPlistUint(out, "TotalSize", "DiskSize", "Size")
-}
-
-// correctAPFSDiskUsage returns Finder-accurate used bytes, percent, and the
+// correctAPFSDiskUsageWithProbe returns Finder-accurate used bytes, percent, and the
 // purgeable bytes Finder counts as free, for an APFS volume. It accounts for
 // purgeable caches and APFS local snapshots that statfs incorrectly counts as
 // "used". Uses a three-tier fallback:
 //  1. Finder via osascript (startup disk only), exact match with macOS Finder
 //  2. diskutil APFSContainerFree, corrects APFS snapshot space
 //  3. Raw gopsutil values, original statfs-based calculation
-func correctAPFSDiskUsage(mountpoint string, total, rawUsed, rawFree uint64) (used uint64, usedPercent float64, purgeable uint64) {
+func correctAPFSDiskUsageWithProbe(mountpoint string, total, rawUsed, rawFree uint64, probe *diskPlistProbe) (used uint64, usedPercent float64, purgeable uint64) {
 	// Tier 1: Finder via osascript (startup disk at "/" only).
 	if mountpoint == "/" && commandExists("osascript") {
 		if finderFree, finderTotal, err := getFinderStartupDiskFreeBytes(); err == nil &&
@@ -352,7 +429,7 @@ func correctAPFSDiskUsage(mountpoint string, total, rawUsed, rawFree uint64) (us
 
 	// Tier 2: diskutil APFSContainerFree (corrects APFS local snapshots).
 	if commandExists("diskutil") {
-		if containerFree, err := getAPFSContainerFreeBytes(mountpoint); err == nil && containerFree <= total {
+		if containerFree, err := probe.containerFreeBytes(); err == nil && containerFree <= total {
 			corrected := total - containerFree
 			// Only apply if it meaningfully differs (>1GB) from raw to avoid noise.
 			if rawUsed > corrected && rawUsed-corrected > 1<<30 {
@@ -378,21 +455,6 @@ func finderPurgeableBytes(rawFree, finderFree uint64) uint64 {
 		return 0
 	}
 	return finderFree - rawFree
-}
-
-// getAPFSContainerFreeBytes returns the APFS container free space (including
-// purgeable snapshot space) by parsing `diskutil info -plist`. This corrects
-// for APFS local snapshots which statfs counts as used.
-func getAPFSContainerFreeBytes(mountpoint string) (uint64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	out, err := runCmd(ctx, "diskutil", "info", "-plist", mountpoint)
-	if err != nil {
-		return 0, err
-	}
-
-	return extractPlistUint(out, "APFSContainerFree")
 }
 
 // authPromptsDisabled mirrors the shell test-mode guard: MOLE_TEST_MODE or
@@ -475,6 +537,39 @@ func extractPlistUint(plist string, keys ...string) (uint64, error) {
 	}
 
 	return 0, fmt.Errorf("%s not found", strings.Join(keys, "/"))
+}
+
+// extractPlistBool reads the <true/> or <false/> that follows <key>key</key>.
+func extractPlistBool(plist, key string) (bool, bool) {
+	_, rest, found := strings.Cut(plist, "<key>"+key+"</key>")
+	if !found {
+		return false, false
+	}
+	rest = strings.TrimSpace(rest)
+	switch {
+	case strings.HasPrefix(rest, "<true/>"):
+		return true, true
+	case strings.HasPrefix(rest, "<false/>"):
+		return false, true
+	}
+	return false, false
+}
+
+// extractPlistString reads the <string> value that follows <key>key</key>.
+func extractPlistString(plist, key string) (string, bool) {
+	_, rest, found := strings.Cut(plist, "<key>"+key+"</key>")
+	if !found {
+		return "", false
+	}
+	rest, found = strings.CutPrefix(strings.TrimSpace(rest), "<string>")
+	if !found {
+		return "", false
+	}
+	value, _, found := strings.Cut(rest, "</string>")
+	if !found {
+		return "", false
+	}
+	return value, true
 }
 
 func uint64AbsDiff(a, b uint64) uint64 {

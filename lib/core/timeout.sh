@@ -21,7 +21,7 @@ readonly MOLE_TIMEOUT_LOADED=1
 #   brew install coreutils
 #
 # Fallback order:
-#   1. gtimeout / timeout
+#   1. gtimeout / timeout / /usr/bin/timeout, each verified to report 124
 #   2. perl helper with dedicated process group cleanup
 #   3. shell-based fallback (last resort)
 #
@@ -29,18 +29,47 @@ readonly MOLE_TIMEOUT_LOADED=1
 #   - May not clean up all child processes
 #   - Has race conditions in edge cases
 #   - Less reliable than native timeout/perl helper
+# A `timeout` found through PATH is not always coreutils or the system one: a
+# hand-written shim that exits with the killed child's 143 instead of 124 on
+# its deadline makes every bounded scan read as Ctrl-C, so `mo clean` cancels
+# the whole run at the first slow step. A shim that rejects fractional
+# durations (exit 125) breaks every sub-second budget the same way. GNU
+# coreutils and the system binary are trusted without a probe; any other
+# candidate must run a short command successfully and time out a short sleep
+# with 124, both using run_with_timeout's -k arguments, or it is skipped.
+_mole_timeout_bin_is_compatible() {
+    local bin="$1"
+    [[ "$bin" == "/usr/bin/timeout" ]] && return 0
+    local version_text=""
+    version_text=$("$bin" --version < /dev/null 2> /dev/null) || true
+    [[ "$version_text" == *"GNU coreutils"* ]] && return 0
+    # A shim can report 124 yet reject -k, returning that status without ever
+    # running the command. Check successful execution with the actual syntax.
+    "$bin" -k 2 1 /usr/bin/true < /dev/null > /dev/null 2>&1 || return 1
+    local probe_rc=0
+    "$bin" -k 2 0.1 /bin/sleep 2 < /dev/null > /dev/null 2>&1 || probe_rc=$?
+    [[ $probe_rc -eq 124 ]]
+}
+
 if [[ -z "${MO_TIMEOUT_INITIALIZED:-}" ]]; then
     MO_TIMEOUT_BIN=""
     MO_TIMEOUT_PERL_BIN=""
-    for candidate in gtimeout timeout; do
-        if command -v "$candidate" > /dev/null 2>&1; then
-            MO_TIMEOUT_BIN="$(command -v "$candidate")"
+    for candidate in gtimeout timeout /usr/bin/timeout; do
+        candidate_path="$(command -v "$candidate" 2> /dev/null || true)"
+        [[ -n "$candidate_path" && -x "$candidate_path" ]] || continue
+        if ! _mole_timeout_bin_is_compatible "$candidate_path"; then
             if [[ "${MO_DEBUG:-0}" == "1" ]]; then
-                echo "[TIMEOUT] Using command: $MO_TIMEOUT_BIN" >&2
+                echo "[TIMEOUT] Skipping $candidate_path: it does not report a timeout as 124" >&2
             fi
-            break
+            continue
         fi
+        MO_TIMEOUT_BIN="$candidate_path"
+        if [[ "${MO_DEBUG:-0}" == "1" ]]; then
+            echo "[TIMEOUT] Using command: $MO_TIMEOUT_BIN" >&2
+        fi
+        break
     done
+    unset candidate candidate_path
 
     if command -v perl > /dev/null 2>&1; then
         MO_TIMEOUT_PERL_BIN="$(command -v perl)"
@@ -78,6 +107,13 @@ mole_rc_timeout() {
 
 mole_rc_timeout_or_signal() {
     [[ "${1:-0}" -eq 124 || "${1:-0}" -ge 128 ]]
+}
+
+# A mutating owner command may also exit with an errno-derived status such as
+# npm's 243, which is an ordinary failure. Only a status that names a real
+# signal means the user interrupted it; a timeout is not one.
+mole_rc_signal() {
+    [[ "${1:-0}" -ge 128 ]] && kill -l "$1" > /dev/null 2>&1
 }
 
 _mole_cleanup_timeout_killer() {
@@ -151,6 +187,22 @@ mole_tty_is_foreground() {
 #   - No process group: Cannot guarantee cleanup of detached children
 #
 # For mission-critical timeouts, install coreutils.
+# A caller that captures `cmd 2>&1` and parses it (lsof, ps, codesign) must
+# not read this wrapper's own notice as command output: under --debug, purge
+# took the line for an lsof warning and kept every node_modules as unverified.
+# The notice reaches stderr only on a terminal and always lands in the debug log.
+_mole_timeout_debug() {
+    if [[ -t 2 ]]; then
+        echo "$1" >&2
+    fi
+    if [[ -n "${DEBUG_LOG_FILE:-}" ]] && declare -f append_log_line > /dev/null 2>&1; then
+        # An unwritable log reports through the caller's stderr before the
+        # inner `2> /dev/null` applies, which is the capture this avoids.
+        { append_log_line "$DEBUG_LOG_FILE" "$1"; } 2> /dev/null || true
+    fi
+    return 0
+}
+
 run_with_timeout() {
     local duration="${1:-0}"
     shift || true
@@ -170,8 +222,10 @@ run_with_timeout() {
     # gtimeout: SIGKILLing the calling worker leaves gtimeout and its child
     # alive, but both still die when gtimeout's own deadline fires, so the orphan
     # window is capped by the caller's timeout budget (2-30s here) rather than
-    # unbounded. Ctrl-C already reaches them, since the signal goes to the whole
-    # foreground process group. Closing the remaining SIGKILL gap would mean
+    # unbounded. gtimeout runs in its own process group, so Ctrl-C does not
+    # reach it and the shell defers its INT trap until gtimeout returns; `-k 2`
+    # keeps that return bounded when the command ignores TERM, matching the
+    # perl backend's grace period (#1787). Closing the remaining SIGKILL gap would mean
     # either routing every non-TTY run through perl, which is every CI run and
     # every piped run, or backgrounding the backend and polling it, which
     # reopens the terminal-handoff class behind #1222/#1218. Neither is worth a
@@ -187,16 +241,28 @@ run_with_timeout() {
     fi
     if [[ -n "${timeout_bin:-}" ]]; then
         if [[ "${MO_DEBUG:-0}" == "1" ]]; then
-            echo "[TIMEOUT] Running with ${duration}s timeout: $*" >&2
+            _mole_timeout_debug "[TIMEOUT] Running with ${duration}s timeout: $*"
         fi
-        "$timeout_bin" "$duration" "$@"
-        return $?
+        local timeout_rc=0 timeout_started=$SECONDS timeout_kill_after=2
+        local timeout_whole_seconds="${duration%.*}"
+        # The -k escalation kills gtimeout's own process group, so bash would
+        # print "Killed: 9"; the command keeps its stderr on fd 3 while that
+        # shell notice goes to /dev/null.
+        { "$timeout_bin" -k "$timeout_kill_after" "$duration" "$@" 2>&3 3>&-; } 3>&2 2> /dev/null || timeout_rc=$?
+        # Escalation cannot exit 137 before the deadline plus its kill grace.
+        # SECONDS rounds to whole seconds: including the grace keeps an early
+        # SIGKILL distinct even for fractional budgets, without another clock
+        # subprocess on every probe. Normalize leading zeroes as decimal.
+        if [[ $timeout_rc -eq 137 && $((SECONDS - timeout_started)) -ge $((10#$timeout_whole_seconds + timeout_kill_after)) ]]; then
+            return 124
+        fi
+        return "$timeout_rc"
     fi
 
     # Use perl helper when timeout command is unavailable.
     if [[ -n "${MO_TIMEOUT_PERL_BIN:-}" ]]; then
         if [[ "${MO_DEBUG:-0}" == "1" ]]; then
-            echo "[TIMEOUT] Perl fallback, ${duration}s: $*" >&2
+            _mole_timeout_debug "[TIMEOUT] Perl fallback, ${duration}s: $*"
         fi
         # shellcheck disable=SC2016  # Embedded Perl uses Perl variables inside single quotes.
         "$MO_TIMEOUT_PERL_BIN" -e '
@@ -249,6 +315,8 @@ run_with_timeout() {
             $SIG{INT} = sub { $shutdown_status ||= 130; };
             $SIG{TERM} = sub { $shutdown_status ||= 143; };
             $SIG{HUP} = sub { $shutdown_status ||= 129; };
+            # Wakes the poll sleep on child exit. Not "IGNORE": that changes reaping.
+            $SIG{CHLD} = sub { };
 
             # The child is a separate process group so timeout cleanup can kill
             # its descendants. A tty only permits its foreground process group
@@ -292,6 +360,9 @@ run_with_timeout() {
             };
 
             my $deadline = time() + $duration;
+            # Short metadata probes should not each pay a 100ms polling wait.
+            # Back off to the existing cadence for long-running commands.
+            my $poll_interval = 0.01;
 
             while (1) {
                 my $result = waitpid($pid, WNOHANG);
@@ -323,7 +394,9 @@ run_with_timeout() {
                     exit 124;
                 }
 
-                sleep 0.1;
+                sleep $poll_interval;
+                $poll_interval *= 2;
+                $poll_interval = 0.1 if $poll_interval > 0.1;
             }
         ' "$duration" "$@"
         return $?
@@ -334,12 +407,38 @@ run_with_timeout() {
     # ========================================================================
 
     if [[ "${MO_DEBUG:-0}" == "1" ]]; then
-        echo "[TIMEOUT] Shell fallback, ${duration}s: $*" >&2
+        _mole_timeout_debug "[TIMEOUT] Shell fallback, ${duration}s: $*"
     fi
 
-    # Start command in background
-    "$@" &
-    local cmd_pid=$!
+    local interrupted=0 cmd_pid="" killer_pid=""
+    local previous_int_trap
+    previous_int_trap=$(trap -p INT || true)
+
+    # Stop the command on SIGINT while preserving the caller's trap. A background
+    # command ignores SIGINT when job control is off, so forwarding INT left it
+    # running with no deadline once the killer was gone; send TERM, as the perl
+    # backend does. The trap goes in before the command starts: a Ctrl-C between
+    # the start and a later trap took the shell's default exit and left the
+    # command running until the killer's deadline.
+    trap 'interrupted=1; if [[ -n "$cmd_pid" ]]; then kill -TERM "$cmd_pid" 2>/dev/null || true; fi; if [[ -n "$killer_pid" ]]; then _mole_cleanup_timeout_killer "$killer_pid"; fi' INT
+
+    # A Ctrl-C already pressed never starts the command: callers run rm -rf here.
+    if [[ $interrupted -eq 1 ]]; then
+        if [[ -n "$previous_int_trap" ]]; then
+            # eval: restore previous trap captured by $(trap -p INT)
+            eval "$previous_int_trap"
+        else
+            trap - INT
+        fi
+        return 130
+    fi
+
+    # Start command in background. Without job control bash gives a background
+    # command /dev/null as stdin, so pass the caller's stdin on explicitly, as
+    # the timeout binary and perl backends do: callers feed osascript and awk
+    # through a here-document.
+    "$@" <&0 &
+    cmd_pid=$!
 
     # Start timeout killer in background.
     # Redirect all FDs to /dev/null so orphaned child processes (e.g. sleep $duration)
@@ -364,21 +463,37 @@ run_with_timeout() {
             fi
         fi
     ) < /dev/null > /dev/null 2>&1 &
-    local killer_pid=$!
+    killer_pid=$!
 
-    local interrupted=0
-    local previous_int_trap
-    previous_int_trap=$(trap -p INT || true)
+    # An interrupt that landed before both PIDs were known reached neither.
+    if [[ $interrupted -eq 1 ]]; then
+        kill -TERM "$cmd_pid" 2> /dev/null || true
+        _mole_cleanup_timeout_killer "$killer_pid"
+    fi
 
-    # Forward SIGINT to the command while preserving the caller's trap.
-    trap 'interrupted=1; kill -INT "$cmd_pid" 2>/dev/null || true; _mole_cleanup_timeout_killer "$killer_pid"' INT
-
-    # Wait for command to complete
+    # Wait for command to complete. `|| exit_code=$?` keeps a failing status
+    # from tripping errexit without toggling it, so a caller that runs with
+    # errexit off gets it back off.
     local exit_code=0
-    set +e
-    wait "$cmd_pid" 2> /dev/null
-    exit_code=$?
-    set -e
+    wait "$cmd_pid" 2> /dev/null || exit_code=$?
+
+    _mole_cleanup_timeout_killer "$killer_pid"
+
+    if [[ $interrupted -eq 1 ]]; then
+        # A command that ignores TERM gets the same two-second grace as the
+        # timeout binary's -k 2 before SIGKILL. The caller's trap stays off
+        # until then: its exit on a second Ctrl-C would skip the KILL.
+        trap 'interrupted=1' INT
+        local grace_ticks=0
+        while kill -0 "$cmd_pid" 2> /dev/null && [[ $grace_ticks -lt 20 ]]; do
+            sleep 0.1 || true
+            grace_ticks=$((grace_ticks + 1))
+        done
+        if kill -0 "$cmd_pid" 2> /dev/null; then
+            kill -KILL "$cmd_pid" 2> /dev/null || true
+        fi
+        wait "$cmd_pid" 2> /dev/null || true
+    fi
 
     if [[ -n "$previous_int_trap" ]]; then
         # eval: restore previous trap captured by $(trap -p INT)
@@ -386,8 +501,6 @@ run_with_timeout() {
     else
         trap - INT
     fi
-
-    _mole_cleanup_timeout_killer "$killer_pid"
 
     if [[ $interrupted -eq 1 ]]; then
         return 130
@@ -397,7 +510,7 @@ run_with_timeout() {
     if [[ $exit_code -eq 143 || $exit_code -eq 137 ]]; then
         # Command was killed by timeout
         if [[ "${MO_DEBUG:-0}" == "1" ]]; then
-            echo "[TIMEOUT] Command timed out after ${duration}s" >&2
+            _mole_timeout_debug "[TIMEOUT] Command timed out after ${duration}s"
         fi
         return 124
     fi

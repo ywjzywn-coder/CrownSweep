@@ -64,7 +64,7 @@ func TestDeleteMultiplePathsCmdHandlesParentChild(t *testing.T) {
 	}
 
 	var counter int64
-	msg := deleteMultiplePathsCmd([]string{parent, child}, &counter)()
+	msg := deleteMultiplePathsCmd([]string{parent, child}, &counter, nil)()
 	progress, ok := msg.(deleteProgressMsg)
 	if !ok {
 		t.Fatalf("expected deleteProgressMsg, got %T", msg)
@@ -138,6 +138,67 @@ func TestValidateTrashTargetRejectsDockerDesktopLiveData(t *testing.T) {
 				t.Fatalf("validateTrashTarget(%q) error = %v, want protected path error", path, err)
 			}
 		})
+	}
+}
+
+func TestValidateTrashTargetRejectsParentsOfProtectedRuntimeState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	containers := filepath.Join(home, "Library", "Containers")
+	if err := os.MkdirAll(containers, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	emptyApp := filepath.Join(containers, "com.example.empty")
+	if err := os.MkdirAll(emptyApp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateTrashTarget(emptyApp); err != nil {
+		t.Fatalf("empty app container was protected: %v", err)
+	}
+	for _, relative := range []string{
+		"Library/Containers/com.docker.docker/Data",
+		"Library/Group Containers/HUAQ24HBR6.dev.orbstack/data",
+	} {
+		if err := os.MkdirAll(filepath.Join(home, relative), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, relative := range []string{"Library", "Library/Containers", "Library/Group Containers"} {
+		path := filepath.Join(home, relative)
+		if err := validateTrashTarget(path); err == nil {
+			t.Errorf("parent of protected runtime state accepted: %s", path)
+		}
+		alias := filepath.Join(t.TempDir(), "parent-alias")
+		if err := os.Symlink(path, alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateTrashTarget(alias); err == nil {
+			t.Errorf("alias of protected runtime parent accepted: %s", alias)
+		}
+	}
+	for _, relative := range []string{"Library/Caches/rebuildable", "Library/Containers/com.example.app", "Library/Group Containers/example.dev.orbstack-backup"} {
+		if err := validateTrashTarget(filepath.Join(home, relative)); err != nil {
+			t.Errorf("unrelated sibling refused: %s: %v", relative, err)
+		}
+	}
+}
+
+func TestValidateTrashTargetRejectsPhysicalParentOfLinkedRuntimeState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	external := t.TempDir()
+	state := filepath.Join(external, "runtime")
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(state, filepath.Join(home, ".orbstack")); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateTrashTarget(external); err == nil {
+		t.Fatal("physical parent of linked runtime state was accepted")
+	}
+	if err := validateTrashTarget(filepath.Join(external, "ordinary-sibling")); err != nil {
+		t.Fatalf("ordinary sibling was protected: %v", err)
 	}
 }
 
@@ -368,6 +429,11 @@ func TestValidateTrashTargetRejectsEndpointSecurityCaches(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	tests := []string{
+		"/private/var/folders/zz",
+		"/private/var/folders/zz/aa",
+		"/private/var/folders/zz/aa/C",
+		"/var/folders/zz/aa/T",
+		"/var/folders/zz/aa/X",
 		"/private/var/folders/zz/aa/C/com.crowdstrike.falcon.App/com.apple.metalfe",
 		"/private/var/folders/zz/aa/X/com.sentinelone.agent.code_sign_clone",
 		"/var/folders/zz/aa/C/com.jamf.management/cache",
@@ -686,5 +752,159 @@ func TestMoveToTrashViaBinaryUsesAbsolutePathWithoutSeparator(t *testing.T) {
 	}
 	if strings.Contains(string(data), `trashBinary, "--"`) {
 		t.Error(`moveToTrashViaBinary must not pass "--" to trash(8); it trashes the target but exits non-zero`)
+	}
+}
+
+func TestAnalyzeDeleteRefusesICloudStructuralFoldersButNotTheirContents(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	mobile := filepath.Join(home, "Library", "Mobile Documents")
+	for _, refused := range []string{
+		mobile,
+		filepath.Join(mobile, "com~apple~CloudDocs"),
+		filepath.Join(mobile, "com~apple~Keynote"),
+		filepath.Join(mobile, "com~apple~Keynote", "Documents"),
+		filepath.Join(home, "library", "mobile documents", "COM~APPLE~PAGES", "documents"),
+	} {
+		if !isProtectedAnalyzeDeletePath(refused) {
+			t.Errorf("iCloud structural folder not refused: %s", refused)
+		}
+	}
+	for _, allowed := range []string{
+		filepath.Join(mobile, "com~apple~CloudDocs", "Downloads"),
+		filepath.Join(mobile, "com~apple~CloudDocs", "big.mov"),
+		filepath.Join(mobile, "com~apple~Keynote", "Documents", "Deck.key"),
+		filepath.Join(mobile, "com~apple~Keynote", "Documents", "Old", "a.key"),
+		filepath.Join(home, "Library", "Mobile Documents Backup", "file"),
+	} {
+		if isProtectedAnalyzeDeletePath(allowed) {
+			t.Errorf("iCloud content refused: %s", allowed)
+		}
+	}
+}
+
+func TestAnalyzeDeleteRefusesICloudStructuralFoldersReachedThroughAnotherPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	container := filepath.Join(home, "Library", "Mobile Documents", "com~apple~Keynote", "Documents")
+	if err := os.MkdirAll(container, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "icloud")
+	if err := os.Symlink(filepath.Join(home, "Library", "Mobile Documents"), alias); err != nil {
+		t.Fatal(err)
+	}
+	for _, refused := range []string{
+		alias,
+		filepath.Join(alias, "com~apple~Keynote"),
+		filepath.Join(alias, "com~apple~Keynote", "Documents"),
+	} {
+		if !isICloudStructuralPath(refused, home) {
+			t.Errorf("iCloud structural folder reached through an alias not refused: %s", refused)
+		}
+	}
+	if isICloudStructuralPath(filepath.Join(alias, "com~apple~Keynote", "Documents", "Deck.key"), home) {
+		t.Errorf("file inside an app's iCloud Documents refused through an alias")
+	}
+}
+
+func TestAnalyzeDeleteAllowsICloudFilesAtStructuralDepths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	mobile := filepath.Join(home, "Library", "Mobile Documents")
+	cloud := filepath.Join(mobile, "com~apple~CloudDocs")
+	if err := os.MkdirAll(cloud, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "icloud")
+	if err := os.Symlink(mobile, alias); err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{"report.txt", "com~apple~CloudDocs/Documents"} {
+		path := filepath.Join(mobile, relative)
+		if err := os.WriteFile(path, []byte("keep user control"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, candidate := range []string{path, filepath.Join(alias, relative)} {
+			if err := validateTrashTarget(candidate); err != nil {
+				t.Errorf("ordinary iCloud file refused: %s: %v", candidate, err)
+			}
+		}
+	}
+	if err := validateTrashTarget(cloud); err == nil {
+		t.Fatal("real iCloud container directory was accepted")
+	}
+}
+
+func TestAnalyzeDeleteRefusesParentsOfExistingICloudState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	library := filepath.Join(home, "Library")
+	if err := os.MkdirAll(library, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateTrashTarget(library); err == nil {
+		t.Fatal("~/Library was accepted; it is a head folder even without protected state")
+	}
+	mobile := filepath.Join(library, "Mobile Documents")
+	if err := os.MkdirAll(filepath.Join(mobile, "com~apple~Keynote", "Documents"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "library")
+	if err := os.Symlink(library, alias); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{library, alias} {
+		if err := validateTrashTarget(path); err == nil {
+			t.Errorf("ancestor of iCloud state accepted: %s", path)
+		}
+	}
+	for _, path := range []string{filepath.Join(library, "Caches", "rebuildable"), filepath.Join(mobile, "com~apple~Keynote", "Documents", "Deck.key")} {
+		if err := validateTrashTarget(path); err != nil {
+			t.Errorf("unrelated directory or user content refused: %s: %v", path, err)
+		}
+	}
+}
+
+// Mole Mac's canTrashFromAnalyze refuses the head of the user's own tree and
+// keeps everything inside it movable; mo analyze follows the same rule.
+func TestAnalyzeDeleteRefusesHeadFoldersButNotTheirContents(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, name := range []string{"Library", "Documents", "Desktop", "Downloads", "Pictures", "Movies", "Music"} {
+		if err := os.MkdirAll(filepath.Join(home, name, "old"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, refused := range []string{
+		filepath.Join(home, "Documents"),
+		filepath.Join(home, "Desktop"),
+		filepath.Join(home, "Downloads"),
+		filepath.Join(home, "Pictures"),
+		filepath.Join(home, "Movies"),
+		filepath.Join(home, "Music"),
+		filepath.Join(home, "Library"),
+		filepath.Join(home, "documents"),
+		filepath.Join(home, "Library", "Caches"),
+		filepath.Join(home, "Library", "Application Support"),
+		filepath.Join(home, "library", "preferences"),
+		"/Library/Caches",
+		"/Library/Fonts",
+	} {
+		if !isProtectedAnalyzeDeletePath(refused) {
+			t.Errorf("head folder not refused: %s", refused)
+		}
+	}
+	for _, allowed := range []string{
+		filepath.Join(home, "Documents", "old"),
+		filepath.Join(home, "Downloads", "old"),
+		filepath.Join(home, "Library", "Caches", "com.example.app"),
+		filepath.Join(home, "Library", "old", "inner"),
+		filepath.Join(home, "Projects"),
+		"/Library/Caches/com.example.app",
+	} {
+		if isProtectedAnalyzeDeletePath(allowed) {
+			t.Errorf("content inside a head folder refused: %s", allowed)
+		}
 	}
 }

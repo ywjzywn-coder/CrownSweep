@@ -86,24 +86,6 @@ EOF
 	[[ "$output" == *"User directory permissions already optimal"* ]] || return 1
 }
 
-@test "opt_system_maintenance reports DNS and Spotlight" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
-set -euo pipefail
-source "$PROJECT_ROOT/lib/core/common.sh"
-source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-flush_dns_cache() { return 0; }
-mkdir -p "$HOME/bin"
-printf '#!/bin/bash\necho "Indexing enabled."\n' > "$HOME/bin/mdutil"
-chmod +x "$HOME/bin/mdutil"
-PATH="$HOME/bin:$PATH"
-execute_optimization system_maintenance
-EOF
-
-	[ "$status" -eq 0 ]
-	[[ "$output" == *"DNS cache flushed"* ]] || return 1
-	[[ "$output" == *"Spotlight index verified"* ]]
-}
-
 @test "opt_network_optimization refreshes DNS" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -115,7 +97,242 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"DNS cache refreshed"* ]] || return 1
-	[[ "$output" == *"mDNSResponder restarted"* ]]
+	[[ "$output" != *"mDNSResponder"* ]]
+}
+
+@test "one optimize task refreshes DNS and one checks the Spotlight index" {
+	# A separate DNS & Spotlight Check task used to repeat both: a second VPN
+	# skip line and a second Spotlight status line in every run.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+dns=0
+spotlight=0
+for ((index = 0; index < ${#MOLE_OPTIMIZE_ACTIONS[@]}; index++)); do
+    handler=${MOLE_OPTIMIZE_HANDLERS[$index]}
+    if declare -f "$handler" | grep -q 'flush_dns_cache'; then dns=$((dns + 1)); fi
+    if declare -f "$handler" | grep -q 'mdutil -s'; then spotlight=$((spotlight + 1)); fi
+done
+echo "DNS=$dns SPOTLIGHT=$spotlight"
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"DNS=1 SPOTLIGHT=1"* ]] || { echo "$output"; return 1; }
+}
+
+@test "a saved DNS & Spotlight Check opt-out still keeps DNS untouched" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_OPTIMIZE_SUDO_AVAILABLE=true MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+is_whitelisted() { [[ "$1" == "system_maintenance" ]]; }
+flush_dns_cache() { echo "UNEXPECTED_FLUSH"; return 0; }
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count skipped)" == "1" ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Skipped (whitelisted): Network Cache Refresh"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"UNEXPECTED_FLUSH"* ]]
+}
+
+@test "DNS refresh is skipped once while a VPN is active" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=1 MOLE_OPTIMIZE_SUDO_AVAILABLE=true MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
+sudo() { echo "UNEXPECTED_SUDO:$*"; return 0; }
+
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count skipped)" == "1" ]] || exit 1
+[[ "$(optimize_outcome_count applied)" == "0" ]] || exit 1
+[[ "$(optimize_outcome_count failed)" == "0" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$(grep -c 'skipped, active VPN detected' <<< "$output")" == "1" ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"UNEXPECTED_SUDO"* ]]
+}
+
+@test "dry-run previews the VPN skip instead of a DNS flush" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=1 MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count skipped)" == "1" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"DNS cache refresh skipped, active VPN detected"* ]] || return 1
+	[[ "$output" != *"DNS cache refreshed"* ]]
+}
+
+@test "DNS flush runs once without a VPN" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 MOLE_OPTIMIZE_SUDO_AVAILABLE=true MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
+sudo() { echo "SUDO:$*"; return 0; }
+function /usr/bin/plutil { echo com.apple.mDNSResponder.reloaded; }
+
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$(grep -c 'SUDO:dscacheutil -flushcache' <<< "$output")" == "1" ]] || return 1
+	[[ "$output" == *"SUDO:/bin/launchctl kill SIGHUP system/com.apple.mDNSResponder.reloaded"* ]] || return 1
+	[[ "$output" == *"DNS cache refreshed"* ]] || return 1
+	[[ "$output" != *"Failed to refresh DNS cache"* ]]
+}
+
+@test "DNS refresh signals only the allowlisted system plist service" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+optimize_sudo_available() { return 0; }
+function /usr/bin/plutil {
+    [[ "$*" == "-extract Label raw -o - /System/Library/LaunchDaemons/com.apple.mDNSResponder.plist" ]] || return 99
+    echo "$label"
+}
+trace="$HOME/dns-service.trace"
+sudo() { printf '%s\n' "$*" >> "$trace"; }
+for label in com.apple.mDNSResponder com.apple.mDNSResponder.reloaded; do
+    : > "$trace"
+    flush_dns_cache || exit 1
+    expected=$(printf 'dscacheutil -flushcache\n/bin/launchctl kill SIGHUP system/%s' "$label")
+    [[ "$(cat "$trace")" == "$expected" ]] || exit 1
+done
+EOF
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+}
+
+@test "DNS refresh refuses an unknown or unreadable service before any sudo action" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+optimize_sudo_available() { return 0; }
+function /usr/bin/plutil { printf '%s\n' "$label"; return "$read_status"; }
+trace="$HOME/dns-refused.trace"
+sudo() { printf '%s\n' "$*" >> "$trace"; }
+read_status=0
+for label in com.apple.mDNSResponder.neighbor '' $'com.apple.mDNSResponder\nextra'; do
+    result=0
+    flush_dns_cache || result=$?
+    [[ "$result" == 1 && ! -e "$trace" ]] || exit 1
+done
+label=com.apple.mDNSResponder
+read_status=1
+result=0
+flush_dns_cache || result=$?
+[[ "$result" == 1 && ! -e "$trace" ]] || exit 1
+EOF
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+}
+
+@test "DNS refresh never retries a refused service signal by process name" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+optimize_sudo_available() { return 0; }
+function /usr/bin/plutil { echo com.apple.mDNSResponder; }
+trace="$HOME/dns-signal-refused.trace"
+sudo() {
+    printf '%s\n' "$*" >> "$trace"
+    [[ "$1" == dscacheutil ]] && return 0
+    [[ -n "$launchctl_error" ]] && echo "$launchctl_error" >&2
+    return 1
+}
+expected=$(printf 'dscacheutil -flushcache\n/bin/launchctl kill SIGHUP system/com.apple.mDNSResponder')
+for launchctl_error in '' 'Could not find service "com.apple.mDNSResponder" in domain for system'; do
+    : > "$trace"
+    result=0
+    flush_dns_cache || result=$?
+    [[ "$result" == 1 ]] || exit 1
+    [[ "$(cat "$trace")" == "$expected" ]] || exit 2
+done
+EOF
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+}
+
+@test "DNS refresh retries a macOS-refused service signal only as the mDNSResponder account" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+optimize_sudo_available() { return 0; }
+function /usr/bin/plutil { echo com.apple.mDNSResponder.reloaded; }
+trace="$HOME/dns-signal-eperm.trace"
+sudo() {
+    printf '%s\n' "$*" >> "$trace"
+    case "$1" in
+        dscacheutil) return 0 ;;
+        /bin/launchctl) echo "Not privileged to signal service." >&2; return 1 ;;
+        *) return "$fallback_status" ;;
+    esac
+}
+expected=$(printf 'dscacheutil -flushcache\n/bin/launchctl kill SIGHUP system/com.apple.mDNSResponder.reloaded\n-u _mdnsresponder /usr/bin/killall -u _mdnsresponder -HUP mDNSResponder')
+for case_spec in 0:0 1:4; do
+    fallback_status=${case_spec%%:*}
+    : > "$trace"
+    result=0
+    flush_dns_cache || result=$?
+    [[ "$result" == "${case_spec##*:}" ]] || exit 1
+    [[ "$(cat "$trace")" == "$expected" ]] || exit 2
+done
+flush_dns_cache() { return 4; }
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count skipped)" == 1 ]] || exit 3
+[[ "$(optimize_outcome_count failed)" == 0 ]] || exit 4
+EOF
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"macOS does not allow signaling mDNSResponder"* ]] || return 1
+	[[ "$output" != *"Failed to refresh DNS cache"* ]]
+}
+
+@test "DNS flush fails closed when the VPN state cannot be determined" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_OPTIMIZE_SUDO_AVAILABLE=true MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE MOLE_ASSUME_VPN_ACTIVE
+has_active_vpn_interface() { return 2; }
+sudo() { echo "UNEXPECTED_SUDO:$*"; return 0; }
+
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count failed)" == "1" ]] || exit 1
+[[ "$(optimize_outcome_count applied)" == "0" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$(grep -c 'Failed to inspect active VPN state' <<< "$output")" == "1" ]] || return 1
+	[[ "$output" != *"UNEXPECTED_SUDO"* ]]
+}
+
+@test "a failed DNS flush is named" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 MOLE_OPTIMIZE_SUDO_AVAILABLE=true MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
+sudo() { echo "SUDO_FAILED:$*"; return 1; }
+
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count failed)" == "1" ]] || exit 1
+[[ "$(optimize_outcome_count applied)" == "0" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$(grep -c 'Failed to refresh DNS cache' <<< "$output")" == "1" ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"DNS cache refreshed"* ]]
 }
 
 @test "fix_broken_preferences repairs only non-Apple preference plists" {
@@ -249,7 +466,7 @@ touch \
     "$prefs/com.example.two.plist" \
     "$prefs/com.example.three.plist"
 
-plutil() {
+_mole_plutil_lint() {
     echo "call" >> "$CALL_LOG"
     return 0
 }
@@ -321,7 +538,10 @@ EOF
 }
 
 @test "optimize scans never delete candidates from partial find output" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+	local test_home="$HOME/partial-find-output"
+	rm -rf "$test_home"
+	mkdir -p "$test_home"
+	run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
@@ -330,8 +550,10 @@ saved="$HOME/Library/Saved Application State/Partial.savedState"
 shared="$HOME/Library/Application Support/com.apple.sharedfilelist/Partial.sfl3"
 mkdir -p "$saved" "${shared%/*}"
 touch "$shared"
+# Both tasks send safe_remove output to /dev/null, so a printed marker would
+# never reach $output. Record the call in a file the check below reads.
 safe_remove() {
-    printf 'UNEXPECTED_REMOVE:%s\n' "$1"
+    printf '%s\n' "$1" >> "$HOME/unexpected-removals"
     return 0
 }
 run_with_timeout() {
@@ -349,13 +571,16 @@ optimize_task_finish saved_state_cleanup
 optimize_task_start
 opt_shared_file_list_repair
 optimize_task_finish shared_file_list_repair
+[[ ! -e "$HOME/unexpected-removals" ]] || { cat "$HOME/unexpected-removals"; exit 1; }
 EOF
 
 	[ "$status" -eq 0 ] || {
 		echo "$output"
 		return 1
 	}
-	[[ "$output" != *"UNEXPECTED_REMOVE"* ]]
+	# Both scans really ran and failed, so the empty removal log is not vacuous.
+	[[ "$output" == *"Failed to scan old saved states"* ]] || return 1
+	[[ "$output" == *"Failed to scan shared file lists"* ]]
 }
 
 @test "optimize saved-state cleanup propagates deletion interruption" {
@@ -792,7 +1017,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-PLIST="$HOME/Library/Preferences/com.apple.spotlight.plist"
+PLIST="$HOME/Library/Preferences/com.apple.Spotlight.plist"
 mkdir -p "$(dirname "$PLIST")"
 rm -f "$PLIST"
 /usr/libexec/PlistBuddy \
@@ -821,12 +1046,55 @@ EOF
 	[[ "$output" != *"com.lm.william.TwinklingCard"* ]]
 }
 
+@test "opt_prune_spotlight_orphan_rules keeps Spotlight's own switches (#1878)" {
+	# Custom.relatedContents is the Show Related Content switch. It passes the
+	# reverse-DNS shape, so the resolver used to call it a missing app and the
+	# switch came back on after every optimize.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+PLIST="$HOME/Library/Preferences/com.apple.Spotlight.plist"
+mkdir -p "$(dirname "$PLIST")"
+rm -f "$PLIST"
+/usr/libexec/PlistBuddy \
+    -c "Add :EnabledPreferenceRules array" \
+    -c "Add :EnabledPreferenceRules:0 string Custom.relatedContents" \
+    -c "Add :EnabledPreferenceRules:1 string MENU_WEBSEARCH.enabled" \
+    -c "Add :EnabledPreferenceRules:2 string com.gone.App" \
+    "$PLIST" >/dev/null 2>&1
+defaults() {
+    case "$1" in
+        read) return 0 ;;
+        write | delete) echo "DEFAULTS: $*" ;;
+    esac
+}
+bundle_has_installed_app() {
+    echo "RESOLVED: $1"
+    return 1
+}
+execute_optimization spotlight_orphan_rules_cleanup
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	# The positive control: a real orphan is still removed.
+	[[ "$output" == *"Removed 1 orphan"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"RESOLVED: com.gone.App"* ]] || return 1
+	[[ "$output" != *"RESOLVED: Custom.relatedContents"* ]] || return 1
+	[[ "$output" != *"RESOLVED: MENU_WEBSEARCH.enabled"* ]] || return 1
+	local written
+	written=$(printf '%s\n' "$output" | grep 'DEFAULTS: write')
+	[[ "$written" == *"Custom.relatedContents"* ]] || { echo "$output"; return 1; }
+	[[ "$written" == *"MENU_WEBSEARCH.enabled"* ]] || return 1
+	[[ "$written" != *"com.gone.App"* ]]
+}
+
 @test "opt_prune_spotlight_orphan_rules dry-run reports but does not write" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-PLIST="$HOME/Library/Preferences/com.apple.spotlight.plist"
+PLIST="$HOME/Library/Preferences/com.apple.Spotlight.plist"
 mkdir -p "$(dirname "$PLIST")"
 rm -f "$PLIST"
 /usr/libexec/PlistBuddy \
@@ -855,7 +1123,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-PLIST="$HOME/Library/Preferences/com.apple.spotlight.plist"
+PLIST="$HOME/Library/Preferences/com.apple.Spotlight.plist"
 mkdir -p "$(dirname "$PLIST")"
 rm -f "$PLIST"
 /usr/libexec/PlistBuddy \
@@ -884,7 +1152,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
-PLIST="$HOME/Library/Preferences/com.apple.spotlight.plist"
+PLIST="$HOME/Library/Preferences/com.apple.Spotlight.plist"
 mkdir -p "$(dirname "$PLIST")"
 rm -f "$PLIST"
 /usr/libexec/PlistBuddy \
@@ -906,6 +1174,82 @@ EOF
 	[ "$status" -eq 0 ] || return 1
 	[[ "$output" == *"RC=130"* ]] || return 1
 	[[ "$output" != *"UNEXPECTED_WRITE"* ]]
+}
+
+@test "Spotlight rules keep the entire array when it changes during app resolution" {
+    for change in corrupt append; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" CHANGE="$change" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+PLIST="$HOME/Library/Preferences/com.apple.Spotlight.plist"
+mkdir -p "${PLIST%/*}"
+printf '%s' '<plist version="1.0"><dict><key>EnabledPreferenceRules</key><array><string>com.missing.App</string><string>com.apple.Safari</string></array></dict></plist>' > "$PLIST"
+defaults() { case "$1" in read) return 0;; *) echo "UNEXPECTED_WRITE $*";; esac; }
+bundle_has_installed_app() {
+    if [[ "$CHANGE" == corrupt ]]; then
+        printf 'incomplete plist' > "$PLIST"
+    else
+        /usr/libexec/PlistBuddy -c 'Add :EnabledPreferenceRules: string System.iphoneApps' "$PLIST"
+    fi
+    return 1
+}
+execute_optimization spotlight_orphan_rules_cleanup
+EOF
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        [[ "$output" != *"UNEXPECTED_WRITE"* ]] || return 1
+        [[ "$output" != *"Removed 1 orphan"* ]] || return 1
+    done
+}
+
+@test "Spotlight rules refuse an array containing a non-string before any write" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+PLIST="$HOME/Library/Preferences/com.apple.Spotlight.plist"
+mkdir -p "${PLIST%/*}"
+printf '%s' '<plist version="1.0"><dict><key>EnabledPreferenceRules</key><array><string>com.missing.App</string><dict><key>protected</key><true/></dict></array></dict></plist>' > "$PLIST"
+defaults() { case "$1" in read) return 0;; *) echo "UNEXPECTED_WRITE $*";; esac; }
+bundle_has_installed_app() { return 1; }
+execute_optimization spotlight_orphan_rules_cleanup
+EOF
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"UNEXPECTED_WRITE"* ]] || return 1
+}
+
+@test "Spotlight rules are read and written in the domain Spotlight itself uses" {
+	# cfprefsd keys domains by exact string: while Spotlight holds
+	# com.apple.Spotlight, com.apple.spotlight reads no rules and a write to it
+	# never reaches Spotlight, even on a case-insensitive volume.
+	for keep in some none; do
+		run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" KEEP="$keep" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+PLIST="$HOME/Library/Preferences/com.apple.Spotlight.plist"
+mkdir -p "${PLIST%/*}"
+rm -f "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :EnabledPreferenceRules array" "$PLIST" >/dev/null 2>&1
+[[ "$KEEP" == none ]] || /usr/libexec/PlistBuddy -c "Add :EnabledPreferenceRules:0 string System.iphoneApps" "$PLIST" >/dev/null 2>&1
+/usr/libexec/PlistBuddy -c "Add :EnabledPreferenceRules: string com.gone.App" "$PLIST" >/dev/null 2>&1
+: > "$HOME/defaults-calls"
+# Recorded in a file: the read's output goes to /dev/null.
+defaults() { echo "DEFAULTS_DOMAIN: $1 $2" >> "$HOME/defaults-calls"; }
+bundle_has_installed_app() { return 1; }
+execute_optimization spotlight_orphan_rules_cleanup
+cat "$HOME/defaults-calls"
+EOF
+		[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+		[[ "$output" == *"Removed 1 orphan"* ]] || { echo "$output"; return 1; }
+		[[ "$output" == *"DEFAULTS_DOMAIN: read com.apple.Spotlight"* ]] || { echo "$output"; return 1; }
+		if [[ "$keep" == none ]]; then
+			[[ "$output" == *"DEFAULTS_DOMAIN: delete com.apple.Spotlight"* ]] || { echo "$output"; return 1; }
+		else
+			[[ "$output" == *"DEFAULTS_DOMAIN: write com.apple.Spotlight"* ]] || { echo "$output"; return 1; }
+		fi
+		[[ "$output" != *"com.apple.spotlight"* ]] || { echo "$output"; return 1; }
+	done
 }
 
 @test "opt_spotlight_index_optimize reports optimal when probes are fast" {
@@ -1055,6 +1399,43 @@ EOF
 	[[ "$output" != *"Cleaned"* ]]
 }
 
+@test "opt_launch_agents_cleanup prioritizes Program over ProgramArguments" {
+	local stub_dir="$HOME/launchctl-stub-bin"
+	local trace="$HOME/launchctl.trace"
+	mkdir -p "$stub_dir"
+	rm -f "$trace"
+	printf '#!/bin/bash\necho "$*" >> "%s"\n' "$trace" > "$stub_dir/launchctl"
+	chmod +x "$stub_dir/launchctl"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$stub_dir:$PATH" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+mkdir -p "$HOME/Library/LaunchAgents"
+cat > "$HOME/Library/LaunchAgents/com.test.program.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.test.program</string>
+    <key>Program</key>
+    <string>/nonexistent/program_binary</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>program_binary</string>
+    </array>
+</dict>
+</plist>
+PLIST
+execute_optimization launch_agents_cleanup
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Launch Agent com.test.program: program missing at /nonexistent/program_binary"* ]] || return 1
+	[[ "$output" == *"left in ~/Library/LaunchAgents"* ]] || return 1
+}
+
 @test "opt_launch_agents_cleanup skips healthy agents" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -1183,7 +1564,7 @@ source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 periodic() { true; }
 export -f periodic
 tmplog="$(mktemp /tmp/mole-test-daily.XXXXXX)"
-touch -t "$(date -v-10d +%Y%m%d%H%M.%S)" "$tmplog"
+touch -t "$(/bin/date -v-10d +%Y%m%d%H%M.%S)" "$tmplog"
 MOLE_PERIODIC_LOG="$tmplog" execute_optimization periodic_maintenance
 [[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
 rm -f "$tmplog"
@@ -1435,7 +1816,7 @@ EOF
 @test "run_optimize_diagnostics honors optimize whitelist paths for mounted images (#977)" {
 	mkdir -p "$HOME/.config/mole"
 	cat > "$HOME/.config/mole/whitelist_optimize" <<'EOF'
-system_maintenance
+network_optimization
 /Volumes/EXT3/Mail/TB.dmg
 /Volumes/mail
 EOF
@@ -1802,7 +2183,9 @@ EOF
 @test "flush_dns_cache does not invoke sudo under MOLE_TEST_NO_AUTH" {
 	# Reproduces the reported regression: ad-hoc flush_dns_cache under test
 	# mode used to fall through optimize_sudo_available and reach `sudo dscacheutil`.
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+	# Pin "no VPN": on a host routing through utun the VPN gate would return
+	# first and this test would pass without reaching the sudo guard.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 MOLE_ASSUME_VPN_ACTIVE=0 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
@@ -1920,6 +2303,7 @@ EOF
 @test "has_active_vpn_interface respects MOLE_ASSUME_VPN_ACTIVE override" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=1 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 # Force scutil/route to fail loudly so the env override is the only path.
 scutil() { echo "should not be called" >&2; return 1; }
@@ -1937,6 +2321,7 @@ EOF
 @test "has_active_vpn_interface returns false when MOLE_ASSUME_VPN_ACTIVE=0" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 # scutil/route should not run when env says no.
 scutil() { echo "should not be called" >&2; return 1; }
@@ -1953,6 +2338,7 @@ EOF
 @test "has_active_vpn_interface detects scutil Connected entry" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 mock_bin="$HOME/vpn-connected-bin"
 mkdir -p "$mock_bin"
@@ -1973,12 +2359,14 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"vpn"* ]] || return 1
+	[[ "$output" != *"no_vpn"* ]] || return 1
 	[[ "$output" != *"should not be called"* ]]
 }
 
 @test "has_active_vpn_interface ignores scutil entries that are all Disconnected" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 mock_bin="$HOME/vpn-disconnected-bin"
 mkdir -p "$mock_bin"
@@ -2003,6 +2391,7 @@ EOF
 @test "has_active_vpn_interface detects full-tunnel via utun default route" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 # No system-managed VPN configured in scutil.
 mock_bin="$HOME/vpn-full-tunnel-bin"
@@ -2016,12 +2405,14 @@ if has_active_vpn_interface; then echo "vpn"; else echo "no_vpn"; fi
 EOF
 
 	[ "$status" -eq 0 ]
-	[[ "$output" == *"vpn"* ]]
+	[[ "$output" == *"vpn"* ]] || return 1
+	[[ "$output" != *"no_vpn"* ]]
 }
 
 @test "has_active_vpn_interface returns false for iCloud Private Relay style utun (#959)" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 # Private Relay / Continuity create utun* but the default route stays on en0.
 # The old netstat/ifconfig probe would have false-positived this; the new
@@ -2065,4 +2456,107 @@ EOF
 	[[ "$output" == *"/Library/Developer/CoreSimulator/Volumes/iOS_17.dmg"$'\t'"/Library/Developer/CoreSimulator/Volumes/iOS_17.0"* ]] || return 1
 	line_count=$(printf '%s\n' "$output" | awk 'NF' | wc -l | tr -d ' ')
 	[ "$line_count" = "2" ]
+}
+
+@test "has_active_vpn_interface treats a missing default route as no VPN" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+mock_bin="$HOME/vpn-offline-bin"
+mkdir -p "$mock_bin"
+printf '#!/bin/bash\necho "* (Disconnected)   AA1B2C3D-1111-2222-3333-444455556666   PPP     (L2TP)         \\"Office VPN\\"   [L2TP]"\n' > "$mock_bin/scutil"
+printf '#!/bin/bash\necho "route: writing to routing socket: not in table" >&2\nexit 1\n' > "$mock_bin/route"
+chmod +x "$mock_bin/scutil" "$mock_bin/route"
+PATH="$mock_bin:$PATH"
+status=0
+has_active_vpn_interface || status=$?
+echo "probe=$status"
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"probe=1"* ]]
+}
+
+@test "has_active_vpn_interface keeps other route failures unknown" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+mock_bin="$HOME/vpn-route-error-bin"
+mkdir -p "$mock_bin"
+printf '#!/bin/bash\necho "* (Disconnected)   AA1B2C3D-1111-2222-3333-444455556666   PPP     (L2TP)         \\"Office VPN\\"   [L2TP]"\n' > "$mock_bin/scutil"
+printf '#!/bin/bash\necho "route: socket: Operation not permitted" >&2\nexit 1\n' > "$mock_bin/route"
+chmod +x "$mock_bin/scutil" "$mock_bin/route"
+PATH="$mock_bin:$PATH"
+status=0
+has_active_vpn_interface || status=$?
+echo "probe=$status"
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"probe=2"* ]]
+}
+
+
+@test "fix_broken_preferences keeps an unreadable plist and still removes a readable broken one" {
+	local test_home="$HOME/fixprefs-unreadable"
+	run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/maintenance.sh"
+
+prefs="$HOME/Library/Preferences"
+mkdir -p "$prefs"
+valid="$prefs/com.example.licensing.plist"
+broken="$prefs/com.example.broken.plist"
+cat > "$valid" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>LicenseKey</key><string>AAAA-BBBB</string></dict></plist>
+PLIST
+printf 'not a plist\n' > "$broken"
+chmod 000 "$valid"
+
+safe_remove() { printf 'REMOVE:%s\n' "$1" >> "$HOME/removed.log"; }
+count=$(fix_broken_preferences)
+printf 'COUNT=%s\n' "$count"
+[[ -f "$valid" ]] && echo "VALID_PRESENT"
+grep -Fq "unreadable preference" "$HOME/Library/Logs/mole/operations.log" && echo "SKIPPED_LOGGED"
+EOF
+	chmod 600 "$test_home/Library/Preferences/com.example.licensing.plist"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"COUNT=1"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"VALID_PRESENT"* ]] || return 1
+	[[ "$output" == *"SKIPPED_LOGGED"* ]] || return 1
+	[[ -f "$test_home/removed.log" ]] || return 1
+	grep -Fq "com.example.broken.plist" "$test_home/removed.log"
+	if grep -Fq "com.example.licensing.plist" "$test_home/removed.log"; then return 1; fi
+}
+
+@test "fix_broken_preferences keeps valid plists when a broken plutil shadows the system one" {
+	local test_home="$HOME/fixprefs-shadowed-plutil"
+	run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/maintenance.sh"
+
+prefs="$HOME/Library/Preferences"
+mkdir -p "$prefs" "$HOME/mock-bin"
+valid="$prefs/com.example.valid.plist"
+cat > "$valid" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Setting</key><string>keep-me</string></dict></plist>
+PLIST
+printf '#!/bin/bash\nexit 1\n' > "$HOME/mock-bin/plutil"
+chmod +x "$HOME/mock-bin/plutil"
+PATH="$HOME/mock-bin:$PATH"
+safe_remove() { printf 'REMOVE:%s\n' "$1" >> "$HOME/removed.log"; }
+count=$(fix_broken_preferences)
+printf 'COUNT=%s\n' "$count"
+[[ -f "$valid" ]] && echo "VALID_PRESENT"
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"COUNT=0"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"VALID_PRESENT"* ]] || return 1
+	[[ ! -e "$test_home/removed.log" ]] || return 1
 }

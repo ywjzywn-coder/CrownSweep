@@ -1,12 +1,18 @@
 name: CodeQL
 
+# Path filters skip changes that only touch files this workflow never reads;
+# scripts/release_workflow_gate.py mirrors them and tests/release_gate_test.py
+# locks the two together, so edit both in one change.
 on:
   push:
     branches: [main, dev]
+    paths: ['**', '!**.md', '!docs/**', '!CONTRIBUTORS.svg', '!LICENSE', '!llms.txt', '!.claude/**', '!.agents/**', '!.cursor/**', '!.github/ISSUE_TEMPLATE/**', '!.github/CODEOWNERS', '!skills/**', '!plugins/**', '**.sh', '**.bash', '**.bats', '**.go', '**.nix', '**.py', '**.ps1', '**/mole', '**/mo']
   pull_request:
     branches: [main, dev]
+    paths: ['**', '!**.md', '!docs/**', '!CONTRIBUTORS.svg', '!LICENSE', '!llms.txt', '!.claude/**', '!.agents/**', '!.cursor/**', '!.github/ISSUE_TEMPLATE/**', '!.github/CODEOWNERS', '!skills/**', '!plugins/**', '**.sh', '**.bash', '**.bats', '**.go', '**.nix', '**.py', '**.ps1', '**/mole', '**/mo']
   schedule:
     - cron: '17 3 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -41,7 +47,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -52,6 +58,6 @@ jobs:
         run: make build
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: "/language:${{ matrix.language }}"

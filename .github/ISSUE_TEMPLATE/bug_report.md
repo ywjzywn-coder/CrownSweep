@@ -14,9 +14,9 @@ Run `mo update` to install the latest stable version, then check `mo --version`.
 
 ## Describe the bug
 
-A clear and concise description of what the bug is. We suggest using English for better global understanding.
+Describe what happened. English is preferred so more contributors can help triage.
 
-If you believe the issue may allow unsafe deletion, path validation bypass, privilege boundary bypass, or release/install integrity issues, do not file a public bug report. Report it privately using the contact details in `SECURITY.md`.
+If you believe the issue may allow unsafe deletion, path validation bypass, privilege boundary bypass, or release/install integrity issues, do not file a public bug report. Report it privately using the contact details in [SECURITY.md](https://github.com/tw93/Mole/blob/main/SECURITY.md).
 
 ## Steps to reproduce
 
@@ -26,11 +26,11 @@ If you believe the issue may allow unsafe deletion, path validation bypass, priv
 
 ## Expected behavior
 
-A clear and concise description of what you expected to happen.
+What did you expect to happen instead?
 
 ## Debug logs
 
-Please run the command with `--debug` flag and paste the output here:
+Run the command with `--debug` and paste the output:
 
 ```bash
 mo <command> --debug
@@ -41,7 +41,7 @@ mo <command> --debug
 <summary>Debug output</summary>
 
 ```text
-Paste the debug output here
+Paste debug output here
 ```
 
 </details>
@@ -56,4 +56,4 @@ Paste mo --version output here
 
 ## Additional context
 
-Add any other context about the problem here, such as screenshots or related issues.
+Screenshots, error messages, or related details (optional).

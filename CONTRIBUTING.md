@@ -131,8 +131,8 @@ Format: `[MODULE_NAME] message` output to stderr.
 ## Requirements
 
 - macOS 12 or newer, works on Intel and Apple Silicon
-- Default macOS Bash 3.2+ plus administrator privileges for cleanup tasks
-- Install Command Line Tools with `xcode-select --install` for curl, tar, and related utilities
+- Default macOS Bash 3.2+; administrator privileges are required for system-level cleanup tasks
+- Command Line Tools (`xcode-select --install`) for curl, tar, and standard utilities
 - Go 1.26+ is required to build the `mo status` or `mo analyze` TUI binaries locally.
 
 ## Go Components
@@ -168,10 +168,10 @@ For releases, GitHub Actions builds architecture-specific binaries automatically
 
 **Guidelines:**
 
-- Keep files focused on single responsibility
-- Extract constants instead of magic numbers
+- Keep files focused on a single responsibility
+- Use named constants instead of magic numbers
 - Use context for timeout control on external commands
-- Add comments explaining **why** something is done, not just **what** is being done.
+- Add comments explaining the **why** behind non-obvious logic, not just what the code does
 
 ## Pull Requests
 

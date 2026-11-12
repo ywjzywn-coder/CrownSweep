@@ -118,7 +118,12 @@ func runTUIMode(path string, isOverview bool) {
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	final, err := p.Run()
+	if finalModel, ok := final.(model); ok {
+		m = finalModel
+	}
+	m.stopMeasurementsForExit()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "analyzer error: %v\n", err)
 		os.Exit(1)
 	}
@@ -152,7 +157,7 @@ func newModel(path string, isOverview bool) model {
 		cachePublications:   make(map[string]*scanPublication),
 		multiSelected:       make(map[string]bool),
 		largeMultiSelected:  make(map[string]bool),
-		liveSortMode:        liveScanSortModeFromEnv(),
+		liveSortMode:        liveSortFreezeOnMove,
 		snapshotRunner:      runLocalSnapshotCommand,
 	}
 
@@ -201,6 +206,7 @@ func createOverviewEntriesWithInsights(insightEntries []dirEntry) []dirEntry {
 	}
 
 	entries = append(entries, systemOverviewRoots()...)
+	entries = append(entries, mountedVolumeOverviewEntries()...)
 
 	// Hidden space insights: paths that silently accumulate disk usage.
 	entries = append(entries, insightEntries...)

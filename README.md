@@ -32,7 +32,7 @@ cargo test --lib --locked --manifest-path src-tauri/Cargo.toml
 npm run tauri -- build --bundles app
 ```
 
-当前前端模拟回归和生产构建已通过；最终原生与发布工具验证记录见维护手册。完整 Developer ID 签名、公证安装包尚未发布。引擎交互适配针对 Mole 1.56.1；Intel 原生运行、最低系统 macOS 12 的实机兼容、真实维护最终操作及其他引擎版本仍需验证。
+当前前端模拟回归和生产构建已通过；最终原生与发布工具验证记录见维护手册。完整 Developer ID 签名、公证安装包尚未发布。引擎已同步至 Mole 1.71.0（2026-11-12 合并上游 941 个提交），交互适配基线随之更新；Intel 原生运行、最低系统 macOS 12 的实机兼容、真实维护最终操作及同步后的引擎交互回归仍需验证。
 
 ## 来源与许可
 

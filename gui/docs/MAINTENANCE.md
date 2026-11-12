@@ -80,7 +80,7 @@ React 页面 → src/lib/api.ts → Tauri command → Rust engine 模块 → Mol
 
 `App.tsx` 合并扫描和 PTY 任务列表。扫描记录区分 running/cancelling/completed/cancelled/failed，最多保留最近 20 个已结束记录；活动扫描不会因该上限被丢弃。任务面板可停止扫描、返回来源页面并查看结果。`engine/activity.rs` 在任务注册/进程启动前取得 permit；App 安装替换必须取得互斥 permit，不能通过前端按钮禁用替代这层保护。
 
-`TaskProgress` 流式解码 PTY 输出，限制日志长度，只从当前未结束的提示行识别交互。适配基线为 Mole 1.56.1：
+`TaskProgress` 流式解码 PTY 输出，限制日志长度，只从当前未结束的提示行识别交互。适配基线为 Mole 1.71.0（2026-11-12 同步上游；同步后的实机交互回归尚未重做）：
 
 - 卸载匹配确认后，显式点击扫描关联文件；最终范围需再次确认或取消。
 - 系统缓存可选择授权继续或跳过。

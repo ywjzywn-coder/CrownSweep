@@ -12,7 +12,9 @@ setup_file() {
 	# Without this, go build would use $HOME/Library/Caches/go-build inside the
 	# temp dir (empty), causing a full cold rebuild on every test run (~6s).
 	ORIGINAL_GOCACHE="$(go env GOCACHE 2>/dev/null || true)"
-	export ORIGINAL_GOCACHE
+	ORIGINAL_GOPATH="$(go env GOPATH 2>/dev/null || true)"
+	ORIGINAL_GOMODCACHE="$(go env GOMODCACHE 2>/dev/null || true)"
+	export ORIGINAL_GOCACHE ORIGINAL_GOPATH ORIGINAL_GOMODCACHE
 
 	HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-cli-home.XXXXXX")"
 	export HOME
@@ -28,14 +30,15 @@ setup_file() {
 		export ANALYZE_BIN STATUS_BIN
 	elif command -v go > /dev/null 2>&1; then
 		# Build Go binaries from current source for JSON tests.
-		# Point GOPATH/GOMODCACHE/GOCACHE at the real home so local focused runs
-		# can reuse caches when the full runner did not prebuild helpers.
+		# Reuse the Go caches resolved before HOME moved (the shared harness may
+		# already have moved it off the account home) so local focused runs
+		# reuse caches when the full runner did not prebuild helpers.
 		ANALYZE_BIN="$(mktemp "${TMPDIR:-/tmp}/analyze-go.XXXXXX")"
 		STATUS_BIN="$(mktemp "${TMPDIR:-/tmp}/status-go.XXXXXX")"
-		GOPATH="${ORIGINAL_HOME}/go" GOMODCACHE="${ORIGINAL_HOME}/go/pkg/mod" \
+		GOPATH="${ORIGINAL_GOPATH}" GOMODCACHE="${ORIGINAL_GOMODCACHE}" \
 			GOCACHE="${ORIGINAL_GOCACHE}" \
 			go build -o "$ANALYZE_BIN" "$PROJECT_ROOT/cmd/analyze" 2>/dev/null
-		GOPATH="${ORIGINAL_HOME}/go" GOMODCACHE="${ORIGINAL_HOME}/go/pkg/mod" \
+		GOPATH="${ORIGINAL_GOPATH}" GOMODCACHE="${ORIGINAL_GOMODCACHE}" \
 			GOCACHE="${ORIGINAL_GOCACHE}" \
 			go build -o "$STATUS_BIN" "$PROJECT_ROOT/cmd/status" 2>/dev/null
 		CLI_OWNS_GO_HELPERS=1
@@ -117,6 +120,42 @@ setup() {
 	[[ "$output" != *"mo optimise"* ]]
 }
 
+@test "mole refuses a deleted cwd before loading user state (#1679)" {
+	local vanished
+	vanished=$(mktemp -d "$HOME/cwd-gone.XXXXXX")
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" VANISHED="$vanished" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+cd "$VANISHED"
+rmdir "$VANISHED"
+exec "$PROJECT_ROOT/mole" clean --dry-run --debug
+EOF
+	[ "$status" -eq 1 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Cannot access the current directory"* ]] || return 1
+	[[ "$output" == *'cd ~'* ]] || return 1
+	[[ "$output" != *"Starting developer cleanup step"* ]] || return 1
+	[[ "$output" != *"Debug logging enabled"* ]]
+}
+
+@test "mole still answers version and help probes from a deleted cwd (#1679)" {
+	local vanished
+	vanished=$(mktemp -d "$HOME/cwd-probe.XXXXXX")
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" VANISHED="$vanished" /bin/bash --noprofile --norc <<'EOF'
+set -uo pipefail
+cd "$VANISHED"
+rmdir "$VANISHED"
+# install.sh and mo update verify a fresh install with these two probes.
+"$PROJECT_ROOT/mole" --version > "$HOME/probe-version.out" 2>&1; echo "VERSION_RC=$?"
+"$PROJECT_ROOT/mole" --help > "$HOME/probe-help.out" 2>&1; echo "HELP_RC=$?"
+"$PROJECT_ROOT/mole" clean --dry-run > /dev/null 2>&1; echo "CLEAN_RC=$?"
+EOF
+	[[ "$output" == *"VERSION_RC=0"* ]] || { echo "$output"; cat "$HOME/probe-version.out"; return 1; }
+	[[ "$output" == *"HELP_RC=0"* ]] || { echo "$output"; cat "$HOME/probe-help.out"; return 1; }
+	# Every other command keeps refusing an unknown working directory.
+	[[ "$output" == *"CLEAN_RC=1"* ]] || { echo "$output"; return 1; }
+	grep -q 'Mole version' "$HOME/probe-version.out" || return 1
+	! grep -q 'Cannot access the current directory' "$HOME/probe-version.out" || return 1
+}
+
 @test "mole --version reports script version" {
 	expected_version="$(grep '^VERSION=' "$PROJECT_ROOT/mole" | head -1 | sed 's/VERSION=\"\(.*\)\"/\1/')"
 	run env HOME="$HOME" "$PROJECT_ROOT/mole" --version
@@ -138,6 +177,28 @@ SCRIPT
 	run env HOME="$HOME" PATH="$fake_bin:$PATH" MOLE_HOMEBREW_DETECT_TIMEOUT=1 "$PROJECT_ROOT/mole" --version
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"Install: Manual"* ]]
+}
+
+@test "mole --version names the commit of a Homebrew HEAD build" {
+	local prefix keg
+	prefix="$(mktemp -d "${BATS_TEST_TMPDIR}/mole-brew-head.XXXXXX")"
+	for keg in HEAD-1a2b3c4 9.9.9; do
+		mkdir -p "$prefix/Cellar/mole/$keg/libexec"
+		cp "$PROJECT_ROOT/mole" "$prefix/Cellar/mole/$keg/libexec/mole"
+		ln -s "$PROJECT_ROOT/lib" "$prefix/Cellar/mole/$keg/libexec/lib"
+		ln -s "$PROJECT_ROOT/bin" "$prefix/Cellar/mole/$keg/libexec/bin"
+	done
+	mkdir -p "$prefix/bin"
+
+	ln -s "$prefix/Cellar/mole/HEAD-1a2b3c4/libexec/mole" "$prefix/bin/mole"
+	run env HOME="$HOME" MOLE_HOMEBREW_DETECT_TIMEOUT=1 "$prefix/bin/mole" --version
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Install: Homebrew (HEAD 1a2b3c4)"* ]] || { echo "$output"; return 1; }
+
+	ln -sf "$prefix/Cellar/mole/9.9.9/libexec/mole" "$prefix/bin/mole"
+	run env HOME="$HOME" MOLE_HOMEBREW_DETECT_TIMEOUT=1 "$prefix/bin/mole" --version
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Install: Homebrew"$'\n'* ]] || { echo "$output"; return 1; }
 }
 
 @test "mole invoked through a cross-directory symlink still sources lib" {
@@ -210,6 +271,24 @@ EOF
 	done
 }
 
+@test "every command answers --help with usage and exit 0" {
+	local cmd
+	for cmd in clean uninstall optimize purge installer history completion touchid update remove; do
+		run env HOME="$HOME" "$PROJECT_ROOT/mole" "$cmd" --help
+		[ "$status" -eq 0 ] || return 1
+		[[ "$output" == *"Usage"* ]] || return 1
+	done
+}
+
+@test "every command answers -h with usage and exit 0" {
+	local cmd
+	for cmd in clean uninstall optimize purge installer history completion touchid update remove; do
+		run env HOME="$HOME" "$PROJECT_ROOT/mole" "$cmd" -h
+		[ "$status" -eq 0 ] || return 1
+		[[ "$output" == *"Usage"* ]] || return 1
+	done
+}
+
 @test "mole --help does not list check command" {
 	run env HOME="$HOME" "$PROJECT_ROOT/mole" --help
 	[ "$status" -eq 0 ]
@@ -240,6 +319,16 @@ EOF
 	[[ "$output" == *"Unknown optimize option: --check"* ]]
 }
 
+@test "optimize accepts -n as alias for --dry-run (#1841)" {
+	run env HOME="$HOME" "$PROJECT_ROOT/mole" optimize --help
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"--dry-run, -n"* ]] || return 1
+
+	run env HOME="$HOME" bash -c "'$PROJECT_ROOT/bin/optimize.sh' -n --help"
+	[ "$status" -eq 0 ]
+	[[ "$output" != *"Unknown optimize option: -n"* ]]
+}
+
 @test "mole uninstall --whitelist returns unsupported option error" {
 	run env HOME="$HOME" "$PROJECT_ROOT/mole" uninstall --whitelist
 	[ "$status" -ne 0 ]
@@ -258,11 +347,11 @@ EOF
 	[ "$status" -eq 0 ] || return 1
 	[[ "$output" == *"U Update"* ]] || return 1
 
-	# TouchID setup takes precedence: no update shortcut even if one is ready.
+	# TouchID setup and an available update both retain their shortcuts.
 	run /bin/bash --noprofile --norc -c "MOLE_TEST_MODE=1 MOLE_SKIP_MAIN=1 HOME=\"\$(mktemp -d)\" source '$PROJECT_ROOT/mole'; _main_menu_controls_line false true"
 	[ "$status" -eq 0 ] || return 1
 	[[ "$output" == *"T TouchID"* ]] || return 1
-	[[ "$output" != *"U Update"* ]] || return 1
+	[[ "$output" == *"U Update"* ]] || return 1
 }
 
 @test "show_main_menu keeps history out of the primary menu" {
@@ -283,6 +372,46 @@ EOF
 	[[ "$output" == *"Clean        Free up disk space"* ]] || return 1
 	[[ "$output" != *"History"* ]] || return 1
 	[[ "$output" != *"history"* ]]
+}
+
+@test "show_main_menu sets the update notice off with a blank line and a green command" {
+	run /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+unset NO_COLOR
+HOME="$(mktemp -d)"
+export HOME MOLE_TEST_MODE=1 MOLE_SKIP_MAIN=1
+source "$PROJECT_ROOT/mole"
+[[ -n "$GREEN" && -n "$NC" ]] || exit 1
+show_menu_option() { printf '%s' "$2"; }
+line=$'\r\033[2K'
+render() {
+    MAIN_MENU_BANNER=""
+    MAIN_MENU_UPDATE_MESSAGE="$1"
+    MAIN_MENU_SHOW_UPDATE=true
+    show_main_menu 1 true
+}
+tagline="${GREEN}${MOLE_TAGLINE}${NC}"$'\n'
+
+# The real banner is used: command substitution strips its trailing blank line,
+# so the separator has to come from the notice itself.
+out="$(render 'Update 9.8.7 available, run mo update')"
+[[ "$out" == *"${tagline}${line}"$'\n'"${line}Update 9.8.7 available, run ${GREEN}mo update${NC}"$'\n'"${line}"$'\n'"${line}Clean"* ]] || { printf '%q\n' "$out"; exit 1; }
+out="$(render 'New nightly commit abc1234 available, run mo update --nightly')"
+[[ "$out" == *"${tagline}${line}"$'\n'"${line}New nightly commit abc1234 available, run ${GREEN}mo update --nightly${NC}"$'\n'"${line}"$'\n'"${line}Clean"* ]] || { printf '%q\n' "$out"; exit 1; }
+
+# Control: without a notice no extra rows appear between banner and options.
+out="$(render '')"
+[[ "$out" == *"${tagline}${line}"$'\n'"${line}Clean"* ]] || { printf '%q\n' "$out"; exit 1; }
+
+# Rendering must not rewrite the stored text: the idle refresh compares it
+# against the plain cache contents on every tick.
+MAIN_MENU_BANNER=""
+MAIN_MENU_UPDATE_MESSAGE='Update 9.8.7 available, run mo update'
+show_main_menu 1 true > /dev/null
+[[ "$MAIN_MENU_UPDATE_MESSAGE" == 'Update 9.8.7 available, run mo update' ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 @test "interactive_main_menu ignores U shortcut when update notice is hidden" {
@@ -325,7 +454,7 @@ touch -t 200001010000 "$msg_cache"
 source "$PROJECT_ROOT/mole"
 message="$(read_update_message_cache "$msg_cache")"
 [[ -z "$message" ]] || exit 1
-[[ ! -s "$msg_cache" ]] || exit 1
+[[ -s "$msg_cache" ]] || exit 1
 EOF
 
 	[ "$status" -eq 0 ]
@@ -353,6 +482,49 @@ EOF
 	[[ "$output" == *"UPDATE_CALLED"* ]]
 }
 
+@test "interactive_main_menu quits on EOF but keeps running through idle ticks" {
+	# The body runs from a file: Bash 3.2 misreads a script fed on stdin once a
+	# function returns from inside a loop here, replaying the tail of a comment.
+	cat > "$BATS_TEST_TMPDIR/menu-eof.sh" <<'EOF'
+set -euo pipefail
+HOME="$(mktemp -d)"
+export HOME PROJECT_ROOT MOLE_TEST_MODE=1 MOLE_SKIP_MAIN=1
+script='source "$PROJECT_ROOT/mole"; show_main_menu() { :; }; hide_cursor() { :; }; show_cursor() { :; }; drain_pending_input() { :; }; interactive_main_menu'
+
+# Wait up to eight seconds for the background menu; a menu that is still alive
+# is killed and reported so a spinning loop cannot hang the suite.
+wait_for_menu() {
+    local pid="$1" _
+    for _ in $(seq 1 80); do
+        kill -0 "$pid" 2> /dev/null || return 0
+        sleep 0.1
+    done
+    kill -KILL "$pid" 2> /dev/null || true
+    wait "$pid" 2> /dev/null || true
+    return 1
+}
+
+# read_key tells an idle one-second tick from EOF only by elapsed time, and the
+# two need opposite handling: EOF must quit, a tick must keep the menu alive.
+/bin/bash --noprofile --norc -c "$script" < /dev/null > /dev/null 2>&1 &
+pid=$!
+wait_for_menu "$pid" || { echo "menu kept running after EOF"; exit 1; }
+wait "$pid" || { echo "menu exited non-zero on EOF"; exit 1; }
+
+# Control: stdin that stays open and idle for three seconds is not EOF, so the
+# menu must still be there after two idle ticks and quit once the pipe closes.
+/bin/bash --noprofile --norc -c "$script" < <(sleep 3) > /dev/null 2>&1 &
+pid=$!
+sleep 2
+kill -0 "$pid" 2> /dev/null || { echo "menu quit during an idle tick"; exit 1; }
+wait_for_menu "$pid" || { echo "menu kept running after the idle pipe closed"; exit 1; }
+wait "$pid" || { echo "menu exited non-zero after the idle pipe closed"; exit 1; }
+EOF
+
+	run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc "$BATS_TEST_TMPDIR/menu-eof.sh"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
 @test "interactive_main_menu drains numeric shortcut Enter before launching uninstall" {
 	run /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -364,7 +536,9 @@ fake_root="$HOME/fake-mole"
 mkdir -p "$fake_root/bin"
 cat > "$fake_root/bin/uninstall.sh" <<'SCRIPT'
 #!/usr/bin/env bash
-if IFS= read -r -s -n1 -t 0.1 key; then
+# Use an integer timeout: macOS Bash 3.2 rejects fractional values, which
+# would report NO_LEAK without checking whether Enter remained on stdin.
+if IFS= read -r -s -n1 -t 1 key; then
     if [[ -z "$key" ]]; then
         echo "LEAK:ENTER"
     else
@@ -465,14 +639,14 @@ EOF
 	real_root="$(mktemp -d "$HOME/ext-real.XXXXXX")"
 	link_root="$HOME/ext-link"
 	ln -s "$real_root" "$link_root"
-	mkdir -p "$link_root/USB/.Trashes"
-	touch "$link_root/USB/.Trashes/cache.tmp"
+	mkdir -p "$link_root/USB/.TemporaryItems"
+	touch "$link_root/USB/.TemporaryItems/staged"
 
 	mock_bin="$HOME/mock-bin"
 	mkdir -p "$mock_bin"
 	cat > "$mock_bin/diskutil" <<'EOF'
 #!/usr/bin/env bash
-exit 0
+printf '%s\n' '<plist version="1.0"><dict><key>Internal</key><false/><key>BusProtocol</key><string>USB</string></dict></plist>'
 EOF
 	chmod +x "$mock_bin/diskutil"
 
@@ -489,7 +663,7 @@ EOF
 auth       sufficient     pam_opendirectory.so
 EOF
 
-	run env MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" status
+	run env MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" status
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"not configured"* ]] || return 1
 
@@ -497,7 +671,7 @@ EOF
 auth       sufficient     pam_tid.so
 EOF
 
-	run env MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" status
+	run env MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" status
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"enabled"* ]]
 }
@@ -511,7 +685,7 @@ EOF
 	fake_bin="$HOME/fake-bin"
 	create_fake_utils "$fake_bin"
 
-	run env PATH="$fake_bin:$PATH" MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" enable
+	run env PATH="$fake_bin:$PATH" MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" enable
 	[ "$status" -eq 0 ]
 	grep -q "pam_tid.so" "$pam_file"
 	[[ -f "${pam_file}.mole-backup" ]]
@@ -527,10 +701,30 @@ EOF
 	fake_bin="$HOME/fake-bin-disable"
 	create_fake_utils "$fake_bin"
 
-	run env PATH="$fake_bin:$PATH" MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" disable
+	run env PATH="$fake_bin:$PATH" MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" disable
 	[ "$status" -eq 0 ]
 	run grep "pam_tid.so" "$pam_file"
 	[ "$status" -ne 0 ]
+}
+
+@test "touchid enable and disable each leave an operations.log row" {
+	pam_file="$HOME/pam_logged"
+	cat >"$pam_file" <<'EOF'
+auth       sufficient     pam_opendirectory.so
+EOF
+	rm -f "$HOME/Library/Logs/mole/operations.log"
+
+	fake_bin="$HOME/fake-bin-logged"
+	create_fake_utils "$fake_bin"
+
+	run env HOME="$HOME" PATH="$fake_bin:$PATH" MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" enable
+	[ "$status" -eq 0 ]
+	run env HOME="$HOME" PATH="$fake_bin:$PATH" MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" disable
+	[ "$status" -eq 0 ]
+
+	run cat "$HOME/Library/Logs/mole/operations.log"
+	[[ "$output" == *"[touchid] REBUILT $pam_file (touchid enabled)"* ]] || return 1
+	[[ "$output" == *"[touchid] REBUILT $pam_file (touchid disabled)"* ]] || return 1
 }
 
 @test "touchid enable --dry-run does not modify pam file" {
@@ -539,7 +733,7 @@ EOF
 auth       sufficient     pam_opendirectory.so
 EOF
 
-	run env MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" enable --dry-run
+	run env MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" enable --dry-run
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"DRY RUN MODE"* ]] || return 1
 
@@ -556,12 +750,12 @@ EOF
 	fake_bin="$HOME/fake-bin-perms-enable"
 	create_fake_utils "$fake_bin"
 
-	run env PATH="$fake_bin:$PATH" MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" enable
+	run env PATH="$fake_bin:$PATH" MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" enable
 	[ "$status" -eq 0 ]
 	grep -q "pam_tid.so" "$pam_file"
 
 	local perms
-	perms=$(stat -f "%Lp" "$pam_file" 2>/dev/null || stat -c "%a" "$pam_file" 2>/dev/null)
+	perms=$(/usr/bin/stat -f "%Lp" "$pam_file" 2>/dev/null || stat -c "%a" "$pam_file" 2>/dev/null)
 	[ "$perms" = "444" ]
 }
 
@@ -575,11 +769,11 @@ EOF
 	fake_bin="$HOME/fake-bin-perms-disable"
 	create_fake_utils "$fake_bin"
 
-	run env PATH="$fake_bin:$PATH" MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" disable
+	run env PATH="$fake_bin:$PATH" MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" "$PROJECT_ROOT/bin/touchid.sh" disable
 	[ "$status" -eq 0 ]
 
 	local perms
-	perms=$(stat -f "%Lp" "$pam_file" 2>/dev/null || stat -c "%a" "$pam_file" 2>/dev/null)
+	perms=$(/usr/bin/stat -f "%Lp" "$pam_file" 2>/dev/null || stat -c "%a" "$pam_file" 2>/dev/null)
 	[ "$perms" = "444" ]
 }
 
@@ -596,15 +790,74 @@ EOF
 	create_fake_utils "$fake_bin"
 
 	run env PATH="$fake_bin:$PATH" \
-		MOLE_PAM_SUDO_FILE="$pam_file" \
+		MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" \
 		MOLE_PAM_SUDO_LOCAL_FILE="$pam_local" \
 		"$PROJECT_ROOT/bin/touchid.sh" enable
 	[ "$status" -eq 0 ]
 	grep -q "pam_tid.so" "$pam_local"
 
 	local perms
-	perms=$(stat -f "%Lp" "$pam_local" 2>/dev/null || stat -c "%a" "$pam_local" 2>/dev/null)
+	perms=$(/usr/bin/stat -f "%Lp" "$pam_local" 2>/dev/null || stat -c "%a" "$pam_local" 2>/dev/null)
 	[ "$perms" = "444" ]
+}
+
+@test "touchid enables the line sudo_local.template ships commented out (#1815)" {
+	pam_file="$HOME/pam_template_copy"
+	pam_local="$(dirname "$pam_file")/sudo_local_template_copy"
+	cat >"$pam_file" <<'EOF'
+# sudo: auth account password session
+auth       include        sudo_local
+auth       sufficient     pam_opendirectory.so
+EOF
+	# A copy of /etc/pam.d/sudo_local.template as macOS ships it.
+	cat >"$pam_local" <<'EOF'
+# sudo_local: local config file which survives system update and is included for sudo
+# uncomment following line to enable Touch ID for sudo
+#auth       sufficient     pam_tid.so
+EOF
+
+	run env MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" \
+		MOLE_PAM_SUDO_LOCAL_FILE="$pam_local" "$PROJECT_ROOT/bin/touchid.sh" status
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"not configured"* ]] || return 1
+
+	fake_bin="$HOME/fake-bin-template-copy"
+	create_fake_utils "$fake_bin"
+
+	run env PATH="$fake_bin:$PATH" MOLE_TEST_MODE=1 \
+		MOLE_PAM_SUDO_FILE="$pam_file" \
+		MOLE_PAM_SUDO_LOCAL_FILE="$pam_local" \
+		"$PROJECT_ROOT/bin/touchid.sh" enable
+	[ "$status" -eq 0 ]
+	[[ "$output" != *"already enabled"* ]] || return 1
+	grep -q '^auth[[:space:]]*sufficient[[:space:]]*pam_tid\.so' "$pam_local"
+}
+
+@test "touchid menu cancels on closed input (#1839)" {
+	pam_file="$HOME/fake-sudo-pam-eof"
+	pam_local="$HOME/fake-sudo-local-eof"
+	cat >"$pam_file" <<'EOF'
+# sudo: auth account password session
+auth       sufficient     pam_opendirectory.so
+EOF
+	cat >"$pam_local" <<'EOF'
+# sudo_local: local config file
+EOF
+
+	# Unconfigured state (enable prompt) refuses EOF
+	run env MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" \
+		MOLE_PAM_SUDO_LOCAL_FILE="$pam_local" \
+		/bin/bash -c "\"$PROJECT_ROOT/bin/touchid.sh\" </dev/null"
+	[ "$status" -ne 0 ]
+	! grep -q "pam_tid.so" "$pam_local" || return 1
+
+	# Configured state (disable prompt) refuses EOF
+	printf 'auth       sufficient     pam_tid.so\n' >> "$pam_local"
+	run env MOLE_TEST_MODE=1 MOLE_PAM_SUDO_FILE="$pam_file" \
+		MOLE_PAM_SUDO_LOCAL_FILE="$pam_local" \
+		/bin/bash -c "\"$PROJECT_ROOT/bin/touchid.sh\" </dev/null"
+	[ "$status" -ne 0 ]
+	grep -q "pam_tid.so" "$pam_local"
 }
 
 # --- JSON output mode tests ---
@@ -798,4 +1051,16 @@ PY
         run /bin/bash -c "${prefix//\$EUID/501}"
         [ "$status" -eq 0 ] || return 1
     done
+}
+
+@test "interactive terminal contract: menu restore, update notice wrapper and signals (PTY)" {
+	command -v python3 >/dev/null 2>&1 || skip "python3 not available"
+	run python3 "$PROJECT_ROOT/tests/main_menu_pty.py"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "e2e harness keeps failed prerequisites from authorizing later mutations" {
+	command -v python3 >/dev/null 2>&1 || skip "python3 not available"
+	run env MOLE_TEST_NO_AUTH=1 PYTHONDONTWRITEBYTECODE=1 python3 "$PROJECT_ROOT/tests/e2e_harness_test.py"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }

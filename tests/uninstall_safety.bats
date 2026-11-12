@@ -81,6 +81,80 @@ EOF
 	[[ "$output" != *"$agents/com.example.Target.outside.plist"* ]] || return 1
 }
 
+@test "uninstall preserves shared engine roots while keeping exact app caches" {
+    mkdir -p "$HOME/Library/Unity" "$HOME/Library/Application Support/Epic"
+    mkdir -p "$HOME/Library/Caches/com.unity3d.UnityEditor5.x"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+MOLE_UNINSTALL_MODE=1 should_protect_path "$HOME/Library/Unity" || exit 1
+MOLE_UNINSTALL_MODE=1 should_protect_path "$HOME/Library/Application Support/Epic" || exit 1
+find_app_files "com.unity3d.UnityEditor5.x" "Unity"
+find_app_files "com.epicgames.UnrealEditor" "Unreal Editor"
+EOF
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"$HOME/Library/Unity"* ]] || return 1
+    [[ "$output" != *"$HOME/Library/Application Support/Epic"* ]] || return 1
+    [[ "$output" == *"$HOME/Library/Caches/com.unity3d.UnityEditor5.x"* ]] || return 1
+}
+
+@test "uninstall never offers the Steam library root or anything inside it" {
+    steam="$HOME/Library/Application Support/Steam"
+    mkdir -p "$steam/steamapps/common/Portal 2" "$steam/userdata/42"
+    touch "$steam/steamapps/common/Portal 2/game.bin"
+    mkdir -p "$HOME/Library/Caches/com.valvesoftware.steam"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+steam="$HOME/Library/Application Support/Steam"
+for p in "$steam" "$steam/" "$steam/steamapps/common/Portal 2" "$steam/userdata/42" \
+    "$HOME/Library/Application Support/steam"; do
+    MOLE_UNINSTALL_MODE=1 should_protect_path "$p" || { echo "unprotected: $p"; exit 1; }
+done
+# Exact root only: a similarly named sibling and Steam's own cache stay eligible.
+if MOLE_UNINSTALL_MODE=1 should_protect_path "$HOME/Library/Application Support/SteamCompanion"; then
+    echo "too broad"
+    exit 1
+fi
+if MOLE_UNINSTALL_MODE=1 should_protect_path "$HOME/Library/Caches/com.valvesoftware.steam"; then
+    echo "cache protected"
+    exit 1
+fi
+# mo clean still reaches the rebuildable caches inside the root.
+if should_protect_path "$steam/htmlcache/entry"; then
+    echo "clean cache blocked"
+    exit 1
+fi
+echo "---"
+find_app_files "com.valvesoftware.steam" "Steam"
+# A Steam-managed game bundle that resolves to the same name must not reach it either.
+find_app_files "com.example.SteamGame" "Steam"
+EOF
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" != *"$HOME/Library/Application Support/Steam"* ]] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == *"$HOME/Library/Caches/com.valvesoftware.steam"* ]] || return 1
+}
+
+@test "versioned IDE leftovers exclude similarly named products and backups" {
+    for leaf in PyCharm2026.2 PyCharmTools PyCharm2026.2-backup; do
+        mkdir -p "$HOME/Library/Caches/JetBrains/$leaf"
+    done
+    for leaf in AndroidStudio2026.1 AndroidStudioTools AndroidStudio2026.1-backup; do
+        mkdir -p "$HOME/Library/Application Support/Google/$leaf"
+    done
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+find_app_files "com.jetbrains.pycharm" "PyCharm"
+find_app_files "com.google.android.studio" "Android Studio"
+EOF
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"/PyCharm2026.2"* ]] || return 1
+    [[ "$output" == *"/AndroidStudio2026.1"* ]] || return 1
+    [[ "$output" != *"Tools"* ]] || return 1
+    [[ "$output" != *"-backup"* ]] || return 1
+}
+
 @test "find_app_files preserves Android Studio project source and credentials" {
 	mkdir -p "$HOME/AndroidStudioProjects/my-app"
 	mkdir -p "$HOME/.android/avd/Pixel_5.avd"
@@ -146,6 +220,20 @@ EOF
 	[[ "$result" == *"Jamf"* ]] || { echo "missed Jamf"; exit 1; }
 }
 
+@test "official uninstaller vendor covers AliEntSafe and leaves other Alibaba apps ordinary" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -uo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+printf 'ALIENTSAFE=%s\n' "$(official_uninstaller_vendor "com.alibaba.security.AliEntSafe" "AliEntSafe" "/Applications/AliEntSafe.app" || echo none)"
+printf 'DINGTALK=%s\n' "$(official_uninstaller_vendor "com.alibaba.DingTalkMac" "DingTalk" "/Applications/DingTalk.app" || echo none)"
+printf 'ALIYUN=%s\n' "$(official_uninstaller_vendor "com.alibaba.aliyun.drive" "AliyunDrive" "/Applications/AliyunDrive.app" || echo none)"
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"ALIENTSAFE=Alibaba Cloud Security"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"DINGTALK=none"* ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"ALIYUN=none"* ]] || { echo "$output"; return 1; }
+}
+
 @test "receipt payload allowlist rejects broad system roots" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -159,6 +247,57 @@ receipt_payload_path_is_allowlisted "/Library/PrivilegedHelperTools/com.example.
 EOF
 
 	[ "$status" -eq 0 ]
+}
+
+@test "uninstall teardown logs each launchd, login item and Dock change it made" {
+	mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Preferences"
+	touch "$HOME/Library/LaunchAgents/com.example.foo.plist"
+	local dock="$HOME/Library/Preferences/com.apple.dock.plist"
+	/usr/libexec/PlistBuddy -c "Add :persistent-apps array" \
+		-c "Add :persistent-apps:0:tile-type string file-tile" \
+		-c "Add :persistent-apps:0:tile-data:bundle-identifier string com.example.gone" \
+		-c "Add :persistent-apps:0:tile-data:file-data:_CFURLString string file:///Applications/Gone.app/" \
+		"$dock" > /dev/null
+
+	run env -u MOLE_TEST_MODE -u MOLE_TEST_NO_AUTH HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() {
+	if [[ "$2" == shasum ]]; then
+		shift 2
+		shasum "$@"
+		return $?
+	fi
+	shift
+	case "$1" in
+		launchctl) return 0 ;;
+		osascript)
+			cat > /dev/null
+			printf '1\n'
+			;;
+		*) return 97 ;;
+	esac
+}
+killall() { :; }
+export MOLE_CURRENT_COMMAND=uninstall
+rm -f "$OPERATIONS_LOG_FILE"
+unload_launch_plist "$HOME/Library/LaunchAgents/com.example.foo.plist" false "" com.example.foo
+bootout_login_item_helpers "com.example.foo.LoginHelper"
+remove_login_item "Gone.app" com.example.gone
+remove_apps_from_dock "/Applications/Gone.app|com.example.gone"
+cat "$OPERATIONS_LOG_FILE"
+EOF
+
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+	[[ "$output" == *"[uninstall] REMOVED $HOME/Library/LaunchAgents/com.example.foo.plist (launchctl unload)"* ]] || return 1
+	[[ "$output" == *"[uninstall] REMOVED gui/$(id -u)/com.example.foo.LoginHelper (launchctl bootout)"* ]] || return 1
+	[[ "$output" == *"[uninstall] REMOVED Gone (login item)"* ]] || return 1
+	[[ "$output" == *"[uninstall] REMOVED /Applications/Gone.app (dock entry)"* ]] || return 1
 }
 
 @test "launch plist unload validates path and uses timeout" {
@@ -398,6 +537,7 @@ EOF
 @test "find_app_files preserves Xcode user data and only collects regenerable caches" {
 	mkdir -p "$HOME/Library/Developer/Xcode/DerivedData/MyApp-abc/Build"
 	mkdir -p "$HOME/Library/Developer/Xcode/iOS DeviceSupport/17.0"
+	mkdir -p "$HOME/Library/Developer/Xcode/visionOS DeviceSupport/1.0"
 	mkdir -p "$HOME/Library/Developer/Xcode/Archives/2026/03/MyApp.xcarchive"
 	mkdir -p "$HOME/Library/Developer/Xcode/UserData"
 	mkdir -p "$HOME/Library/Developer/Toolchains/swift-6.0.xctoolchain"
@@ -425,6 +565,7 @@ EOF
 
 	[[ "$result" == *"/Library/Developer/Xcode/DerivedData"* ]] || { echo "missed DerivedData cache"; exit 1; }
 	[[ "$result" == *"/Library/Developer/Xcode/iOS DeviceSupport"* ]] || { echo "missed iOS DeviceSupport"; exit 1; }
+	[[ "$result" == *"/Library/Developer/Xcode/visionOS DeviceSupport"* ]] || { echo "missed visionOS DeviceSupport"; exit 1; }
 	[[ "$result" == *"/Library/Developer/CoreSimulator/Caches"* ]] || { echo "missed simulator caches"; exit 1; }
 }
 
@@ -436,8 +577,10 @@ EOF
 	mkdir -p "$HOME/Library/Huawei/SDK"
 	mkdir -p "$HOME/.huawei/AppGallery"
 	mkdir -p "$HOME/.ohos/sdk"
-	mkdir -p "$HOME/Library/Caches/Huawei"
-	mkdir -p "$HOME/Library/Logs/Huawei"
+	mkdir -p "$HOME/Library/Caches/Huawei/DevEcoStudio5.0"
+	mkdir -p "$HOME/Library/Logs/Huawei/DevEcoStudio5.0"
+	mkdir -p "$HOME/Library/Caches/Huawei/HiSuite"
+	mkdir -p "$HOME/Library/Logs/Huawei/HiSuite"
 
 	result="$(
 		HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
@@ -454,8 +597,35 @@ EOF
 	[[ "$result" != *"$HOME/Library/Huawei"* ]] || { echo "leaked Huawei SDK tree"; exit 1; }
 	[[ "$result" != *"$HOME/.huawei"* ]] || { echo "leaked Huawei account state"; exit 1; }
 	[[ "$result" != *"$HOME/.ohos"* ]] || { echo "leaked OHOS SDK config"; exit 1; }
-	[[ "$result" == *"Caches/Huawei"* ]] || { echo "missed Huawei cache"; exit 1; }
-	[[ "$result" == *"Logs/Huawei"* ]] || { echo "missed Huawei logs"; exit 1; }
+	[[ "$result" == *"Caches/Huawei/DevEcoStudio5.0"* ]] || { echo "missed DevEco cache"; exit 1; }
+	[[ "$result" == *"Logs/Huawei/DevEcoStudio5.0"* ]] || { echo "missed DevEco logs"; exit 1; }
+	# The Huawei roots are shared with other Huawei products.
+	[[ $'\n'"$result"$'\n' != *$'\n'"$HOME/Library/Caches/Huawei"$'\n'* ]] || { echo "took shared Huawei cache root"; exit 1; }
+	[[ $'\n'"$result"$'\n' != *$'\n'"$HOME/Library/Logs/Huawei"$'\n'* ]] || { echo "took shared Huawei log root"; exit 1; }
+	[[ "$result" != *"HiSuite"* ]] || { echo "took another Huawei product"; exit 1; }
+}
+
+@test "uninstall keeps cache-resident user data out of automatic removal" {
+	# Raycast keeps clipboard-history images, Mullvad Browser its profile root
+	# and Buzz its Whisper models, plugins and user CSS under ~/Library/Caches;
+	# all become opt-in rows like Spotify.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/review.sh"
+for kept in \
+    "$HOME/Library/Caches/com.raycast.macos" \
+    "$HOME/Library/Caches/com.raycast.macos/Clipboard" \
+    "$HOME/Library/Caches/MullvadBrowser" \
+    "$HOME/Library/Caches/Buzz" \
+    "$HOME/Library/Caches/Buzz/models" \
+    "$HOME/Library/Caches/com.spotify.client"; do
+    if _uninstall_disposable_leftover "$kept"; then echo "automatic: $kept"; exit 1; fi
+done
+_uninstall_disposable_leftover "$HOME/Library/Caches/com.example.app" || exit 1
+_uninstall_disposable_leftover "$HOME/Library/Caches/com.raycast.macosx" || exit 1
+_uninstall_disposable_leftover "$HOME/Library/Caches/Buzzword" || exit 1
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 @test "find_app_files rejects bundle ids with glob metacharacters" {
@@ -539,21 +709,28 @@ EOF
 	[[ "$result" != *"TestApplication"* ]] || { echo "matched sibling bundle prefix"; printf '%s\n' "$result"; exit 1; }
 }
 
-@test "ByHost cleanup routes through user-mode mole_delete (no sudo prompt)" {
-	mkdir -p "$HOME/Library/Preferences/ByHost"
-	touch "$HOME/Library/Preferences/ByHost/com.example.TestApp.ABC123.plist"
-	mkdir -p "$HOME/Applications/TestApp.app"
+@test "selected ByHost cleanup routes through user-mode mole_delete (no sudo prompt)" {
+	local fixture_home
+	fixture_home=$(mktemp -d "$HOME/inventory-fixture.XXXXXX")
+	mkdir -p "$fixture_home/Library/Preferences/ByHost"
+	touch "$fixture_home/Library/Preferences/ByHost/com.example.TestApp.ABC123.plist"
+	mkdir -p "$fixture_home/Applications/TestApp.app"
 
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+	run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 # Homebrew is present but owns no cask; the real brew is never consulted.
 brew() { :; }
 
 trace="$HOME/mole_delete.log"
 mole_delete() {
 	printf '%s|%s\n' "$1" "${2:-false}" >> "$trace"
+	if [[ "$1" == "$app_bundle" ]]; then
+		mv "$app_bundle" "$HOME/removed-app-fixture"
+	fi
 	return 0
 }
 request_sudo_access() { return 0; }
@@ -579,7 +756,9 @@ files_cleaned=0
 total_items=0
 total_size_cleaned=0
 
-printf '\n' | batch_uninstall_applications
+drain_pending_input() { :; }
+paginated_multi_select() { MOLE_SELECTION_RESULT=0; }
+printf 'd\n' | MOLE_TEST_MODE=1 batch_uninstall_applications
 
 if grep -q "ByHost.*com.example.TestApp.*plist|true" "$trace"; then
 	echo "ByHost plist routed through sudo mole_delete"
@@ -588,9 +767,13 @@ if grep -q "ByHost.*com.example.TestApp.*plist|true" "$trace"; then
 fi
 
 grep -q "ByHost.*com.example.TestApp.*plist|false" "$trace"
+[[ $(wc -l < "$HOME/inventory.trace") -ge 2 ]] || exit 1
 EOF
 
-	[ "$status" -eq 0 ]
+	[ "$status" -eq 0 ] || {
+		printf 'exit status: %s\n%s\n' "$status" "$output"
+		return 1
+	}
 }
 
 @test "malformed bundle ids do not trigger defaults or ByHost side effects" {
@@ -641,7 +824,7 @@ for bad_id in "-g" "NSGlobalDomain" "com-example"; do
 	total_items=0
 	total_size_cleaned=0
 
-	batch_uninstall_applications </dev/null
+	MOLE_TEST_MODE=1 batch_uninstall_applications </dev/null
 
 	if grep -q '^defaults:' "$trace" || grep -q 'ByHost' "$trace"; then
 		echo "unexpected domain cleanup side effect for $bad_id"
@@ -937,4 +1120,904 @@ EOF
 		echo "gate missing the empty-plan check"
 		return 1
 	}
+}
+
+@test "protection pattern loops match globs inline, without a per-pattern call" {
+	# should_protect_path and should_protect_data run once per candidate across
+	# hundreds of patterns, so each loop tests the glob inline instead of
+	# calling bundle_matches_pattern. The verdicts pin that the unquoted RHS
+	# is still a glob: quoting it would turn a wildcard row such as
+	# *wireguard* into an exact-string match and drop the protection.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+calls="$HOME/bundle-match-calls"
+: >"$calls"
+bundle_matches_pattern() {
+    printf '.' >>"$calls"
+    [[ -z "$2" ]] && return 1
+    # shellcheck disable=SC2053 # unquoted RHS is the glob
+    [[ "$1" == $2 ]]
+}
+verdict() { if "$@"; then echo "$*=protected"; else echo "$*=open"; fi; }
+verdict should_protect_data "com.sogou.inputmethod.pinyin"
+verdict should_protect_data "com.sogou.cloud"
+verdict should_protect_data "im.rime.squirrel"
+verdict should_protect_data "org.example.wireguard-ui"
+verdict should_protect_data "org.example.plain"
+verdict should_protect_data "com.utmapp.UTM"
+verdict should_protect_path "$HOME/Library/Containers/com.utmapp.UTM"
+verdict should_protect_path "$HOME/Library/Caches/org.example.wireguard-ui/data"
+verdict should_protect_path "$HOME/Library/Caches/org.example.plain/data"
+MOLE_UNINSTALL_MODE=1 verdict should_protect_path "com.apple.loginitems.agent"
+MOLE_UNINSTALL_MODE=1 verdict should_protect_path "$HOME/Library/Caches/org.example.plain/data"
+echo "calls=$(wc -c <"$calls" | tr -d ' ')"
+EOF
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"should_protect_data com.sogou.inputmethod.pinyin=protected"* ]] || return 1
+	[[ "$output" == *"should_protect_data com.sogou.cloud=open"* ]] || return 1
+	[[ "$output" == *"should_protect_data im.rime.squirrel=protected"* ]] || return 1
+	[[ "$output" == *"should_protect_data org.example.wireguard-ui=protected"* ]] || return 1
+	[[ "$output" == *"should_protect_data org.example.plain=open"* ]] || return 1
+	[[ "$output" == *"should_protect_data com.utmapp.UTM=protected"* ]] || return 1
+	[[ "$output" == *"$HOME/Library/Containers/com.utmapp.UTM=protected"* ]] || return 1
+	[[ "$output" == *"org.example.wireguard-ui/data=protected"* ]] || return 1
+	[[ "$output" == *"should_protect_path com.apple.loginitems.agent=protected"* ]] || return 1
+	[[ "$output" == *"org.example.plain/data=open"*"org.example.plain/data=open"* ]] || return 1
+	[[ "${lines[${#lines[@]} - 1]}" == "calls=0" ]]
+}
+
+@test "uninstall mode matches the Apple uninstallable globs before the critical rows" {
+	# With the shipped lists no bundle ID is in both APPLE_UNINSTALLABLE_APPS
+	# and SYSTEM_CRITICAL_BUNDLES, so the first loop's verdict equals the
+	# fall-through and quoting its right-hand side would change nothing
+	# observable. A fixture critical row that overlaps com.apple.dt.* makes the
+	# order visible: the unquoted glob wins and Xcode stays uninstallable,
+	# while a quoted one is an exact string, misses, and lets the critical
+	# row protect it.
+	local fixture="$HOME/protection-order-fixture"
+	mkdir -p "$fixture"
+	cp -R "$PROJECT_ROOT/lib" "$PROJECT_ROOT/bin" "$fixture/"
+	awk '{ print } /^readonly SYSTEM_CRITICAL_BUNDLES=\($/ { print "    \"com.apple.dt.*\""; print "    \"org.example.critical.*\"" }' \
+		"$PROJECT_ROOT/lib/core/app_protection_data.sh" >"$fixture/lib/core/app_protection_data.sh"
+
+	run env HOME="$HOME" FIXTURE="$fixture" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+source "$FIXTURE/lib/core/common.sh"
+verdict() { if "$@"; then echo "$*=protected"; else echo "$*=open"; fi; }
+MOLE_UNINSTALL_MODE=1 verdict should_protect_path "org.example.critical.Tool"
+MOLE_UNINSTALL_MODE=1 verdict should_protect_path "com.apple.dt.Xcode"
+MOLE_UNINSTALL_MODE=1 verdict should_protect_path "com.apple.finder"
+EOF
+	[ "$status" -eq 0 ] || return 1
+	# Positive controls: the fixture row is live in uninstall mode, and a
+	# critical ID outside the uninstallable list is still protected.
+	[[ "$output" == *"should_protect_path org.example.critical.Tool=protected"* ]] || return 1
+	[[ "$output" == *"should_protect_path com.apple.finder=protected"* ]] || return 1
+	[[ "$output" == *"should_protect_path com.apple.dt.Xcode=open"* ]]
+}
+
+@test "live uninstall inventory treats independent longer bundle IDs as shared owners" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/IntelliJ IDEA.app"
+other="$HOME/Applications/Community.app"
+mkdir -p "$selected/Contents" "$other/Contents"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellij.ce</string></dict></plist>' > "$other/Contents/Info.plist"
+rc=0
+uninstall_live_bundle_has_other_install com.jetbrains.intellij "$selected" || rc=$?
+printf 'LONGER_OWNER_RC=%s\n' "$rc"
+[[ $rc -eq 0 && -n "$_MOLE_UNINSTALL_LIVE_SIBLING_FINGERPRINT" ]] || exit 1
+# A textual neighbour is not an owner. Nested helpers still belong to the
+# selected app and must not make every extension-bearing app unremovable.
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellix.ce</string></dict></plist>' > "$other/Contents/Info.plist"
+mkdir -p "$selected/Contents/Helper.app/Contents"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellij.helper</string></dict></plist>' > "$selected/Contents/Helper.app/Contents/Info.plist"
+rc=0
+uninstall_live_bundle_has_other_install com.jetbrains.intellij "$selected" || rc=$?
+printf 'UNRELATED_AND_EMBEDDED_RC=%s\n' "$rc"
+[[ $rc -eq 1 ]] || exit 1
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "live uninstall inventory protects stable data while removing a differently identified channel" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/Zed Nightly.app"
+other="$HOME/Applications/Zed.app"
+mkdir -p "$selected/Contents" "$other/Contents" "$HOME/.config/zed"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>dev.zed.Zed</string></dict></plist>' > "$other/Contents/Info.plist"
+rc=0
+uninstall_live_bundle_has_other_install dev.zed.Zed-Nightly "$selected" || rc=$?
+printf 'CHANNEL_OWNER_RC=%s\n' "$rc"
+[[ $rc -eq 0 && -n "$_MOLE_UNINSTALL_LIVE_SIBLING_FINGERPRINT" ]] || exit 1
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "leftover sink rechecks new sibling owners and unknown inventory after app removal" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 MOLE_UNINSTALL_MODE=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/IntelliJ IDEA.app"
+other="$HOME/Applications/Community.app"
+data="$HOME/Library/Containers/com.jetbrains.intellij.ce"
+mkdir -p "$HOME/Applications" "$data/Data/Documents"
+printf 'only copy\n' > "$data/Data/Documents/project"
+# Exercise the real caller and policy but replace the irreversible sink.
+mole_delete() { printf '%s\n' "$1" >> "$HOME/sink-attempts"; }
+# Preview proved absence; a sibling then appears while the selected app moves.
+rc=0
+uninstall_live_bundle_has_other_install com.jetbrains.intellij "$selected" || rc=$?
+[[ $rc -eq 1 ]] || exit 1
+mkdir -p "$other/Contents"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellij.ce</string></dict></plist>' > "$other/Contents/Info.plist"
+for mode in trash permanent; do
+    export MOLE_DELETE_MODE="$mode"
+    rc=0
+    remove_file_list "$data" false com.jetbrains.intellij "$selected" || rc=$?
+    [[ $rc -eq 16 && ! -e "$HOME/sink-attempts" ]] || exit 1
+done
+# An unreadable inventory also keeps the reviewed data.
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/unknown-root")
+ln -s "$HOME/Applications" "$HOME/unknown-root"
+rc=0
+remove_file_list "$data" false com.jetbrains.intellij "$selected" || rc=$?
+[[ $rc -eq 16 && ! -e "$HOME/sink-attempts" ]] || exit 1
+# Complete absence keeps normal deletion reachable, including extension data.
+mkdir -p "$HOME/empty-apps"
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/empty-apps")
+remove_file_list "$data" false com.jetbrains.intellij "$selected"
+[[ $(cat "$HOME/sink-attempts") == "$data" ]] || exit 1
+[[ -f "$data/Data/Documents/project" ]] || exit 1
+printf 'FRESH_OWNER_GATE_AND_ABSENCE_CONTROL_OK\n'
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "a new owner after the app move preserves defaults helpers and full container bytes" {
+    run env HOME="$HOME" MOLE_HAS_FDA=1 PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 MOLE_UNINSTALL_MODE=1 MOLE_DELETE_MODE=trash /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/IntelliJ IDEA.app"
+other="$HOME/Applications/Community.app"
+data="$HOME/Library/Containers/com.jetbrains.intellij.ce"
+mkdir -p "$selected/Contents" "$data/Data/Documents" "$HOME/Library/Preferences/ByHost"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellij</string></dict></plist>' > "$selected/Contents/Info.plist"
+printf 'container metadata\n' > "$data/.com.apple.containermanagerd.metadata.plist"
+printf 'only copy of document\n' > "$data/Data/Documents/project"
+printf 'preferences\n' > "$HOME/Library/Preferences/ByHost/com.jetbrains.intellij.ce.fixture.plist"
+retained_kb=$(du -skP "$data" | awk '{print $1}')
+encoded=$(printf '%s' "$data" | base64 | tr -d '\n')
+fields=(IDEA "$selected" com.jetbrains.intellij "$((1000 + retained_kb))" "$encoded" '' false false false '' '' '' '' none x com.jetbrains.intellij '' x)
+IFS='|' detail="${fields[*]}"; unset IFS
+app_details=("$detail")
+_batch_selected_app_plan_matches() { return 0; }
+stop_launch_services() { :; }
+unregister_app_bundle() { :; }
+remove_login_item() { :; }
+force_kill_app() { :; }
+stop_inline_spinner() { :; }
+defaults() { printf 'defaults:%s\n' "$*" >> "$HOME/forbidden"; }
+bootout_login_item_helpers() { printf 'helpers\n' >> "$HOME/forbidden"; }
+mole_delete() {
+    if [[ "$1" == "$selected" ]]; then
+        mv "$selected" "$HOME/removed-fixture.app"
+        mkdir -p "$other/Contents"
+        printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellij.ce</string></dict></plist>' > "$other/Contents/Info.plist"
+        return 0
+    fi
+    printf 'sink:%s\n' "$1" >> "$HOME/forbidden"
+}
+success_count=0 failed_count=0 brew_apps_removed=0 total_size_freed=0 files_cleaned=0 total_items=0
+failed_items=() success_items=() success_dock_targets=() system_extension_warning_apps=()
+review_only_system_leftovers=() review_only_system_leftover_keys=() running_at_uninstall_apps=()
+_batch_execute_removals
+printf 'SUCCESS=%s FREED_KB=%s\n' "$success_count" "$total_size_freed"
+[[ $success_count -eq 1 && $failed_count -eq 0 ]] || exit 1
+[[ ! -e "$HOME/forbidden" ]] || { cat "$HOME/forbidden"; exit 1; }
+[[ $total_size_freed -eq 1000 ]] || exit 1
+[[ -f "$data/Data/Documents/project" && -d "$other" ]] || exit 1
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "a container whose Trash move macOS denied is reported and not counted as freed" {
+    # A denied move leaves the whole container, metadata plist included. Only
+    # a root emptied down to that plist is a containermanagerd stub.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 MOLE_UNINSTALL_MODE=1 MOLE_DELETE_MODE=trash /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/Soda Music.app"
+data="$HOME/Library/Containers/com.soda.music"
+_batch_selected_app_plan_matches() { return 0; }
+stop_launch_services() { :; }
+unregister_app_bundle() { :; }
+remove_login_item() { :; }
+force_kill_app() { :; }
+stop_inline_spinner() { :; }
+bootout_login_item_helpers() { :; }
+for run in denied:1 emptied:1 denied:0 emptied:0; do
+    outcome="${run%:*}"
+    export MOLE_HAS_FDA="${run#*:}"
+    rm -rf "$data" "$HOME/removed-fixture.app"
+    mkdir -p "$selected/Contents" "$data/Data/Library/Application Support/SodaMusic/LunaCacheV2"
+    printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.soda.music</string></dict></plist>' > "$selected/Contents/Info.plist"
+    printf 'container metadata\n' > "$data/.com.apple.containermanagerd.metadata.plist"
+    head -c 65536 /dev/zero > "$data/Data/Library/Application Support/SodaMusic/LunaCacheV2/track"
+    container_kb=$(du -skP "$data" | awk '{print $1}')
+    # Without the grant the plan never measured the container.
+    [[ "$MOLE_HAS_FDA" == 1 ]] || container_kb=0
+    encoded=$(printf '%s' "$data" | base64 | tr -d '\n')
+    fields=(Soda "$selected" com.soda.music "$((1000 + container_kb))" "$encoded" '' false false false '' '' '' '' none x com.soda.music '' x)
+    IFS='|' detail="${fields[*]}"; unset IFS
+    app_details=("$detail")
+    mole_delete() {
+        if [[ "$1" == "$selected" ]]; then
+            mv "$selected" "$HOME/removed-fixture.app"
+            return 0
+        fi
+        if [[ "$outcome" == denied ]]; then
+            _mole_record_uninstall_refusal "$1" access-denied
+            return "$MOLE_ERR_PRIVACY_DENIED"
+        fi
+        rm -rf "$1/Data"
+    }
+    success_count=0 failed_count=0 brew_apps_removed=0 total_size_freed=0 files_cleaned=0 total_items=0
+    failed_items=() success_items=() success_dock_targets=() system_extension_warning_apps=()
+    review_only_system_leftovers=() review_only_system_leftover_keys=() running_at_uninstall_apps=()
+    _batch_execute_removals > "$HOME/removal-output" 2>&1
+    out=$(cat "$HOME/removal-output")
+    printf '%s FREED_KB=%s\n%s\n' "$outcome" "$total_size_freed" "$out"
+    if [[ "$outcome" == denied ]]; then
+        [[ "$out" == *"macOS denied access: ~/Library/Containers/com.soda.music"* ]] || exit 1
+        [[ $total_size_freed -eq 1000 ]] || exit 1
+    else
+        [[ "$out" != *"Library/Containers/com.soda.music"* ]] || exit 1
+        [[ $total_size_freed -eq $((1000 + container_kb)) ]] || exit 1
+    fi
+done
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "leftover sink keeps data when the selected app path is reinstalled" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 MOLE_UNINSTALL_MODE=1 MOLE_DELETE_MODE=permanent /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+app="$HOME/Applications/Target.app"
+data="$HOME/Library/Containers/com.example.Target"
+mkdir -p "$app/Contents" "$data"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.example.Target</string></dict></plist>' > "$app/Contents/Info.plist"
+mole_delete() { printf 'unexpected sink\n' > "$HOME/forbidden"; }
+rc=0
+remove_file_list "$data" false com.example.Target "$app" || rc=$?
+[[ ! -e "$HOME/forbidden" && $rc -eq 16 ]] || exit 1
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "sibling matching folds case in-process instead of forking per candidate" {
+    # The predicate runs once per installed app in every sibling scan, three
+    # scans per selected app. Two tr forks per id and per name made a
+    # 200-app Mac 2.6x slower than V1.58.0; the verdicts must stay identical.
+    local shim="$BATS_TEST_TMPDIR/shim"
+    mkdir -p "$shim"
+    # shellcheck disable=SC2016  # The shim expands $TR_COUNT_FILE and "$@" when it runs.
+    printf '#!/bin/bash\nprintf . >> "$TR_COUNT_FILE"\nexec /usr/bin/tr "$@"\n' > "$shim/tr"
+    chmod +x "$shim/tr"
+    run env HOME="$BATS_TEST_TMPDIR/home" PATH="$shim:$PATH" \
+        TR_COUNT_FILE="$BATS_TEST_TMPDIR/tr-count" PROJECT_ROOT="$PROJECT_ROOT" \
+        MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/Selected.app"
+mkdir -p "$selected/Contents"
+apps_data=()
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    app="$HOME/Applications/Vendor$i Tool.app"
+    mkdir -p "$app/Contents"
+    printf '<plist><dict><key>CFBundleIdentifier</key><string>com.Vendor%s.Tool</string></dict></plist>\n' "$i" > "$app/Contents/Info.plist"
+    apps_data+=("$i|$app|Vendor$i Tool|com.Vendor$i.Tool|0|Never|0")
+done
+verdict() { if uninstall_bundles_share_remnants "$2" "$3" "$4" "$5"; then echo "$1=shared"; else echo "$1=open"; fi; }
+: > "$TR_COUNT_FILE"
+verdict dot_continuation_any_case com.Foo.Bar com.foo.bar.PRO /A/Foo.app /A/Other.app
+verdict same_id_any_case com.Foo.Bar COM.FOO.BAR /A/Foo.app /A/Other.app
+verdict channel_name_any_case com.a.x com.b.y "/A/Zed Nightly.app" /A/ZED.app
+verdict suffix_strip_is_case_sensitive com.a.x com.b.y "/A/Zed nightly.app" /A/Zed.app
+verdict unrelated com.a.x com.b.y /A/Alpha.app /A/Beta.app
+verdict one_letter_names com.a.x com.b.y /A/X.app /A/x.app
+rc=0
+uninstall_live_bundle_has_other_install com.example.selected "$selected" || rc=$?
+echo "scan_rc=$rc"
+rc=0
+uninstall_bundle_id_has_surviving_sibling com.Example.Selected "$selected" || rc=$?
+echo "rows_rc=$rc"
+echo "names=[$(uninstall_surviving_sibling_names com.example.selected "$selected")]"
+forks=$(wc -c < "$TR_COUNT_FILE")
+echo "tr_execs=${forks//[[:space:]]/}"
+# Positive control: the same harness still finds a real sibling.
+mkdir -p "$HOME/Applications/Selected Pro.app/Contents"
+printf '<plist><dict><key>CFBundleIdentifier</key><string>com.example.selected.pro</string></dict></plist>\n' > "$HOME/Applications/Selected Pro.app/Contents/Info.plist"
+rc=0
+uninstall_live_bundle_has_other_install com.example.selected "$selected" || rc=$?
+echo "scan_with_sibling_rc=$rc"
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"dot_continuation_any_case=shared"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"same_id_any_case=shared"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"channel_name_any_case=shared"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"suffix_strip_is_case_sensitive=open"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"unrelated=open"* && "$output" == *"one_letter_names=open"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"scan_rc=1"* && "$output" == *"rows_rc=1"* && "$output" == *"names=[]"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"scan_with_sibling_rc=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"tr_execs=0"* ]] || { echo "$output"; return 1; }
+}
+
+@test "a retained leftover family names its cause once instead of per path" {
+    # After the app is already in the Trash the user cannot select it again,
+    # so the summary has to say why the data stayed. Three causes can retain a
+    # family: a live sibling, an inventory that could not prove absence, and a
+    # replacement at the selected path. Each gets its own label, once.
+    local scenario label
+    for scenario in shared unknown reappeared single; do
+        run env HOME="$BATS_TEST_TMPDIR/home-$scenario" PROJECT_ROOT="$PROJECT_ROOT" \
+            SCENARIO="$scenario" MOLE_TEST_NO_AUTH=1 MOLE_UNINSTALL_MODE=1 \
+            MOLE_DELETE_MODE=trash /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/IntelliJ IDEA.app"
+other="$HOME/Applications/Community.app"
+support="$HOME/Library/Application Support/IntelliJ"
+cache="$HOME/Library/Caches/com.jetbrains.intellij"
+prefs="$HOME/Library/Preferences/com.jetbrains.intellij.plist"
+mkdir -p "$selected/Contents" "$support" "$cache" "${prefs%/*}"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellij</string></dict></plist>' > "$selected/Contents/Info.plist"
+printf 'state\n' > "$support/state"
+printf 'cache\n' > "$cache/blob"
+printf 'prefs\n' > "$prefs"
+if [[ "$SCENARIO" == single ]]; then
+    planned=("$support")
+else
+    planned=("$support" "$cache" "$prefs")
+fi
+# Retained bytes are subtracted from the plan, so size the plan up front.
+retained_kb=$(du -skcP "${planned[@]}" | awk 'END {print $1}')
+encoded=$(printf '%s\n' "${planned[@]}" | base64 | tr -d '\n')
+fields=(IDEA "$selected" com.jetbrains.intellij "$((1000 + retained_kb))" "$encoded" '' false false false '' '' '' '' none x com.jetbrains.intellij '' x)
+IFS='|' detail="${fields[*]}"; unset IFS
+app_details=("$detail")
+_batch_selected_app_plan_matches() { return 0; }
+stop_launch_services() { :; }
+unregister_app_bundle() { :; }
+remove_login_item() { :; }
+force_kill_app() { :; }
+stop_inline_spinner() { :; }
+defaults() { printf 'defaults:%s\n' "$*" >> "$HOME/forbidden"; }
+bootout_login_item_helpers() { printf 'helpers\n' >> "$HOME/forbidden"; }
+mole_delete() {
+    if [[ "$1" == "$selected" ]]; then
+        mv "$selected" "$HOME/removed-fixture.app"
+        case "$SCENARIO" in
+            shared | single)
+                mkdir -p "$other/Contents"
+                printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellij.ce</string></dict></plist>' > "$other/Contents/Info.plist"
+                ;;
+            unknown)
+                ln -s "$HOME/Applications" "$HOME/unknown-root"
+                _MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/unknown-root")
+                ;;
+            reappeared) mkdir -p "$selected/Contents" ;;
+        esac
+        return 0
+    fi
+    printf 'sink:%s\n' "$1" >> "$HOME/forbidden"
+}
+success_count=0 failed_count=0 brew_apps_removed=0 total_size_freed=0 files_cleaned=0 total_items=0
+failed_items=() success_items=() success_dock_targets=() system_extension_warning_apps=()
+review_only_system_leftovers=() review_only_system_leftover_keys=() running_at_uninstall_apps=()
+_batch_execute_removals
+[[ $success_count -eq 1 && $failed_count -eq 0 ]] || exit 1
+[[ ! -e "$HOME/forbidden" ]] || { cat "$HOME/forbidden"; exit 1; }
+[[ -f "$support/state" ]] || exit 1
+printf 'FREED_KB=%s\n' "$total_size_freed"
+EOF
+        [ "$status" -eq 0 ] || { echo "$scenario: $output"; return 1; }
+        case "$scenario" in
+            shared) label='Kept (shared with another installed app): 3 paths' ;;
+            unknown) label='Kept (other copies of the app could not be checked): 3 paths' ;;
+            reappeared) label='Kept (selected app path exists again; select the app again): 3 paths' ;;
+            single) label='Kept (shared with another installed app): ~/Library/Application Support/IntelliJ' ;;
+        esac
+        [[ "$output" == *"$label"* ]] || { echo "$scenario: $output"; return 1; }
+        [[ "$(printf '%s\n' "$output" | grep -cF 'Kept (')" -eq 1 ]] || { echo "$scenario: $output"; return 1; }
+        [[ "$output" != *"protected by Mole"* && "$output" != *"Could not remove"* ]] || { echo "$scenario: $output"; return 1; }
+        [[ "$output" == *"FREED_KB=1000"* ]] || { echo "$scenario: $output"; return 1; }
+    done
+}
+
+@test "live uninstall inventory counts a PlayCover bundle as a sibling install (#1715)" {
+    # shellcheck disable=SC2016  # matches the literal source line, unexpanded
+    grep -qF '"$HOME/Library/Containers/io.playcover.PlayCover/Applications"' \
+        "$PROJECT_ROOT/lib/uninstall/batch.sh" || return 1
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+playcover="$HOME/Library/Containers/io.playcover.PlayCover/Applications"
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications" "$playcover")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/Mole Probe.app"
+mkdir -p "$selected/Contents" "$playcover/fit.mole.probe.app"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.probe</string></dict></plist>' > "$selected/Contents/Info.plist"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.probe</string></dict></plist>' > "$playcover/fit.mole.probe.app/Info.plist"
+rc=0
+uninstall_live_bundle_has_other_install fit.mole.probe "$selected" || rc=$?
+printf 'PLAYCOVER_SIBLING_RC=%s\n' "$rc"
+[[ $rc -eq 0 ]] || exit 1
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "live uninstall inventory keeps shared data when a PlayCover bundle is selected beside a native copy (#1715)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+playcover="$HOME/Library/Containers/io.playcover.PlayCover/Applications"
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications" "$playcover")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$playcover/fit.mole.probe.app"
+mkdir -p "$selected" "$HOME/Applications/PlayCover/Mole Probe.app"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.probe</string></dict></plist>' > "$selected/Info.plist"
+ln -s "$selected/Info.plist" "$HOME/Applications/PlayCover/Mole Probe.app/Info.plist"
+# The launcher alias alone is not another install.
+rc=0
+uninstall_live_bundle_has_other_install fit.mole.probe "$selected" || rc=$?
+printf 'ALIAS_ONLY_RC=%s\n' "$rc"
+[[ $rc -eq 1 ]] || exit 1
+native="$HOME/Applications/Mole Probe.app"
+mkdir -p "$native/Contents"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.probe</string></dict></plist>' > "$native/Contents/Info.plist"
+rc=0
+uninstall_live_bundle_has_other_install fit.mole.probe "$selected" || rc=$?
+printf 'NATIVE_SIBLING_RC=%s\n' "$rc"
+[[ $rc -eq 0 ]] || exit 1
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "PlayCover inventory reads flat bundle metadata and invalidates its cache (#1715)" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/uninstall.sh"
+root="$HOME/Library/Containers/io.playcover.PlayCover/Applications"
+app="$root/com.example.Game.app"
+mkdir -p "$app"
+cat > "$app/Info.plist" <<'PLIST'
+<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.Game</string><key>CFBundleDisplayName</key><string>Example Game</string></dict></plist>
+PLIST
+uninstall_print_app_search_dirs | grep -Fx "$root" > /dev/null || exit 1
+[[ "$(uninstall_resolve_bundle_id "$app")" == com.example.Game ]] || exit 1
+mdls() { return 1; }
+[[ "$(uninstall_resolve_display_name "$app" com.example.Game)" == 'Example Game' ]] || exit 1
+touch -t 202501010101 "$app/Info.plist"
+before=$(uninstall_print_app_paths_with_mtime "$root" true)
+IFS=$'\t' read -r app_mtime info_mtime app_path <<< "$before"
+[[ "$app_path" == "$app" && "$info_mtime" == "$(/usr/bin/stat -f%m "$app/Info.plist")" ]] || exit 1
+touch -t 202501010102 "$app/Info.plist"
+after=$(uninstall_print_app_paths_with_mtime "$root" true)
+[[ "$before" != "$after" ]] || exit 1
+uninstall_print_app_search_dirs() { printf '%s\n' "$root"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+before=$(uninstall_app_inventory_fingerprint)
+touch -t 202501010103 "$app/Info.plist"
+after=$(uninstall_app_inventory_fingerprint)
+! uninstall_inventory_can_reuse_cached_apps "$before" "$after" || exit 1
+
+cat > "$HOME/stat-fallback" <<'STAT'
+#!/bin/bash
+if [[ "$1" == -f ]]; then
+    printf 'partial batch output\n'
+    exit 1
+fi
+exec /usr/bin/stat "$@"
+STAT
+chmod +x "$HOME/stat-fallback"
+STAT_BSD="$HOME/stat-fallback"
+[[ "$(uninstall_print_app_paths_with_mtime "$root" true)" == "$(/usr/bin/stat -f '%m' "$app")"$'\t'"$(/usr/bin/stat -f '%m' "$app/Info.plist")"$'\t'"$app" ]] || exit 1
+EOF
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "updater staging copies in hidden folders are not listed as installed apps" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF2'
+set -uo pipefail
+source "$PROJECT_ROOT/bin/uninstall.sh"
+root="$HOME/Applications"
+mkdir -p "$root/Foo.app/Contents" "$root/.foo-update/app/Foo.app/Contents" "$root/.Helper.app/Contents"
+uninstall_print_app_paths_with_mtime "$root" | awk -F '\t' '{ print "LISTED=" $NF }' | sed "s#$HOME#~#"
+EOF2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"LISTED=~/Applications/Foo.app"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"LISTED=~/Applications/.Helper.app"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *".foo-update"* ]] || { echo "$output"; return 1; }
+}
+
+@test "an old app copy in Foundation's item-replacement folder is not listed in any locale" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF2'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/uninstall.sh"
+root="$HOME/Applications"
+# Spanish written decomposed, as a directory listing returns it.
+es=$(printf '(%s está guardando un documento…)' Sparkle | /usr/bin/iconv -f UTF-8 -t UTF-8-MAC)
+mkdir -p "$root/WhatsApp.app/Contents" \
+    "$root/(A Document Being Saved By Sparkle)/WhatsApp.app/Contents" \
+    "$root/(A Document Being Saved By Sparkle 2)/Old.app/Contents" \
+    "$root/（Sparkle正在保存文稿）/Old.app/Contents" \
+    "$root/$es/Old.app/Contents" \
+    "$root/(Not Being Saved)/Kept.app/Contents" "$root/（不是）/Kept.app/Contents"
+# The decomposed name reached the disk as written (U+0301 is CC 81).
+ls "$root" | LC_ALL=C grep -q $'\xcc\x81' || { echo "no decomposed name on disk"; exit 1; }
+uninstall_print_app_paths_with_mtime "$root" | awk -F '\t' '{ print "LISTED=" $NF }' | sed "s#$HOME#~#"
+uninstall_print_app_search_dirs() { printf '%s\n' "$root"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+uninstall_app_inventory_fingerprint | awk -F '|' '{ print "INVENTORY=" $1 }' | sed "s#$HOME#~#"
+EOF2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local kind
+    for kind in LISTED INVENTORY; do
+        [[ "$output" == *"$kind=~/Applications/WhatsApp.app"* ]] || { echo "$output"; return 1; }
+        [[ "$output" == *"$kind=~/Applications/(Not Being Saved)/Kept.app"* ]] || { echo "$output"; return 1; }
+        [[ "$output" == *"$kind=~/Applications/（不是）/Kept.app"* ]] || { echo "$output"; return 1; }
+    done
+    [[ "$output" != *"Being Saved By"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"正在保存文稿"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"guardando"* ]] || { echo "$output"; return 1; }
+}
+
+@test "item-replacement folder names come from the system's Document.loctable" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF2'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/uninstall.sh"
+uninstall_load_item_replacement_globs
+printf '%s\n' "$_MOLE_ITEM_REPLACEMENT_GLOBS" | grep -c . | sed 's/^/COUNT=/'
+printf '%s\n' "$_MOLE_ITEM_REPLACEMENT_GLOBS" | grep -c '%' | sed 's/^/UNCONVERTED=/' || true
+EOF2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local count="${output#*COUNT=}"
+    count="${count%%$'\n'*}"
+    # 148 templates from 43 locales on macOS 27; fewer means the read broke.
+    [[ "$count" =~ ^[0-9]+$ ]] && ((count >= 80)) || { echo "$output"; return 1; }
+    [[ "$output" == *"UNCONVERTED=0"* ]] || { echo "$output"; return 1; }
+}
+
+@test "an updater staging copy does not count as a surviving sibling but a hidden app does" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF2'
+set -uo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+root="$HOME/Applications"
+selected="$root/Foo.app"
+hidden="$root/.Helper.app"
+for app in "$selected" "$root/.foo-update/app/Foo.app"; do
+  mkdir -p "$app/Contents"
+  printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.example.foo</string></dict></plist>' > "$app/Contents/Info.plist"
+done
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$root")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+rc=0
+uninstall_live_bundle_has_other_install com.example.foo "$selected" || rc=$?
+printf 'STAGING_ONLY_RC=%s\n' "$rc"
+mkdir -p "$hidden/Contents"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.example.foo</string></dict></plist>' > "$hidden/Contents/Info.plist"
+rc=0
+uninstall_live_bundle_has_other_install com.example.foo "$selected" || rc=$?
+printf 'HIDDEN_APP_RC=%s\n' "$rc"
+EOF2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"STAGING_ONLY_RC=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"HIDDEN_APP_RC=0"* ]] || { echo "$output"; return 1; }
+}
+
+@test "uninstall finds exact updater and crash SDK leaves without shared parents" {
+    run env HOME="$HOME/sdk-leaves" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+for leaf in 'Caches/com.example.Gizmo.ShipIt' 'Caches/gizmo-updater' 'Application Support/Caches/gizmo-updater' 'Caches/com.crashlytics.data/com.example.Gizmo' 'Caches/SentryCrash/Gizmo' 'Caches/KSCrash/Gizmo' 'Application Support/com.bugsnag.Bugsnag/com.example.Gizmo'; do
+    mkdir -p "$HOME/Library/$leaf"
+done
+mkdir -p "$HOME/Library/Caches/com.crashlytics.data/com.other.Gizmo" "$HOME/Library/Caches/Electron-updater"
+result=$(find_app_files com.example.Gizmo Gizmo)
+for leaf in 'Caches/com.example.Gizmo.ShipIt' 'Caches/gizmo-updater' 'Application Support/Caches/gizmo-updater' 'Caches/com.crashlytics.data/com.example.Gizmo' 'Caches/SentryCrash/Gizmo' 'Caches/KSCrash/Gizmo' 'Application Support/com.bugsnag.Bugsnag/com.example.Gizmo'; do
+    grep -Fx "$HOME/Library/$leaf" <<< "$result" || exit 1
+done
+! grep -Fx "$HOME/Library/Caches/com.crashlytics.data" <<< "$result" || exit 1
+[[ "$result" != *com.other.Gizmo* ]] || exit 1
+[[ "$result" != *Electron-updater* ]] || exit 1
+SH
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "uninstall discovers UUID metadata owners and direct native manifests only" {
+    run env HOME="$HOME/metadata-owned" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+app="$HOME/Applications/Gizmo.app"
+container="$HOME/Library/Containers/ABCDEFAB-1234-1234-1234-123456789ABC"
+hosts="$HOME/Library/Application Support/Browser/NativeMessagingHosts"
+mkdir -p "$app/Contents/MacOS" "$container" "$hosts"
+touch "$app/Contents/MacOS/host"
+printf '%s\n' '{"MCMMetadataIdentifier":"com.example.Gizmo"}' > "$container/.com.apple.containermanagerd.metadata.plist"
+printf '{"path":"%s/Contents/MacOS/host"}\n' "$app" > "$hosts/owned.json"
+printf '{"path":"%s/../Other.app/host"}\n' "$app" > "$hosts/escape.json"
+printf '%s\n' '{"path":"/Applications/Other.app/host"}' > "$hosts/other.json"
+result=$(find_app_files com.example.Gizmo Gizmo "$app")
+grep -Fx "$container" <<< "$result"
+grep -Fx "$hosts/owned.json" <<< "$result"
+[[ "$result" != *escape.json* && "$result" != *other.json* ]] || exit 1
+printf '%s\n' '{"MCMMetadataIdentifier":"com.other.Gizmo"}' > "$container/.com.apple.containermanagerd.metadata.plist"
+result=$(find_app_files com.example.Gizmo Gizmo "$app")
+! grep -Fx "$container" <<< "$result" || exit 1
+SH
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "JetBrains selector maps exact leaves and protects differently named siblings" {
+    run env HOME="$HOME/selector-owned" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+app="$HOME/Applications/Custom IDE.app"
+other="$HOME/Applications/Other IDE.app"
+mkdir -p "$app/Contents" "$other/Contents" "$HOME/Library/Caches/JetBrains/IdeaIC2026.2" "$HOME/Library/Caches/JetBrains/IdeaIC2026.20"
+printf '%s\n' '{"JVMOptions":{"Properties":{"idea.paths.selector":"IdeaIC2026.2"}}}' > "$app/Contents/Info.plist"
+/usr/bin/plutil -convert xml1 "$app/Contents/Info.plist"
+cp "$app/Contents/Info.plist" "$other/Contents/Info.plist"
+result=$(find_app_files com.jetbrains.custom 'Custom IDE' "$app")
+grep -Fx "$HOME/Library/Caches/JetBrains/IdeaIC2026.2" <<< "$result"
+[[ "$result" != *IdeaIC2026.20* ]] || exit 1
+uninstall_bundles_share_remnants com.jetbrains.custom com.jetbrains.other "$app" "$other"
+_MOLE_UNINSTALL_SELECTOR_APP="$app"
+_MOLE_UNINSTALL_SELECTED_SELECTOR=IdeaIC2026.2
+mv "$app" "$app.removed"
+uninstall_bundles_share_remnants com.jetbrains.custom com.jetbrains.other "$app" "$other"
+/usr/libexec/PlistBuddy -c 'Set :JVMOptions:Properties:idea.paths.selector PyCharm2026.2' "$other/Contents/Info.plist"
+if uninstall_bundles_share_remnants com.jetbrains.custom com.jetbrains.other "$app" "$other"; then exit 1; fi
+SH
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "JetBrains selector uncertainty after preview stops every teardown" {
+    local scenario
+    for scenario in unknown changed; do
+        run env HOME="$BATS_TEST_TMPDIR/$scenario" PROJECT_ROOT="$PROJECT_ROOT" SCENARIO="$scenario" MOLE_TEST_NO_AUTH=1 /bin/bash <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+selected="$HOME/Applications/IDE.app"
+mkdir -p "$selected/Contents"
+fields=(IDE "$selected" com.jetbrains.custom 0 '' '' false false false '' '' '' '' none x com.jetbrains.custom '' x IdeaIC2026.2)
+IFS='|' detail="${fields[*]}"; unset IFS
+app_details=("$detail")
+_batch_selected_app_plan_matches() { return 0; }
+mole_uninstall_jetbrains_selector() {
+    [[ "$SCENARIO" == changed ]] || return 1
+    printf 'IdeaIC2026.3\n'
+}
+uninstall_live_bundle_has_other_install() { return 1; }
+stop_launch_services() { touch "$HOME/forbidden"; }
+unregister_app_bundle() { touch "$HOME/forbidden"; }
+remove_login_item() { touch "$HOME/forbidden"; }
+force_kill_app() { touch "$HOME/forbidden"; }
+mole_delete() { touch "$HOME/forbidden"; }
+stop_inline_spinner() { :; }
+success_count=0 failed_count=0 brew_apps_removed=0 total_size_freed=0 files_cleaned=0 total_items=0
+failed_items=() success_items=() success_dock_targets=() system_extension_warning_apps=()
+review_only_system_leftovers=() review_only_system_leftover_keys=() running_at_uninstall_apps=()
+_batch_execute_removals
+[[ $failed_count -eq 1 && $success_count -eq 0 && ! -e "$HOME/forbidden" ]] || exit 1
+[[ "${failed_items[*]}" == *'metadata changed after preview'* ]] || exit 1
+SH
+        [ "$status" -eq 0 ] || { echo "$scenario: $output"; return 1; }
+    done
+}
+
+@test "metadata ownership probes retain on timeout and preserve signals" {
+    run env HOME="$BATS_TEST_TMPDIR/probe-status" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+container="$HOME/Library/Containers/ABCDEFAB-1234-1234-1234-123456789ABC"
+app="$HOME/Applications/IDE.app"
+mkdir -p "$container" "$app/Contents"
+printf '%s\n' '{"MCMMetadataIdentifier":"com.example.Gizmo"}' > "$container/.com.apple.containermanagerd.metadata.plist"
+touch "$app/Contents/Info.plist"
+run_with_timeout() { return "$probe_status"; }
+for probe_status in 124 143; do
+    rc=0
+    mole_uninstall_uuid_container_owned "$container" com.example.Gizmo || rc=$?
+    if [[ $probe_status -eq 124 ]]; then [[ $rc -eq 1 ]] || exit 1; else [[ $rc -eq 143 ]] || exit 1; fi
+    rc=0
+    mole_uninstall_jetbrains_selector "$app" com.jetbrains.custom || rc=$?
+    if [[ $probe_status -eq 124 ]]; then [[ $rc -eq 1 ]] || exit 1; else [[ $rc -eq 143 ]] || exit 1; fi
+done
+rc=0
+uninstall_bundles_share_remnants com.jetbrains.custom com.jetbrains.other "$app" "$HOME/Other.app" || rc=$?
+[[ $rc -eq 143 ]] || exit 1
+SH
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "JetBrains selector metadata accepts mixed-case bundle IDs" {
+    run env HOME="$BATS_TEST_TMPDIR/selector-case" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+app="$HOME/Applications/Custom IDE.app"
+mkdir -p "$app/Contents" "$HOME/Library/Caches/JetBrains/IdeaIC2026.2"
+printf '%s\n' '<plist><dict><key>JVMOptions</key><dict><key>Properties</key><dict><key>idea.paths.selector</key><string>IdeaIC2026.2</string></dict></dict></dict></plist>' > "$app/Contents/Info.plist"
+for id in com.jetbrains.custom COM.JETBRAINS.custom; do
+    selector=$(mole_uninstall_jetbrains_selector "$app" "$id")
+    [[ "$selector" == IdeaIC2026.2 ]] || exit 1
+    files=$(find_app_files "$id" 'Custom IDE' "$app")
+    grep -Fx "$HOME/Library/Caches/JetBrains/IdeaIC2026.2" <<< "$files" || exit 1
+done
+SH
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "JetBrains same-selector sibling retention folds both bundle IDs" {
+    run env HOME="$BATS_TEST_TMPDIR/sibling-case" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'SH'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+mole_uninstall_jetbrains_selector() { printf '%s\n' IdeaIC2026.2; }
+for selected in com.jetbrains.custom COM.JETBRAINS.custom; do
+    for other in com.jetbrains.other COM.JETBRAINS.other; do
+        uninstall_bundles_share_remnants "$selected" "$other" '/Applications/Custom IDE.app' '/Applications/Other IDE.app' || exit 1
+    done
+done
+mole_uninstall_jetbrains_selector() {
+    case "$1" in */Custom*) echo IdeaIC2026.2 ;; *) echo PyCharm2026.2 ;; esac
+}
+if uninstall_bundles_share_remnants COM.JETBRAINS.custom COM.JETBRAINS.other '/Applications/Custom IDE.app' '/Applications/Other IDE.app'; then exit 1; fi
+SH
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "a whole uninstall never runs du on another app's container without Full Disk Access" {
+	for grant in 0 1; do
+		local fixture_home="$HOME/container-du-$grant"
+		mkdir -p "$fixture_home/Applications/TestApp.app/Contents" \
+			"$fixture_home/Library/Containers/com.example.TestApp/Data" \
+			"$fixture_home/Library/Group Containers/group.com.example.TestApp/Data" \
+			"$fixture_home/Library/Caches/com.example.TestApp" \
+			"$fixture_home/du-stub"
+		cat > "$fixture_home/Applications/TestApp.app/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.TestApp</string></dict></plist>
+PLIST
+		cat > "$fixture_home/du-stub/du" <<STUB
+#!/bin/bash
+printf '%s\n' "\$*" >> "$fixture_home/du.log"
+printf '8\ttotal\n'
+STUB
+		chmod +x "$fixture_home/du-stub/du"
+		: > "$fixture_home/du.log"
+
+		run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" GRANT="$grant" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+PATH="$HOME/du-stub:$PATH"
+export MOLE_HAS_FDA="$GRANT"
+brew() { :; }
+app_bundle="$HOME/Applications/TestApp.app"
+# Every leftover survives its removal, so the post-removal measurement runs.
+mole_delete() {
+	[[ "$1" != "$app_bundle" ]] || mv "$app_bundle" "$HOME/removed-app-fixture"
+	return 0
+}
+remove_file_list() { printf '0\n'; return 0; }
+request_sudo_access() { return 0; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+enter_alt_screen() { :; }
+leave_alt_screen() { :; }
+hide_cursor() { :; }
+show_cursor() { :; }
+remove_apps_from_dock() { :; }
+pgrep() { return 1; }
+pkill() { return 0; }
+sudo() { return 0; }
+selected_apps=("0|$app_bundle|TestApp|com.example.TestApp|0|Never")
+files_cleaned=0
+total_items=0
+total_size_cleaned=0
+drain_pending_input() { :; }
+# The container is personal data, so the review has to select it.
+paginated_multi_select() { MOLE_SELECTION_RESULT="0,1"; }
+printf 'd\n' | MOLE_TEST_MODE=1 batch_uninstall_applications
+EOF
+		[ "$status" -eq 0 ] || { printf 'grant %s exit %s\n%s\n' "$grant" "$status" "$output"; return 1; }
+		grep -qF "Library/Caches/com.example.TestApp" "$fixture_home/du.log" || {
+			cat "$fixture_home/du.log"
+			return 1
+		}
+		if [[ "$grant" == 0 ]]; then
+			if grep -F "Library/Containers" "$fixture_home/du.log"; then return 1; fi
+		else
+			grep -qF "Library/Containers/com.example.TestApp" "$fixture_home/du.log" || {
+				cat "$fixture_home/du.log"
+				return 1
+			}
+		fi
+	done
+}
+
+@test "a PlayCover app inside its container is not measured without Full Disk Access" {
+	local app="$HOME/Library/Containers/io.playcover.PlayCover/Applications/com.example.game.app"
+	mkdir -p "$app/Contents" "$HOME/playcover-du"
+	cat > "$HOME/playcover-du/du" <<STUB
+#!/bin/bash
+printf '%s\n' "\$*" >> "$HOME/playcover-du.log"
+printf '8\t%s\n' "\${@: -1}"
+STUB
+	chmod +x "$HOME/playcover-du/du"
+	: > "$HOME/playcover-du.log"
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" APP="$app" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+PATH="$HOME/playcover-du:$PATH"
+mdls() { return 1; }
+sed_src=$(/usr/bin/sed -n "/^uninstall_inline_du_size_kb() {/,/^}/p" "$PROJECT_ROOT/bin/uninstall.sh")
+eval "$sed_src"
+MOLE_UNINSTALL_INLINE_DU_SIZE_TIMEOUT_SEC=5
+export MOLE_HAS_FDA=0
+[[ "$(uninstall_inline_du_size_kb "$APP")" == 0 ]] || exit 1
+[[ ! -s "$HOME/playcover-du.log" ]] || exit 2
+export MOLE_HAS_FDA=1
+[[ "$(uninstall_inline_du_size_kb "$APP")" == 8 ]] || exit 3
+grep -qF "$APP" "$HOME/playcover-du.log" || exit 4
+EOF
+	[ "$status" -eq 0 ] || { printf 'exit %s\n%s\n' "$status" "$output"; return 1; }
 }

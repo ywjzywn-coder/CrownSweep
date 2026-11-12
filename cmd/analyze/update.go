@@ -17,19 +17,24 @@ func (m *model) scheduleOverviewScans() tea.Cmd {
 	if !m.inOverviewMode() {
 		return nil
 	}
+	availableSlots := maxConcurrentOverview - len(m.overviewScanningSet)
+	if availableSlots <= 0 {
+		m.overviewScanning = true
+		return nil
+	}
 
 	var pendingIndices []int
 	for i, entry := range m.entries {
 		if entry.Size < 0 && m.overviewScanningSet[entry.Path] == nil {
 			pendingIndices = append(pendingIndices, i)
-			if len(pendingIndices) >= maxConcurrentOverview {
+			if len(pendingIndices) >= availableSlots {
 				break
 			}
 		}
 	}
 
 	if len(pendingIndices) == 0 {
-		m.overviewScanning = false
+		m.overviewScanning = len(m.overviewScanningSet) > 0
 		if !hasPendingOverviewEntries(m.entries) {
 			m.sortOverviewEntriesBySize()
 			m.status = "Ready"
@@ -66,19 +71,36 @@ func (m *model) scheduleOverviewScans() tea.Cmd {
 		}
 	}
 
-	cmds = append(cmds, tickCmd())
+	cmds = append(cmds, m.startTick())
 	return tea.Batch(cmds...)
 }
 
 func (m model) Init() tea.Cmd {
-	if m.inOverviewMode() {
-		return tea.Batch(m.scheduleOverviewScans(), m.detectLocalSnapshotsCmd())
+	// Init receives a copy. Start work through Update so the running model
+	// retains the tick guard before any scan completion can refill the queue.
+	return func() tea.Msg {
+		return initializeMsg{}
 	}
-	return tea.Batch(m.scanCmd(m.path), tickCmd())
 }
 
-func (m model) scanCmd(path string) tea.Cmd {
+func (m *model) newLiveScanRequest() (int64, *scanPublication) {
+	m.cancelLiveScan()
+	id := nextLiveScanID.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	publication := newScanPublication(ctx, cancel)
+	// Reserve identity before dispatch, including cache reads and commands
+	// that have not begun enumerating yet.
+	m.liveScanID = id
+	m.liveScanCancel = publication.cancel
+	return id, publication
+}
+
+func (m *model) scanCmd(path string) tea.Cmd {
+	id, publication := m.newLiveScanRequest()
 	return func() tea.Msg {
+		if err := publication.ctx.Err(); err != nil {
+			return liveScanStartMsg{id: id, path: path, err: err}
+		}
 		if cached, err := loadCacheFromDisk(path); err == nil {
 			result := scanResult{
 				State:      cached.State,
@@ -88,9 +110,9 @@ func (m model) scanCmd(path string) tea.Cmd {
 				TotalFiles: cached.TotalFiles,
 			}
 			if cached.NeedsRefresh {
-				return scanResultMsg{path: path, result: result, err: nil, stale: true}
+				return scanResultMsg{id: id, path: path, result: result, err: nil, stale: true}
 			}
-			return scanResultMsg{path: path, result: result, err: nil}
+			return scanResultMsg{id: id, path: path, result: result, err: nil}
 		}
 
 		if stale, err := loadStaleCacheFromDisk(path); err == nil {
@@ -101,29 +123,39 @@ func (m model) scanCmd(path string) tea.Cmd {
 				TotalSize:  stale.TotalSize,
 				TotalFiles: stale.TotalFiles,
 			}
-			return scanResultMsg{path: path, result: result, err: nil, stale: true}
+			return scanResultMsg{id: id, path: path, result: result, err: nil, stale: true}
 		}
 
-		return startLiveScanCmd(path, m.filesScanned, m.dirsScanned, m.bytesScanned, m.currentPath)()
+		return startLiveScanCmd(id, path, publication, m.filesScanned, m.dirsScanned, m.bytesScanned, m.currentPath, scanCacheReuse)()
 	}
 }
 
-func (m model) scanFreshCmd(path string) tea.Cmd {
-	return func() tea.Msg {
-		return startLiveScanCmd(path, m.filesScanned, m.dirsScanned, m.bytesScanned, m.currentPath)()
-	}
+func (m *model) scanFreshCmd(path string) tea.Cmd {
+	id, publication := m.newLiveScanRequest()
+	return startLiveScanCmd(id, path, publication, m.filesScanned, m.dirsScanned, m.bytesScanned, m.currentPath, scanCacheReuse)
 }
 
-func (m model) scanBypassingCacheCmd(path string) tea.Cmd {
-	return func() tea.Msg {
-		return startLiveScanCmdWithPolicy(path, m.filesScanned, m.dirsScanned, m.bytesScanned, m.currentPath, scanCacheBypass)()
-	}
+func (m *model) scanBypassingCacheCmd(path string) tea.Cmd {
+	id, publication := m.newLiveScanRequest()
+	return startLiveScanCmd(id, path, publication, m.filesScanned, m.dirsScanned, m.bytesScanned, m.currentPath, scanCacheBypass)
 }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(uiTickInterval, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+// startTick arms the animation loop only when none is running. Each loop
+// re-arms itself while work remains, so a second one would double the
+// spinner speed. Every scan, navigation, and deletion entry point shares
+// this guard, including overview refills before the first tick arrives.
+func (m *model) startTick() tea.Cmd {
+	if m.tickRunning {
+		return nil
+	}
+	m.tickRunning = true
+	return tickCmd()
 }
 
 func (m *model) cancelLiveScan() {
@@ -134,6 +166,8 @@ func (m *model) cancelLiveScan() {
 	m.liveScanCancel = nil
 	m.liveScanEvents = nil
 	m.liveScanningPaths = nil
+	m.liveEntryIndex = nil
+	m.liveEntriesDirty = false
 	m.autoSortLiveEntries = false
 }
 
@@ -170,18 +204,23 @@ func (m *model) applyLiveChildSize(entry dirEntry, complete bool, result scanRes
 	}
 
 	m.ensureLiveEntryBacking()
-	previousSize := int64(-1)
-	found := false
-	for i := range m.entriesAll {
-		if m.entriesAll[i].Path == entry.Path {
-			previousSize = m.entriesAll[i].Size
-			m.entriesAll[i] = entry
-			found = true
-			break
+	if m.liveEntryIndex == nil {
+		m.liveEntryIndex = make(map[string]int, len(m.entriesAll))
+		for i := range m.entriesAll {
+			m.liveEntryIndex[m.entriesAll[i].Path] = i
 		}
 	}
-	if !found {
+	previousSize := int64(-1)
+	if i, found := m.liveEntryIndex[entry.Path]; found {
+		previousSize = m.entriesAll[i].Size
+		m.entriesAll[i] = entry
+	} else {
+		m.liveEntryIndex[entry.Path] = len(m.entriesAll)
 		m.entriesAll = append(m.entriesAll, entry)
+	}
+	// The unfiltered view shares the backing rows, including after append.
+	if m.entryFilter == "" {
+		m.entries = m.entriesAll
 	}
 
 	m.totalSize += max(entry.Size, 0) - max(previousSize, 0)
@@ -194,13 +233,27 @@ func (m *model) applyLiveChildSize(entry dirEntry, complete bool, result scanRes
 		childResult.Entries = filterNonEmptyEntries(result.Entries)
 		m.cache[entry.Path] = historyEntryFromScanResult(entry.Path, childResult, m.cache[entry.Path], true)
 	}
+	// Account for every result immediately; reorder and rebuild filtered rows
+	// once per existing display tick, rather than once per child event.
+	m.liveEntriesDirty = true
+	m.clampEntrySelection()
+	m.status = fmt.Sprintf("Scanning %s...", displayPath(m.path))
+}
+
+func (m *model) flushLiveEntryUpdates() {
+	if !m.liveEntriesDirty {
+		return
+	}
+	m.liveEntriesDirty = false
 	if m.autoSortLiveEntries {
 		m.sortLiveEntriesForActiveMode()
 	} else {
+		selectedPath := m.selectedEntryPath()
 		m.applyEntryFilter()
+		if selectedPath != "" {
+			m.selectEntryPath(selectedPath)
+		}
 	}
-	m.clampEntrySelection()
-	m.status = fmt.Sprintf("Scanning %s...", displayPath(m.path))
 }
 
 func (m *model) finishLiveScan(result scanResult) {
@@ -210,6 +263,8 @@ func (m *model) finishLiveScan(result scanResult) {
 	m.liveScanCancel = nil
 	m.liveScanEvents = nil
 	m.liveScanningPaths = nil
+	m.liveEntryIndex = nil
+	m.liveEntriesDirty = false
 	m.autoSortLiveEntries = false
 
 	filteredEntries := filterNonEmptyEntries(result.Entries)
@@ -230,7 +285,12 @@ func (m *model) finishLiveScan(result scanResult) {
 	} else if selectedPath != "" {
 		m.selectEntryPath(selectedPath)
 	}
-	m.cache[m.path] = historyEntryFromScanResult(m.path, result, m.cache[m.path], false)
+	cached := historyEntryFromScanResult(m.path, result, m.cache[m.path], false)
+	m.cache[m.path] = cached
+	// The view mutates its backing arrays when rows are removed. The writer
+	// shares the immutable history snapshot instead of racing those changes.
+	result.Entries = cached.Entries
+	result.LargeFiles = cached.LargeFiles
 	publication := m.newBackgroundCacheWrite(context.Background(), m.path)
 	if m.scanState == scanComplete && m.totalSize > 0 {
 		if m.overviewSizeCache == nil {
@@ -254,6 +314,8 @@ func (m *model) sortLiveEntriesForActiveMode() {
 		selectedPath = m.selectedEntryPath()
 	}
 	sortDirEntriesBySize(m.entriesAll)
+	m.liveEntryIndex = nil
+	m.liveEntriesDirty = false
 	m.applyEntryFilter()
 	if m.liveSortMode == liveSortFreezeOnMove {
 		m.selected = 0
@@ -277,7 +339,7 @@ func (m *model) selectEntryPath(path string) {
 	for i, entry := range m.entries {
 		if entry.Path == path {
 			m.selected = i
-			return
+			break
 		}
 	}
 	m.clampEntrySelection()
@@ -285,6 +347,14 @@ func (m *model) selectEntryPath(path string) {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case initializeMsg:
+		var cmd tea.Cmd
+		if m.inOverviewMode() {
+			cmd = tea.Batch(m.scheduleOverviewScans(), m.detectLocalSnapshotsCmd())
+		} else {
+			cmd = tea.Batch(m.scanCmd(m.path), m.startTick())
+		}
+		return m, cmd
 	case tea.KeyMsg:
 		return m.updateKey(msg)
 	case tea.WindowSizeMsg:
@@ -312,9 +382,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cancelBackgroundCacheWrites(removedPaths)
 				invalidateCacheAncestry(removedPaths)
 				if msg.err != nil {
-					m.status = fmt.Sprintf("Deleted %d items; some failed: %v", msg.count, msg.err)
+					m.status = fmt.Sprintf("Moved %d items to Trash, some failed: %v", msg.count, msg.err)
 				} else {
-					m.status = fmt.Sprintf("Deleted %d items", msg.count)
+					m.status = fmt.Sprintf("Moved %d items to Trash", msg.count)
+				}
+				if msg.logWarning != "" {
+					m.status += " · " + msg.logWarning
 				}
 
 				// Selective invalidation: only views whose size the delete
@@ -347,25 +420,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.currentPath != nil {
 					m.currentPath.Store("")
 				}
-				return m, tea.Batch(m.scanCmd(m.path), tickCmd())
+				cmd := tea.Batch(m.scanCmd(m.path), m.startTick())
+				return m, cmd
 			}
 			if msg.err != nil {
-				m.status = fmt.Sprintf("Failed to delete: %v", msg.err)
+				m.status = fmt.Sprintf("Failed to move to Trash: %v", msg.err)
 			} else {
-				m.status = fmt.Sprintf("Deleted %d items", msg.count)
+				m.status = fmt.Sprintf("Moved %d items to Trash", msg.count)
+			}
+			if msg.logWarning != "" {
+				m.status += " · " + msg.logWarning
 			}
 		}
 		return m, nil
 	case scanResultMsg:
-		if msg.path != "" && msg.path != m.path {
-			if msg.err == nil {
-				filteredEntries := filterNonEmptyEntries(msg.result.Entries)
-				result := msg.result
-				result.Entries = filteredEntries
-				m.cache[msg.path] = historyEntryFromScanResult(msg.path, result, m.cache[msg.path], msg.stale)
-			}
+		if msg.id == 0 || msg.id != m.liveScanID || msg.path != m.path {
 			return m, nil
 		}
+		m.cancelLiveScan()
 		m.scanning = false
 		if msg.err != nil {
 			m.status = fmt.Sprintf("Scan failed: %v", msg.err)
@@ -374,6 +446,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		filteredEntries := filterNonEmptyEntries(msg.result.Entries)
 		result := msg.result
 		result.Entries = filteredEntries
+		selectedPath := m.selectedEntryPath()
 		m.entriesAll = filteredEntries
 		m.entries = filteredEntries
 		m.largeFilesAll = msg.result.LargeFiles
@@ -388,6 +461,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// query is empty.
 		m.applyEntryFilter()
 		m.applyLargeFilter()
+		m.selectEntryPath(selectedPath)
 		m.cache[m.path] = historyEntryFromScanResult(m.path, result, m.cache[m.path], msg.stale)
 		if !msg.stale && m.scanState == scanComplete && m.totalSize > 0 {
 			if m.overviewSizeCache == nil {
@@ -412,20 +486,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.currentPath != nil {
 				m.currentPath.Store("")
 			}
-			return m, tea.Batch(m.scanFreshCmd(m.path), tickCmd())
+			cmd := tea.Batch(m.scanFreshCmd(m.path), m.startTick())
+			return m, cmd
 		}
 
 		m.status = scanSummary(m.totalSize, m.scanState)
 		return m, nil
 	case liveScanStartMsg:
-		if msg.path != m.path {
+		if msg.id == 0 || msg.id != m.liveScanID || msg.path != m.path {
 			if msg.cancel != nil {
 				msg.cancel()
 			}
 			return m, nil
 		}
-		m.cancelLiveScan()
 		if msg.err != nil {
+			m.cancelLiveScan()
 			m.scanning = false
 			m.status = fmt.Sprintf("Scan failed: %v", msg.err)
 			return m, nil
@@ -492,8 +567,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.inOverviewMode() {
+			name := filepath.Base(msg.Path)
 			for i := range m.entries {
 				if m.entries[i].Path == msg.Path {
+					if m.entries[i].Name != "" {
+						name = m.entries[i].Name
+					}
 					m.entries[i].Size = msg.Size
 					m.entries[i].State = measurementState(msg.Size, msg.Err)
 					break
@@ -503,7 +582,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scanState = entryScanState(m.entries)
 
 			if msg.Err != nil {
-				m.status = fmt.Sprintf("Unable to measure %s: %v", displayPath(msg.Path), msg.Err)
+				label := "Size unavailable"
+				if msg.Size > 0 {
+					label = "Partial size"
+				}
+				m.status = fmt.Sprintf("%s: %s (%s)", label, name, measurementErrorReason(msg.Err))
 			}
 
 			cmd := m.scheduleOverviewScans()
@@ -521,6 +604,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tickMsg:
+		m.flushLiveEntryUpdates()
 		hasPending := false
 		if m.inOverviewMode() {
 			for _, entry := range m.entries {
@@ -538,8 +622,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.status = fmt.Sprintf("Moving to Trash... %s items", formatNumber(count))
 				}
 			}
+			m.tickRunning = true
 			return m, tickCmd()
 		}
+		m.tickRunning = false
 		return m, nil
 	default:
 		return m, nil
@@ -547,6 +633,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// The busy view hides rows and confirmations. Keep its inputs from
+	// changing selection or dispatching another deletion without a visible prompt.
+	if m.deleting {
+		switch msg.String() {
+		case "q", "Q", "ctrl+c":
+			return m, tea.Quit
+		case "r", "R":
+			// Refresh remains safe: completion cancels it before invalidating caches.
+		default:
+			return m, nil
+		}
+	}
+
 	// Delete confirm flow.
 	if m.deleteConfirm {
 		switch msg.String() {
@@ -579,18 +678,21 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.deleteTarget = nil
 			if len(pathsToDelete) == 0 {
 				m.deleting = false
-				m.status = "Nothing to delete"
+				m.status = "Nothing to move to Trash"
 				return m, nil
 			}
 
+			audit := newDeleteAudit(m.selectedPathSizes(pathsToDelete))
 			if len(pathsToDelete) == 1 {
 				targetPath := pathsToDelete[0]
-				m.status = fmt.Sprintf("Deleting %s...", filepath.Base(targetPath))
-				return m, tea.Batch(deletePathCmd(targetPath, m.deleteCount), tickCmd())
+				m.status = fmt.Sprintf("Moving %s to Trash...", filepath.Base(targetPath))
+				cmd := tea.Batch(deletePathCmd(targetPath, m.deleteCount, audit), m.startTick())
+				return m, cmd
 			}
 
-			m.status = fmt.Sprintf("Deleting %d items...", len(pathsToDelete))
-			return m, tea.Batch(deleteMultiplePathsCmd(pathsToDelete, m.deleteCount), tickCmd())
+			m.status = fmt.Sprintf("Moving %d items to Trash...", len(pathsToDelete))
+			cmd := tea.Batch(deleteMultiplePathsCmd(pathsToDelete, m.deleteCount, audit), m.startTick())
+			return m, cmd
 		case "esc", "q":
 			m.status = "Cancelled"
 			m.deleteConfirm = false
@@ -711,7 +813,8 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = "Refreshing..."
 			m.overviewScanning = true
 			m.snapshotProbeID++
-			return m, tea.Batch(m.scheduleOverviewScans(), m.detectLocalSnapshotsCmd(), tickCmd())
+			cmd := tea.Batch(m.scheduleOverviewScans(), m.detectLocalSnapshotsCmd(), m.startTick())
+			return m, cmd
 		}
 
 		m.cancelOverviewScans([]string{m.path})
@@ -728,7 +831,8 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.currentPath != nil {
 			m.currentPath.Store("")
 		}
-		return m, tea.Batch(m.scanBypassingCacheCmd(m.path), tickCmd())
+		cmd := tea.Batch(m.scanBypassingCacheCmd(m.path), m.startTick())
+		return m, cmd
 	case "t", "T":
 		if m.scanning {
 			m.status = "Top files are available after the scan finishes"
@@ -937,7 +1041,7 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "delete", "backspace":
 		if m.scanning {
-			m.status = "Delete is available after the scan finishes"
+			m.status = "Move to Trash is available after the scan finishes"
 			return m, nil
 		}
 		if m.showLargeFiles {
@@ -985,7 +1089,7 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else if m.selected < len(m.entries) {
 				selected := m.entries[m.selected]
 				if selected.State == scanUnavailable {
-					m.status = fmt.Sprintf("Cannot delete %s, size unknown", selected.Name)
+					m.status = fmt.Sprintf("Cannot move %s to Trash, size unknown", selected.Name)
 					return m, nil
 				}
 				m.deleteConfirm = true
@@ -1131,7 +1235,12 @@ func (m model) goBack() (tea.Model, tea.Cmd) {
 		if hasPendingOverviewEntries(m.entries) {
 			m.totalSize = sumKnownEntrySizes(m.entries)
 			m.scanState = entryScanState(m.entries)
-			return m, m.scheduleOverviewScans()
+			cmd := m.scheduleOverviewScans()
+			if cmd == nil && m.overviewScanning {
+				m.status = "Checking system folders..."
+				cmd = m.startTick()
+			}
+			return m, cmd
 		}
 		m.status = scanSummary(m.totalSize, m.scanState)
 		return m, nil
@@ -1148,7 +1257,8 @@ func (m model) goBack() (tea.Model, tea.Cmd) {
 		if m.currentPath != nil {
 			m.currentPath.Store("")
 		}
-		return m, tea.Batch(m.scanFreshCmd(m.path), tickCmd())
+		cmd := tea.Batch(m.scanFreshCmd(m.path), m.startTick())
+		return m, cmd
 	}
 	m.status = scanSummary(m.totalSize, m.scanState)
 	m.scanning = false
@@ -1176,10 +1286,14 @@ func (m *model) switchToOverviewMode() tea.Cmd {
 	m.snapshotProbeID++
 	cmd := m.scheduleOverviewScans()
 	if cmd == nil {
+		if m.overviewScanning {
+			m.status = "Checking system folders..."
+			return tea.Batch(m.detectLocalSnapshotsCmd(), m.startTick())
+		}
 		m.status = "Ready"
 		return m.detectLocalSnapshotsCmd()
 	}
-	return tea.Batch(cmd, m.detectLocalSnapshotsCmd(), tickCmd())
+	return tea.Batch(cmd, m.detectLocalSnapshotsCmd(), m.startTick())
 }
 
 func (m model) enterSelectedDir() (tea.Model, tea.Cmd) {
@@ -1246,7 +1360,8 @@ func (m model) enterSelectedDir() (tea.Model, tea.Cmd) {
 				if m.totalFiles > 0 {
 					m.lastTotalFiles = m.totalFiles
 				}
-				return m, tea.Batch(m.scanFreshCmd(m.path), tickCmd())
+				cmd := tea.Batch(m.scanFreshCmd(m.path), m.startTick())
+				return m, cmd
 			}
 			m.status = fmt.Sprintf("Cached view for %s", displayPath(m.path))
 			m.scanning = false
@@ -1256,7 +1371,8 @@ func (m model) enterSelectedDir() (tea.Model, tea.Cmd) {
 		if total, err := peekCacheTotalFiles(m.path); err == nil && total > 0 {
 			m.lastTotalFiles = total
 		}
-		return m, tea.Batch(m.scanCmd(m.path), tickCmd())
+		cmd := tea.Batch(m.scanCmd(m.path), m.startTick())
+		return m, cmd
 	}
 	m.status = fmt.Sprintf("File: %s, %s", selected.Name, humanizeBytes(selected.Size))
 	return m, nil
@@ -1277,6 +1393,18 @@ func scanOverviewPathCmd(path string, index int, publication *scanPublication) t
 
 // Cancel before invalidating stored measurements, so an in-flight scan cannot
 // publish pre-delete bytes after the invalidation has finished.
+// stopMeasurementsForExit ends every running du before the process leaves.
+// exec.CommandContext can only kill a child while its parent is alive, so a
+// quit that does not wait would leave du walking the tree with no deadline.
+func (m *model) stopMeasurementsForExit() {
+	m.cancelLiveScan()
+	m.cancelOverviewScans(nil)
+	m.cancelBackgroundCacheWrites(nil)
+	for deadline := time.Now().Add(duExitWait); activeDu.Load() > 0 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func (m *model) cancelOverviewScans(removedPaths []string) {
 	for path, publication := range m.overviewScanningSet {
 		if len(removedPaths) == 0 || pathTouchesRemoved(path, removedPaths) {

@@ -208,6 +208,20 @@ load_purge_config() {
     PURGE_SEARCH_PATHS=()
     PURGE_DISCOVERY_STATUS=0
 
+    # Only a confirmed missing file may fall back to discovery, which rewrites
+    # the config. Anything else that cannot be read keeps the user's scope.
+    local config_state=0
+    mole_whitelist_file_state "$PURGE_CONFIG_FILE" "purge paths" || config_state=$?
+    [[ $config_state -ne 2 ]] || return 1
+
+    # Process substitution would lose the status of a failure after the probe.
+    local config_paths config_status=0
+    config_paths=$(mole_purge_read_paths_config "$PURGE_CONFIG_FILE" 2> /dev/null) || config_status=$?
+    if [[ $config_status -ne 0 ]]; then
+        [[ $config_status -ge 128 ]] || mole_report_unreadable_whitelist "$PURGE_CONFIG_FILE" "purge paths"
+        return "$config_status"
+    fi
+
     local line existing_path already_found
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
@@ -224,9 +238,16 @@ load_purge_config() {
         done
         [[ "$already_found" == "true" ]] && continue
         PURGE_SEARCH_PATHS+=("$line")
-    done < <(mole_purge_read_paths_config "$PURGE_CONFIG_FILE")
+    done <<< "$config_paths"
 
     if [[ ${#PURGE_SEARCH_PATHS[@]} -eq 0 ]]; then
+        # A file the user kept with no active paths asks for the defaults, as
+        # its template and `mo purge --paths` say; discovery would replace it.
+        if [[ $config_state -eq 0 ]]; then
+            PURGE_SEARCH_PATHS=("${DEFAULT_PURGE_SEARCH_PATHS[@]}")
+            return 0
+        fi
+
         if [[ -t 1 ]] && [[ -z "${_PURGE_DISCOVERY_SILENT:-}" ]]; then
             echo -e "${GRAY}First run: discovering project directories...${NC}" >&2
         fi
@@ -501,56 +522,463 @@ is_protected_vendor_dir() {
 # Names do not prove rebuildability: target/deploy carries Anchor keys,
 # and build/coverage can contain tracked source. Reused at discovery and sink.
 # Returns 0 when authored content is present, 1 when the walk completed and
-# found none, 2 when a probe timed out or failed. A 2 is not evidence either
+# found none, 2 when a probe timed out or failed; signals propagate. A 2 is not evidence either
 # way: callers keep the candidate but must say so instead of dropping it.
 purge_artifact_has_authored_content() {
     local path="${1%/}"
+    local deadline="${2:-}"
+    local probe_timeout=""
     [[ -d "$path" ]] || return 1
     # A configured root can cross a symlink before reaching the candidate.
-    # Git ancestry must follow the actual repository, not the alias spelling.
     path=$(cd "$path" 2> /dev/null && /bin/pwd -P) || return 2
     local evidence=""
     # Do not follow links or read key contents. This walks the whole artifact
     # when nothing matches, so it takes the tree-walk budget, not the
     # command-probe one.
-    evidence=$(run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" /usr/bin/find "$path" \
-        \( -name .git -o -name '*-keypair.json' \) -print -quit 2> /dev/null) || return 2
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 2
+    local probe_rc=0
+    evidence=$(run_with_timeout "$probe_timeout" /usr/bin/find "$path" \
+        \( -name .git -o -name '*-keypair.json' \) -print -quit 2> /dev/null) || probe_rc=$?
+    [[ $probe_rc -le 128 ]] || return "$probe_rc"
+    [[ $probe_rc -eq 0 ]] || return 2
     [[ -z "$evidence" ]] || return 0
 
-    local ancestor="$path"
-    while [[ "$ancestor" != "/" && -n "$ancestor" ]]; do
-        if [[ -e "$ancestor/.git" || -L "$ancestor/.git" ]]; then
-            # Ignore inherited Git routing; inspect this directory's own repo.
-            evidence=$(run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" \
-                env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
-                GIT_OPTIONAL_LOCKS=0 GIT_LITERAL_PATHSPECS=1 \
-                git -c core.fsmonitor=false --git-dir="$ancestor/.git" --work-tree="$ancestor" -C "$path" ls-files -- . 2> /dev/null) || return 2
-            [[ -n "$evidence" ]]
-            return $?
-        fi
-        ancestor="${ancestor%/*}"
-    done
-    return 1
+    local tracked_rc=0
+    mole_path_has_git_tracked_files "$path" "$deadline" || tracked_rc=$?
+    return "$tracked_rc"
 }
 
+# Set by is_protected_purge_artifact: "in_use" when a process holds the artifact.
+PURGE_PROTECTION_REASON=""
 # Set by is_protected_purge_artifact: true when the verdict came from an
 # unfinished content probe rather than evidence.
 PURGE_PROTECTION_UNVERIFIED=false
 
+# Returns the same tri-state as process probes. A project may be active with
+# no open file inside node_modules, for example a shell or dev server in cwd.
+# lsof prints a name in the C locale, which purge runs under, with every byte
+# outside printable ASCII as \xHH and a backslash doubled, so a raw comparison
+# never matches ~/www/项目.
+_purge_lsof_path_form() {
+    local path="$1" byte char form=""
+    local LC_ALL=C
+    if [[ "$path" != *[!\ -~]* && "$path" != *\\* ]]; then
+        printf '%s' "$path"
+        return 0
+    fi
+    for byte in $(printf '%s' "$path" | /usr/bin/od -An -v -tx1); do
+        if [[ "$byte" == 5c ]]; then
+            form+="\\\\"
+        elif [[ "$((16#$byte))" -ge 32 && "$((16#$byte))" -le 126 ]]; then
+            printf -v char '%b' "\\x$byte"
+            form+="$char"
+        else
+            form+="\\x$byte"
+        fi
+    done
+    printf '%s' "$form"
+}
+
+# Regex for paths on a command line, ended by anything that cannot continue a
+# file name (a `java -cp a:b` colon, a comma, a quote). A /private path may be
+# spelled through its macOS alias, and a non-ASCII name in the other Unicode form
+# than the disk. lsof reports the disk's spelling, so only this probe needs them.
+_purge_path_regex() {
+    local regex="" path spelling conversion form
+    for path in "$@"; do
+        for spelling in "$path" "${path#/private}"; do
+            case "$spelling" in
+                /tmp | /tmp/* | /var | /var/* | /etc | /etc/* | "$path") ;;
+                *) continue ;;
+            esac
+            regex+="${regex:+|}$(_mole_regex_escape "$spelling")"
+            [[ -n "$(LC_ALL=C printf '%s' "$spelling" | LC_ALL=C /usr/bin/tr -d ' -~')" ]] || continue
+            for conversion in "UTF-8-MAC UTF-8" "UTF-8 UTF-8-MAC"; do
+                form=$(printf '%s' "$spelling" | /usr/bin/iconv -f "${conversion% *}" -t "${conversion#* }" 2> /dev/null) || continue
+                [[ -z "$form" || "$form" == "$spelling" ]] || regex+="|$(_mole_regex_escape "$form")"
+            done
+        done
+    done
+    printf '(%s)([^[:alnum:]._-]|$)' "$regex"
+}
+
+# Is any of these pids, which a probe just saw, a live process other than Mole?
+# Mole is itself, what it started, and the unbroken chain of shells that started
+# it, such as the shell that ran `mo purge` from a project. The first ancestor
+# that is not a shell ends the chain, so a dev server or an Electron app whose
+# terminal runs Mole still counts. The table is read after the probe, so a pid
+# missing from it has exited, as Mole's own polling sleeps do. A match that names
+# no pid is still a match. Same statuses as the probes that call it.
+_purge_outside_process_among() {
+    local pids="$1" deadline="${2:-}" probe_timeout table rc=0
+    [[ -n "$pids" ]] || return 0
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 2
+    table=$(LC_ALL=C run_with_timeout "$probe_timeout" /bin/ps -axo pid=,ppid=,comm= 2> /dev/null) || rc=$?
+    [[ $rc -le 128 ]] || return "$rc"
+    [[ $rc -eq 0 && -n "$table" ]] || return 2
+    rc=0
+    HIT_PIDS="$pids" SELF_PID="$$" LC_ALL=C /usr/bin/awk '
+        {
+            parent[$1] = $2
+            name = $0
+            sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", name)
+            sub(/.*\//, "", name)
+            sub(/^-/, "", name)
+            if (name ~ /^(bash|zsh|sh|dash|ksh|fish|tcsh|csh)$/) shell[$1] = 1
+        }
+        END {
+            self = ENVIRON["SELF_PID"]
+            own[self] = 1
+            for (pid = parent[self]; (pid in shell) && !(pid in own); pid = parent[pid]) own[pid] = 1
+            descendants[self] = 1
+            do {
+                grew = 0
+                for (pid in parent) {
+                    if (!(pid in descendants) && (parent[pid] in descendants)) {
+                        descendants[pid] = 1
+                        grew = 1
+                    }
+                }
+            } while (grew)
+            count = split(ENVIRON["HIT_PIDS"], hits, /[ \n]+/)
+            for (i = 1; i <= count; i++) {
+                pid = hits[i]
+                if ((pid in parent) && !(pid in own) && !(pid in descendants)) exit 0
+            }
+            exit 1
+        }' <<< "$table" || rc=$?
+    return "$rc"
+}
+
+_purge_other_process_matches() {
+    local pattern="$1" deadline="${2:-}" probe_timeout rc=0 matched_pids=""
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 2
+    # Case-blind: the default volume is, so a command line may spell it either way.
+    matched_pids=$(run_with_timeout "$probe_timeout" pgrep -if "$pattern" 2> /dev/null) || rc=$?
+    [[ $rc -le 128 ]] || return "$rc"
+    [[ $rc -le 1 ]] || return 2
+    [[ $rc -eq 0 ]] || return 1
+    _purge_outside_process_among "$matched_pids" "$deadline"
+}
+
+# The open-file listing the in-use probes read, left in _PURGE_OPEN_LISTING.
+# A filter pass's snapshot wins. Otherwise a complete listing that finished
+# within the current wall-clock second answers again, so the delete loop and
+# its final guard ask lsof once per second for a whole batch instead of twice
+# per folder each (four machine-wide lsof per folder before, about 15 s for
+# twenty folders). The window matches Mole Mac's sink: anything opened after
+# the listing returned stays unseen for under a second. SECONDS ticks with the
+# wall clock, so an equal stamp, taken when lsof returned, is younger than one
+# second; bash 3.2 has no cheaper monotonic clock, so a clock stepped back by
+# k seconds mid-run can stretch that to k+1. A failed, empty or
+# warning-carrying listing is never kept. Same statuses as the probes:
+# 0 listed, 2 unknown, >128 signal.
+_PURGE_OPEN_LISTING=""
+_PURGE_SINK_LISTING=""
+_PURGE_SINK_LISTING_SECOND=""
+_purge_open_listing() {
+    local deadline="${1:-}" probe_timeout listing rc=0
+    _PURGE_OPEN_LISTING=""
+    if [[ -n "${_PURGE_OPEN_SNAPSHOT:-}" ]]; then
+        _PURGE_OPEN_LISTING="$_PURGE_OPEN_SNAPSHOT"
+        return 0
+    fi
+    if [[ -n "$_PURGE_SINK_LISTING" && "$_PURGE_SINK_LISTING_SECOND" == "$SECONDS" ]]; then
+        _PURGE_OPEN_LISTING="$_PURGE_SINK_LISTING"
+        return 0
+    fi
+    _PURGE_SINK_LISTING=""
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 2
+    local error_file="" returned_second
+    # Removed below on every path; the temp root prunes it if Mole dies first.
+    error_file=$(mktemp "$(mole_temp_path_template mole-purge-lsof)" 2> /dev/null) || return 2
+    # From /, so lsof and its wrappers never list themselves in the project.
+    # stderr stays apart: merged into a pipe it can split a name line in two.
+    listing=$(cd / && run_with_timeout "$probe_timeout" /usr/sbin/lsof -nP -a -u "$(id -u)" -Fn 2> "$error_file") || rc=$?
+    returned_second="$SECONDS"
+    if [[ -s "$error_file" ]]; then
+        rm -f "$error_file" # SAFE: mktemp file this function created
+        [[ $rc -le 128 ]] || return "$rc"
+        return 2 # A warning means some processes went unseen.
+    fi
+    rm -f "$error_file" # SAFE: mktemp file this function created
+    [[ $rc -le 128 ]] || return "$rc"
+    [[ $rc -eq 0 && -n "$listing" ]] || return 2
+    _PURGE_OPEN_LISTING="$listing"
+    if ! LC_ALL=C /usr/bin/grep -q '^[^pfn]' <<< "$listing"; then
+        _PURGE_SINK_LISTING="$listing"
+        _PURGE_SINK_LISTING_SECOND="$returned_second"
+    fi
+    return 0
+}
+
+purge_node_project_running() {
+    local project="$1" deadline="${2:-}" evidence rc=0 line saw_cwd=false
+    [[ "$project" == /* && ! "$project" =~ [[:cntrl:]] ]] || return 2
+    _purge_open_listing "$deadline" || rc=$?
+    [[ $rc -le 128 ]] || return "$rc"
+    [[ $rc -eq 0 ]] || return 2
+    evidence=$(LC_ALL=C /usr/bin/awk '
+        /^p/ { pid = $0; next }
+        /^f/ { cwd = ($0 == "fcwd"); if (cwd) { print pid; print $0 } next }
+        /^n/ { if (cwd) print; next }
+        { print }' <<< "$_PURGE_OPEN_LISTING")
+    local listed_project current_pid=""
+    listed_project=$(_purge_lsof_path_form "$project")
+    while IFS= read -r line; do
+        case "$line" in
+            "n$project" | "n$project/"* | "n$listed_project" | "n$listed_project/"*)
+                rc=0
+                _purge_outside_process_among "$current_pid" "$deadline" || rc=$?
+                [[ $rc -ne 0 ]] || return 0
+                [[ $rc -eq 1 ]] || return "$rc"
+                saw_cwd=true
+                ;;
+            n/*) saw_cwd=true ;;
+            p[0-9]*) current_pid="${line#p}" ;;
+            fcwd) ;;
+            *) return 2 ;; # A warning or unavailable cwd makes visibility incomplete.
+        esac
+    done <<< "$evidence"
+    [[ "$saw_cwd" == true ]] || return 2
+    _purge_other_process_matches "$(_purge_path_regex "$project")" "$deadline"
+}
+
+# Lockfiles make reinstall possible; the package-manager record separates
+# installed files from later local edits. An incomplete probe is not proof.
+# This is independent of the existing seven-day activity/selection policy.
+purge_node_modules_is_protected() {
+    local path="$1" deadline="${2:-}" project marker="" pair lock record
+    local evidence probe_timeout rc=0
+    path=$(cd "$path" 2> /dev/null && /bin/pwd -P) || return 2
+    project="${path%/*}"
+    [[ -f "$project/package.json" && -r "$project/package.json" && ! -L "$project/package.json" ]] || return 0
+    for pair in 'package-lock.json:.package-lock.json' 'npm-shrinkwrap.json:.package-lock.json' 'pnpm-lock.yaml:.modules.yaml' 'yarn.lock:.yarn-integrity' 'yarn.lock:.yarn-state.yml'; do
+        lock="${pair%%:*}"
+        record="${pair#*:}"
+        if [[ -f "$project/$lock" && -r "$project/$lock" && ! -L "$project/$lock" &&
+            -f "$path/$record" && -r "$path/$record" && ! -L "$path/$record" ]]; then
+            marker="$path/$record"
+            break
+        fi
+    done
+    [[ -n "$marker" ]] || return 0
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 2
+    evidence=$(run_with_timeout "$probe_timeout" /usr/bin/find "$path" \
+        -type d -path "$path/.cache" -prune -o -type f -newer "$marker" -print -quit 2> /dev/null) || rc=$?
+    [[ $rc -le 128 ]] || return "$rc"
+    [[ $rc -eq 0 ]] || return 2
+    [[ -z "$evidence" ]] || return 0
+    purge_node_project_running "$project" "$deadline"
+}
+
+# Same statuses as the process probes (0 in use, 1 idle, 2 unknown, >128 signal).
+# Does a current-user process other than Mole hold a descriptor, mapped binary or
+# cwd inside the artifact, or name it on a command line?
+purge_artifact_in_use() {
+    local artifact="${1%/}" deadline="${2:-}" rc=0
+    [[ "$artifact" == /* && ! "$artifact" =~ [[:cntrl:]] ]] || return 2
+    _purge_open_listing "$deadline" || rc=$?
+    [[ $rc -le 128 ]] || return "$rc"
+    [[ $rc -eq 0 ]] || return 2
+
+    local holders=""
+    holders=$(TARGET_ARTIFACT="$artifact" TARGET_LISTED="$(_purge_lsof_path_form "$artifact")" LC_ALL=C /usr/bin/awk '
+        BEGIN {
+            raw = ENVIRON["TARGET_ARTIFACT"]
+            listed = ENVIRON["TARGET_LISTED"]
+        }
+        /^p[0-9]+$/ { pid = substr($0, 2); next }
+        /^f/ { next }
+        /^n/ {
+            path = substr($0, 2)
+            if ((path == raw || path == listed || index(path, raw "/") == 1 || index(path, listed "/") == 1) && !(pid in seen)) {
+                seen[pid] = 1
+                printf "%s ", pid
+            }
+            next
+        }
+        { exit 20 }
+        END {
+            if (pid == "") exit 20
+        }
+    ' <<< "$_PURGE_OPEN_LISTING") || return 2
+    if [[ -n "$holders" ]]; then
+        rc=0
+        _purge_outside_process_among "$holders" "$deadline" || rc=$?
+        [[ $rc -ne 0 ]] || return 0
+        [[ $rc -eq 1 ]] || return "$rc"
+    fi
+
+    _purge_other_process_matches "$(_purge_path_regex "$artifact")" "$deadline"
+}
+
+# One listing for a whole filter pass, taken before its workers start. Without
+# it every candidate pays a whole-system lsof. A failed listing leaves the
+# probes to ask live and report for themselves.
+_purge_take_lsof_snapshots() {
+    local deadline="${1:-}" probe_timeout listing
+    probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$deadline") || return 0
+    listing=$(cd / && run_with_timeout "$probe_timeout" /usr/sbin/lsof -nP -a -u "$(id -u)" -Fn 2>&1) && _PURGE_OPEN_SNAPSHOT="$listing"
+    return 0
+}
+
+# A build folder also stays while its project runs. Records an unknown state in
+# PURGE_PROTECTION_UNVERIFIED, as the other target checks do.
+_purge_running_project_protects() {
+    local path="$1" deadline="${2:-}" physical rc=0
+    if ! physical=$(cd "$path" 2> /dev/null && /bin/pwd -P); then
+        PURGE_PROTECTION_UNVERIFIED=true
+        return 0
+    fi
+    purge_node_project_running "${physical%/*}" "$deadline" || rc=$?
+    [[ $rc -le 128 ]] || return "$rc"
+    if [[ $rc -eq 2 ]]; then
+        PURGE_PROTECTION_UNVERIFIED=true
+        return 0
+    fi
+    [[ $rc -ne 0 ]] || PURGE_PROTECTION_REASON="in_use"
+    return "$rc"
+}
+
+# .build, or a --scratch-path directory SwiftPM itself tagged. A file named
+# workspace-state.json proves nothing: any other purge target name stays that
+# target, with its own guards.
+_is_swiftpm_scratch_root() {
+    local dir="${1%/}" base="${1%/}" target tag
+    base="${base##*/}"
+    [[ -d "$dir" && ! -L "$dir" ]] || return 1
+    [[ "$base" != ".build" ]] || return 0
+    for target in "${MOLE_PURGE_TARGETS[@]}"; do
+        [[ "$base" != "$target" ]] || return 1
+    done
+    tag="$dir/$MOLE_CACHEDIR_TAG_NAME"
+    [[ -f "$tag" && ! -L "$tag" ]] || return 1
+    LC_ALL=C /usr/bin/grep -q 'Swift Package Manager' "$tag" 2> /dev/null
+}
+
+# An unreadable or non-directory entry counts as holding something.
+_swiftpm_dir_has_entries() {
+    local listing=""
+    [[ -e "$1" || -L "$1" ]] || return 1
+    [[ -d "$1" && ! -L "$1" ]] || return 0
+    listing=$(/bin/ls -A "$1" 2> /dev/null) || return 0
+    [[ -n "$listing" ]]
+}
+
+# A scratch root that resolved dependencies, which is what offering it whole
+# would trip on (checkouts/<pkg>/.git) and re-clone. SourceKit-LSP's index-build
+# resolves its own, so it decomposes the same way.
+is_swiftpm_packaged_scratch_dir() {
+    local dir="${1%/}"
+    [[ -d "$dir" && ! -L "$dir" ]] || return 1
+    if [[ "${dir##*/}" == "index-build" ]]; then
+        _is_swiftpm_scratch_root "${dir%/*}" || return 1
+    else
+        _is_swiftpm_scratch_root "$dir" || return 1
+    fi
+    _swiftpm_dir_has_entries "$dir/checkouts" || _swiftpm_dir_has_entries "$dir/repositories"
+}
+
+is_swiftpm_build_output_artifact() {
+    local path="${1%/}"
+    local base="${path##*/}"
+    local parent="${path%/*}"
+    [[ -n "$parent" && "$parent" != "$path" ]] || return 1
+    local output_name
+    for output_name in "${MOLE_SWIFTPM_BUILD_OUTPUT_DIRS[@]}"; do
+        if [[ "$base" == "$output_name" ]]; then
+            is_swiftpm_packaged_scratch_dir "$parent"
+            return $?
+        fi
+    done
+    return 1
+}
+
+purge_swiftpm_scratch_running() {
+    local scratch_dir="${1%/}" deadline="${2:-}"
+    local scratch_name="${scratch_dir##*/}"
+    [[ -n "$scratch_name" && ! "$scratch_name" =~ [[:cntrl:]] ]] || return 2
+    # A plain .build names nothing specific; the project probe covers it.
+    [[ "$scratch_name" != ".build" ]] || return 1
+    _purge_other_process_matches "(^|[[:space:]/=])$(_purge_path_regex "$scratch_name")" "$deadline"
+}
+
+purge_swiftpm_output_is_protected() {
+    local path="${1%/}" deadline="${2:-}"
+    path=$(cd "$path" 2> /dev/null && /bin/pwd -P) || return 2
+    local scratch_dir="${path%/*}"
+    [[ "${scratch_dir##*/}" != "index-build" ]] || scratch_dir="${scratch_dir%/*}"
+    local project="${scratch_dir%/*}"
+    [[ -n "$project" && "$project" == /* ]] || return 2
+    local running_rc=0
+    purge_node_project_running "$project" "$deadline" || running_rc=$?
+    [[ $running_rc -le 128 ]] || return "$running_rc"
+    [[ $running_rc -ne 2 ]] || return 2
+    [[ $running_rc -ne 0 ]] || return 0
+
+    local scratch_rc=0
+    purge_swiftpm_scratch_running "$scratch_dir" "$deadline" || scratch_rc=$?
+    [[ $scratch_rc -le 128 ]] || return "$scratch_rc"
+    return "$scratch_rc"
+}
+
+emit_purge_candidate_or_swiftpm_outputs() {
+    local item="${1%/}"
+    local search_path="$2"
+    if is_swiftpm_packaged_scratch_dir "$item"; then
+        local output_name output_dir
+        for output_name in "${MOLE_SWIFTPM_BUILD_OUTPUT_DIRS[@]}"; do
+            output_dir="$item/$output_name"
+            if [[ -d "$output_dir" && ! -L "$output_dir" ]] && is_safe_project_artifact "$output_dir" "$search_path"; then
+                emit_purge_candidate_or_swiftpm_outputs "$output_dir" "$search_path"
+            fi
+        done
+        return 0
+    fi
+    printf '%s\n' "$item"
+}
+
 is_protected_purge_artifact() {
     local path="${1%/}"
+    local deadline="${2:-}"
     local base="${path##*/}"
 
     PURGE_PROTECTION_UNVERIFIED=false
+    PURGE_PROTECTION_REASON=""
     local authored_rc=0
-    purge_artifact_has_authored_content "$path" || authored_rc=$?
+    purge_artifact_has_authored_content "$path" "$deadline" || authored_rc=$?
+    [[ $authored_rc -le 128 ]] || return "$authored_rc"
     if [[ $authored_rc -eq 2 ]]; then
         PURGE_PROTECTION_UNVERIFIED=true
         return 0
     fi
     [[ $authored_rc -ne 0 ]] || return 0
 
+    local physical_path="$path" in_use_rc=0
+    physical_path=$(cd "$path" 2> /dev/null && /bin/pwd -P) || physical_path="$path"
+    purge_artifact_in_use "$physical_path" "$deadline" || in_use_rc=$?
+    [[ $in_use_rc -le 128 ]] || return "$in_use_rc"
+    if [[ $in_use_rc -eq 2 ]]; then
+        PURGE_PROTECTION_UNVERIFIED=true
+        return 0
+    fi
+    if [[ $in_use_rc -eq 0 ]]; then
+        PURGE_PROTECTION_REASON="in_use"
+        return 0
+    fi
+
     case "$base" in
+        node_modules)
+            local node_rc=0
+            purge_node_modules_is_protected "$path" "$deadline" || node_rc=$?
+            [[ $node_rc -le 128 ]] || return "$node_rc"
+            if [[ $node_rc -eq 2 ]]; then
+                PURGE_PROTECTION_UNVERIFIED=true
+                return 0
+            fi
+            return "$node_rc"
+            ;;
         bin)
             # Only allow purging bin/ when we can detect .NET context.
             if is_dotnet_bin_dir "$path"; then
@@ -566,21 +994,167 @@ is_protected_purge_artifact() {
             # Protect Xcode global DerivedData in ~/Library/Developer/Xcode/
             # Only allow purging DerivedData within project directories
             [[ "$path" == *"/Library/Developer/Xcode/DerivedData"* ]] && return 0
-            return 1
+            [[ -f "$path/info.plist" || -d "$path/Build" ]] || return 1
+            _purge_running_project_protects "$path" "$deadline"
+            return $?
+            ;;
+        target)
+            [[ -f "${path%/*}/Cargo.toml" || -f "${path%/*}/pom.xml" || -f "$path/.rustc_info.json" ]] || return 1
+            _purge_running_project_protects "$path" "$deadline"
+            return $?
+            ;;
+        .build)
+            [[ -f "${path%/*}/Package.swift" || -f "$path/workspace-state.json" || -f "$path/build.db" ]] || return 1
+            _purge_running_project_protects "$path" "$deadline"
+            return $?
+            ;;
+        venv | .venv)
+            [[ -f "$path/pyvenv.cfg" ]] || return 1
+            _purge_running_project_protects "$path" "$deadline"
+            return $?
             ;;
     esac
+
+    if is_swiftpm_build_output_artifact "$path"; then
+        local swiftpm_rc=0
+        purge_swiftpm_output_is_protected "$path" "$deadline" || swiftpm_rc=$?
+        [[ $swiftpm_rc -le 128 ]] || return "$swiftpm_rc"
+        if [[ $swiftpm_rc -eq 2 ]]; then
+            PURGE_PROTECTION_UNVERIFIED=true
+            return 0
+        fi
+        [[ $swiftpm_rc -ne 0 ]] || PURGE_PROTECTION_REASON="in_use"
+        return "$swiftpm_rc"
+    fi
 
     return 1
 }
 
-# Scan purge targets using fd (fast) or pruned find.
+# Scan purge targets using fd (fast) or pruned find. Optional $3 names a file
+# for the candidates the content probes verified clean; the caller that asks
+# for it owns and removes it, so a plain scan leaves nothing behind.
+# The purge walk and its dataless probe use the system find: `-flags` is a BSD
+# primary, so a GNU findutils find earlier in PATH would always answer "unknown"
+# and the walk would descend into online-only cloud folders. One binary for the
+# probe, the root listing and the walk keeps the probe's answer true for both.
+# Not readonly so a test can point it at a fixture stub after sourcing.
+_MOLE_PURGE_FIND="/usr/bin/find"
+
+# 0 when this find accepts `-flags +dataless`. Probed once per process on a
+# directory that is never dataless; any failure means "unknown", not "dataless".
+_purge_find_knows_dataless() {
+    if [[ -z "${_MOLE_PURGE_FIND_DATALESS:-}" ]]; then
+        local probe_rc=0
+        run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" "$_MOLE_PURGE_FIND" "$HOME" -maxdepth 0 -flags +dataless > /dev/null 2>&1 || probe_rc=$?
+        mole_rc_signal "$probe_rc" && return "$probe_rc"
+        if [[ $probe_rc -eq 0 ]]; then
+            _MOLE_PURGE_FIND_DATALESS="yes"
+        else
+            _MOLE_PURGE_FIND_DATALESS="no"
+        fi
+    fi
+    [[ "$_MOLE_PURGE_FIND_DATALESS" == "yes" ]]
+}
+
+# Directories every purge walk prunes by name.
+readonly PURGE_WALK_PRUNE_DIRS=(".git" "Library" ".Trash" "Applications")
+
+# Sets _PURGE_PRUNE_EXPR and _PURGE_TARGET_EXPR, the find name tests the purge
+# walks share. $1 = yes adds the online-only (dataless) prune: such a folder
+# holds nothing on this disk, and listing it makes the File Provider fetch it
+# from the network, which is how a Google Drive root used up the scan budget
+# (#1679).
+_purge_walk_expressions() {
+    local with_dataless="$1" name
+    _PURGE_PRUNE_EXPR=()
+    for name in "${PURGE_WALK_PRUNE_DIRS[@]}"; do
+        [[ ${#_PURGE_PRUNE_EXPR[@]} -eq 0 ]] || _PURGE_PRUNE_EXPR+=(-o)
+        _PURGE_PRUNE_EXPR+=(-name "$name")
+    done
+    [[ "$with_dataless" != "yes" ]] || _PURGE_PRUNE_EXPR+=(-o -flags +dataless)
+    _PURGE_TARGET_EXPR=()
+    for name in "${PURGE_TARGETS[@]}"; do
+        [[ ${#_PURGE_TARGET_EXPR[@]} -eq 0 ]] || _PURGE_TARGET_EXPR+=(-o)
+        _PURGE_TARGET_EXPR+=(-name "$name")
+    done
+}
+
+# Split a configured scan root whose single scan timed out into scan units,
+# each re-scanned with its own budget so one slow project skips only itself
+# (#1666). A root that is itself a project stays one unit. Any other root
+# becomes one unit per direct child the root walk would enter: pruned names,
+# online-only folders, purge targets (a direct-child artifact of a non-project
+# root is refused by the depth rule anyway), symlinks and non-directories are
+# left out. A root whose listing fails, or that has no such child, stays one
+# unit. Sets _PURGE_SCAN_UNITS; returns a signal status when the listing was
+# interrupted.
+_PURGE_SCAN_UNITS=()
+_purge_list_scan_units() {
+    local root="$1"
+    _PURGE_SCAN_UNITS=()
+    if mole_purge_is_project_root "$root"; then
+        _PURGE_SCAN_UNITS=("$root")
+        return 0
+    fi
+    local dataless_rc=0 with_dataless=no
+    _purge_find_knows_dataless || dataless_rc=$?
+    if mole_rc_signal "$dataless_rc"; then
+        return "$dataless_rc"
+    fi
+    [[ $dataless_rc -ne 0 ]] || with_dataless=yes
+    _purge_walk_expressions "$with_dataless"
+
+    local list_output=""
+    list_output=$(mktemp_file "mole-purge-units") || list_output=""
+    local list_rc=1
+    if [[ -n "$list_output" ]]; then
+        list_rc=0
+        run_with_timeout "$(_purge_scan_timeout_seconds)" "$_MOLE_PURGE_FIND" "$root" -mindepth 1 -maxdepth 1 \
+            \( "${_PURGE_PRUNE_EXPR[@]}" -o "${_PURGE_TARGET_EXPR[@]}" \) -prune -o \
+            -type d -print0 2> /dev/null > "$list_output" || list_rc=$?
+    fi
+    if mole_rc_signal "$list_rc"; then
+        rm -f "$list_output" 2> /dev/null || true # SAFE: exact scratch file created above
+        return "$list_rc"
+    fi
+    if [[ $list_rc -eq 0 ]]; then
+        # Sorted, so units start and skipped children are reported in name
+        # order rather than directory order.
+        local child
+        while IFS= read -r -d '' child; do
+            [[ "$child" == "${root%/}/"* && -d "$child" && ! -L "$child" ]] || continue
+            _PURGE_SCAN_UNITS+=("$child")
+        done < <(LC_ALL=C sort -z "$list_output" 2> /dev/null)
+    else
+        debug_log "Purge scan root listing failed (status $list_rc), scanning it as one unit: $root"
+    fi
+    [[ -z "$list_output" ]] || rm -f "$list_output" 2> /dev/null || true # SAFE: exact scratch file created above
+    [[ ${#_PURGE_SCAN_UNITS[@]} -gt 0 ]] || _PURGE_SCAN_UNITS=("$root")
+    return 0
+}
+
+# Whole-second discovery budget for one scan unit, from MO_PURGE_SCAN_TIMEOUT_SEC.
+_purge_scan_timeout_seconds() {
+    local scan_timeout="${MO_PURGE_SCAN_TIMEOUT_SEC:-60}"
+    [[ "$scan_timeout" =~ ^[1-9][0-9]*$ ]] || scan_timeout=60
+    [[ "$scan_timeout" -ge 2 ]] || scan_timeout=2
+    printf '%s\n' "$scan_timeout"
+}
+
+# Args: $1 configured scan root, $2 output file, $3 optional verified sidecar,
+# $4 optional scan unit: a directory below $1 to walk instead of all of $1.
+# Depth limits and safety checks stay relative to $1, so a unit finds exactly
+# what the whole-root walk finds below it (#1666).
 scan_purge_targets() {
     local search_path="$1"
     local output_file="$2"
     local target_output="${output_file}.targets"
     local tag_output="${output_file}.tags"
+    local walk_output="${output_file}.walk"
     local processed_output="${output_file}.processed"
     local error_output="${output_file}.errors"
+    local verified_output="${3:-}"
+    local walk_path="${4:-$search_path}"
     local min_depth="$PURGE_MIN_DEPTH_DEFAULT"
     local max_depth="$PURGE_MAX_DEPTH_DEFAULT"
     if [[ ! "$min_depth" =~ ^[0-9]+$ ]]; then
@@ -595,24 +1169,47 @@ scan_purge_targets() {
     if [[ ! -d "$search_path" ]]; then
         return
     fi
+    # A unit is a real directory below the root. One that vanished or became a
+    # symlink after the root was listed holds nothing this root may scan.
+    local walk_offset=0
+    if [[ "$walk_path" != "$search_path" ]]; then
+        local walk_relative="${walk_path#"${search_path%/}"/}"
+        [[ "$walk_relative" != "$walk_path" && -n "$walk_relative" ]] || return 1
+        local walk_relative_without_slashes="${walk_relative//\//}"
+        walk_offset=$((${#walk_relative} - ${#walk_relative_without_slashes} + 1))
+        if [[ -L "$walk_path" || ! -d "$walk_path" ]]; then
+            : > "$output_file"
+            return 0
+        fi
+    fi
 
     # A scan result is publishable only after every producer and filter for the
     # root completes. Keep the caller-visible file empty until that point so a
     # timeout or read failure cannot turn a partial prefix into delete candidates.
     : > "$output_file"
-    rm -f "$target_output" "$tag_output" "$processed_output" "$error_output" 2> /dev/null || true
+    rm -f "$target_output" "$tag_output" "$walk_output" "$processed_output" "$error_output" 2> /dev/null || true
+    [[ -z "$verified_output" ]] || rm -f "$verified_output" "${verified_output}.probes" 2> /dev/null || true
 
-    local cachedir_tag_min_depth=$((min_depth + 1))
-    local cachedir_tag_max_depth=$((max_depth + 1))
-    local scan_timeout="${MO_PURGE_SCAN_TIMEOUT_SEC:-60}"
-    [[ "$scan_timeout" =~ ^[1-9][0-9]*$ ]] || scan_timeout=60
-    [[ "$scan_timeout" -ge 2 ]] || scan_timeout=2
+    # Depths below are relative to the walk path; candidates keep the depths
+    # they have relative to the configured root.
+    local cachedir_tag_min_depth=$((min_depth + 1 - walk_offset))
+    local cachedir_tag_max_depth=$((max_depth + 1 - walk_offset))
+    min_depth=$((min_depth - walk_offset))
+    max_depth=$((max_depth - walk_offset))
+    [[ $min_depth -ge 1 ]] || min_depth=1
+    [[ $cachedir_tag_min_depth -ge 1 ]] || cachedir_tag_min_depth=1
+    if [[ $max_depth -lt $min_depth ]]; then
+        : > "$output_file"
+        return 0
+    fi
+    local scan_timeout
+    scan_timeout=$(_purge_scan_timeout_seconds)
     local scan_deadline=$((SECONDS + scan_timeout))
     local scan_stage_timeout=""
 
     # Update current scanning path
     local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
-    echo "$search_path" > "$stats_dir/purge_scanning" 2> /dev/null || true
+    echo "$walk_path" > "$stats_dir/purge_scanning" 2> /dev/null || true
 
     emit_valid_cachedir_tag_dirs() {
         local deadline="$1"
@@ -651,16 +1248,17 @@ scan_purge_targets() {
                         fi
 
                         if [[ -n "$item" ]] && is_safe_project_artifact "$item" "$search_path"; then
-                            echo "$item"
+                            emit_purge_candidate_or_swiftpm_outputs "$item" "$search_path"
                             # Update scanning path to show current project directory
                             local project_dir="${item%/*}"
                             echo "$project_dir" > "$stats_dir/purge_scanning" 2> /dev/null || true
                         fi
                     done
-                ) | filter_protected_artifacts "$deadline" > "$processed_output" || process_status=$?
+                ) | filter_protected_artifacts "$deadline" "$verified_output" "$stats_dir/purge_scanning" > "$processed_output" || process_status=$?
 
             if [[ $process_status -ne 0 ]]; then
                 rm -f "$processed_output" 2> /dev/null || true
+                [[ -z "$verified_output" ]] || rm -f "$verified_output" "${verified_output}.probes" 2> /dev/null || true
                 return "$process_status"
             fi
             if ! mv "$processed_output" "$output_file"; then
@@ -673,7 +1271,7 @@ scan_purge_targets() {
     }
 
     cleanup_scan_outputs() {
-        rm -f "$target_output" "$tag_output" "$processed_output" "$error_output" 2> /dev/null || true
+        rm -f "$target_output" "$tag_output" "$walk_output" "$processed_output" "$error_output" 2> /dev/null || true
     }
 
     local use_find=true
@@ -681,6 +1279,9 @@ scan_purge_targets() {
     # Allow forcing find via MO_USE_FIND environment variable
     if [[ "${MO_USE_FIND:-0}" == "1" ]]; then
         debug_log "MO_USE_FIND=1: Forcing find instead of fd"
+        use_find=true
+    elif mole_purge_is_cloud_synced_path "$search_path" || mole_purge_is_cloud_synced_path "$walk_path"; then
+        # Only find can skip online-only (dataless) directories, see below.
         use_find=true
     elif command -v fd > /dev/null 2>&1; then
         # Escape regex special characters in target names for fd patterns (single sed pass)
@@ -731,14 +1332,14 @@ scan_purge_targets() {
         if [[ $fd_status -eq 0 ]]; then
             # Only fd diagnostics may determine scan completeness; timeout
             # wrapper tracing must not look like a filesystem error in debug mode.
-            MO_DEBUG=0 run_with_timeout "$scan_stage_timeout" fd "${fd_args[@]}" "$pattern" "$search_path" \
+            MO_DEBUG=0 run_with_timeout "$scan_stage_timeout" fd "${fd_args[@]}" "$pattern" "$walk_path" \
                 2> "$error_output" > "$target_output" || fd_status=$?
         fi
         if [[ $fd_status -eq 0 ]]; then
             scan_stage_timeout=$(_mole_timeout_with_deadline "$scan_timeout" "$scan_deadline") || fd_status=$?
         fi
         if [[ $fd_status -eq 0 ]]; then
-            MO_DEBUG=0 run_with_timeout "$scan_stage_timeout" fd "${fd_tag_args[@]}" "^${MOLE_CACHEDIR_TAG_NAME}$" "$search_path" \
+            MO_DEBUG=0 run_with_timeout "$scan_stage_timeout" fd "${fd_tag_args[@]}" "^${MOLE_CACHEDIR_TAG_NAME}$" "$walk_path" \
                 2>> "$error_output" > "$tag_output" || fd_status=$?
         fi
         if [[ $fd_status -eq 0 && -s "$error_output" ]]; then
@@ -749,7 +1350,16 @@ scan_purge_targets() {
             emit_valid_cachedir_tag_dirs "$scan_deadline" < "$tag_output" >> "$target_output" || fd_status=$?
         fi
         if [[ $fd_status -eq 0 ]]; then
-            process_scan_results "$target_output" "$scan_deadline" || fd_status=$?
+            local filter_status=0
+            process_scan_results "$target_output" "$scan_deadline" || filter_status=$?
+            if [[ $filter_status -ne 0 ]]; then
+                # Discovery completed. Repeating it cannot repair a failed
+                # shared filter and would spend the remaining root budget twice.
+                cleanup_scan_outputs
+                : > "$output_file"
+                debug_log "Purge result filtering failed (status $filter_status): $walk_path"
+                return "$filter_status"
+            fi
         fi
         if [[ $fd_status -eq 0 ]]; then
             debug_log "Using fd for scanning"
@@ -766,54 +1376,78 @@ scan_purge_targets() {
     fi
 
     if [[ "$use_find" == "true" ]]; then
-        debug_log "Using find for scanning"
-        # Pruned find avoids descending into heavy directories.
-        local prune_dirs=(".git" "Library" ".Trash" "Applications")
-        local purge_targets=("${PURGE_TARGETS[@]}")
-
-        local prune_expr=()
-        for i in "${!prune_dirs[@]}"; do
-            prune_expr+=(-name "${prune_dirs[$i]}")
-            [[ $i -lt $((${#prune_dirs[@]} - 1)) ]] && prune_expr+=(-o)
-        done
-
-        local target_expr=()
-        for i in "${!purge_targets[@]}"; do
-            target_expr+=(-name "${purge_targets[$i]}")
-            [[ $i -lt $((${#purge_targets[@]} - 1)) ]] && target_expr+=(-o)
-        done
-
-        # Use plain `find` here for compatibility with environments where
-        # `command find` behaves inconsistently in this complex expression.
+        # Pruned find avoids descending into heavy and online-only directories.
         local find_status=0
         scan_stage_timeout=$(_mole_timeout_with_deadline "$scan_timeout" "$scan_deadline") || find_status=$?
-        if [[ $find_status -eq 0 ]]; then
-            run_with_timeout "$scan_stage_timeout" find "$search_path" -mindepth "$min_depth" -maxdepth "$max_depth" -type d \
-                \( "${prune_expr[@]}" \) -prune -o \
-                \( "${target_expr[@]}" \) -print -prune \
-                2> /dev/null > "$target_output" || find_status=$?
+        if [[ $find_status -ne 0 ]]; then
+            cleanup_scan_outputs
+            debug_log "Purge discovery budget exhausted before find (status $find_status): $walk_path"
+            return "$find_status"
         fi
-
-        if [[ $find_status -eq 0 ]]; then
-            scan_stage_timeout=$(_mole_timeout_with_deadline "$scan_timeout" "$scan_deadline") || find_status=$?
+        # An older find that does not know the flag name fails the whole walk,
+        # so ask it once, after the budget check, and walk without the prune
+        # when it does not.
+        local dataless_rc=0 with_dataless=no
+        _purge_find_knows_dataless || dataless_rc=$?
+        if mole_rc_signal "$dataless_rc"; then
+            cleanup_scan_outputs
+            return "$dataless_rc"
+        elif [[ $dataless_rc -eq 0 ]]; then
+            with_dataless=yes
         fi
+        _purge_walk_expressions "$with_dataless"
+        local -a prune_expr=("${_PURGE_PRUNE_EXPR[@]}") target_expr=("${_PURGE_TARGET_EXPR[@]}")
         if [[ $find_status -eq 0 ]]; then
-            run_with_timeout "$scan_stage_timeout" find "$search_path" -mindepth "$cachedir_tag_min_depth" -maxdepth "$cachedir_tag_max_depth" \
-                \( -type d \( \( "${prune_expr[@]}" \) -o \( "${target_expr[@]}" \) \) \) -prune -o \
+            debug_log "Using find for scanning"
+            # One walk prints both target directories and CACHEDIR.TAG files.
+            # It reaches the tag depth, and the split below keeps targets to
+            # their own depth range, so coverage matches the two walks this
+            # replaced. Prune rules now apply at depth 1 for tags too, so a tag
+            # inside a top-level .git, Library or online-only folder is no
+            # longer listed (#1666).
+            run_with_timeout "$scan_stage_timeout" "$_MOLE_PURGE_FIND" "$walk_path" -mindepth "$min_depth" -maxdepth "$cachedir_tag_max_depth" \
+                \( -type d \( "${prune_expr[@]}" \) \) -prune -o \
+                \( "${target_expr[@]}" \) -print -prune -o \
                 -type f -name "$MOLE_CACHEDIR_TAG_NAME" -print \
-                2> /dev/null > "$tag_output" || find_status=$?
+                2> /dev/null > "$walk_output" || find_status=$?
+        fi
+        if [[ $find_status -eq 0 ]]; then
+            # shellcheck disable=SC2016 # Awk expands its own variables.
+            WALK_BASE="${walk_path%/}" TAG_NAME="$MOLE_CACHEDIR_TAG_NAME" TARGET_OUT="$target_output" TAG_OUT="$tag_output" \
+                awk -v target_max="$max_depth" -v tag_min="$cachedir_tag_min_depth" '
+                    BEGIN {
+                        base = ENVIRON["WALK_BASE"]; tag = ENVIRON["TAG_NAME"]
+                        target_out = ENVIRON["TARGET_OUT"]; tag_out = ENVIRON["TAG_OUT"]
+                        printf "" > target_out; printf "" > tag_out
+                    }
+                    {
+                        if (substr($0, 1, length(base) + 1) != base "/") next
+                        n = split(substr($0, length(base) + 2), parts, "/")
+                        depth = 0
+                        for (i = 1; i <= n; i++) if (parts[i] != "") { depth++; name = parts[i] }
+                        if (name == tag) { if (depth >= tag_min) print > tag_out }
+                        else if (depth <= target_max) print > target_out
+                    }
+                ' "$walk_output" || find_status=$?
         fi
         if [[ $find_status -eq 0 ]]; then
             emit_valid_cachedir_tag_dirs "$scan_deadline" < "$tag_output" >> "$target_output" || find_status=$?
         fi
         if [[ $find_status -eq 0 ]]; then
-            process_scan_results "$target_output" "$scan_deadline" || find_status=$?
+            local filter_status=0
+            process_scan_results "$target_output" "$scan_deadline" || filter_status=$?
+            if [[ $filter_status -ne 0 ]]; then
+                cleanup_scan_outputs
+                : > "$output_file"
+                debug_log "Purge result filtering failed (status $filter_status): $walk_path"
+                return "$filter_status"
+            fi
         fi
 
         cleanup_scan_outputs
         if [[ $find_status -ne 0 ]]; then
             : > "$output_file"
-            debug_log "find scan failed (status $find_status): $search_path"
+            debug_log "find scan failed (status $find_status): $walk_path"
             return "$find_status"
         fi
     fi
@@ -856,28 +1490,133 @@ filter_nested_artifacts() {
     fi
 }
 
+# Optional $2 collects the candidates this probe verified clean, so the review
+# step can skip walking them a second time within the same run. Optional $3 is
+# the scan sentinel; the filter stops with 130 once it has been removed.
+# Probes run in a bounded pool, but results stay bound to each item's input
+# position and are published in input order only after every probe finished.
 filter_protected_artifacts() {
     local deadline="${1:-}"
+    local verified_file="${2:-}"
+    local cancel_file="${3:-}"
+    local results=""
+    if [[ -n "$verified_file" ]]; then
+        results="${verified_file}.probes"
+        : > "$results" 2> /dev/null || true
+    else
+        results=$(mktemp_file "mole-purge-probes") || return 1
+    fi
+
+    local _PURGE_OPEN_SNAPSHOT=""
+    _purge_take_lsof_snapshots "$deadline"
+
+    local max_probe_jobs
+    max_probe_jobs=$(get_optimal_parallel_jobs io)
+    if ! [[ "$max_probe_jobs" =~ ^[0-9]+$ ]] || [[ "$max_probe_jobs" -lt 1 ]]; then
+        max_probe_jobs=1
+    elif [[ "$max_probe_jobs" -gt 4 ]]; then
+        max_probe_jobs=4
+    fi
+
+    local -a items=() probe_pids=()
+    local item item_index probe_pid done_pid probe_slot wait_status stop_status=0
     while IFS= read -r item; do
         if [[ "$deadline" =~ ^[0-9]+$ && $SECONDS -ge $deadline ]]; then
-            return 124
+            stop_status=124
+            break
         fi
-        # An unfinished probe is not evidence either way. Keep the candidate
-        # visible; the in-process recheck before the menu reports it.
-        if ! is_protected_purge_artifact "$item" ||
-            [[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]]; then
+        if [[ -n "$cancel_file" && ! -f "$cancel_file" ]]; then
+            stop_status=130
+            break
+        fi
+        items+=("$item")
+        item_index=$((${#items[@]} - 1))
+        (
+            probe_rc=0
+            is_protected_purge_artifact "$item" "$deadline" || probe_rc=$?
+            printf '%s %s %s\n' "$item_index" "$probe_rc" "$PURGE_PROTECTION_UNVERIFIED" >> "$results"
+            [[ $probe_rc -le 128 ]] || exit "$probe_rc"
+        ) < /dev/null &
+        probe_pids+=("$!")
+        if [[ ${#probe_pids[@]} -ge $max_probe_jobs ]]; then
+            wait_status=0
+            mole_wait_for_any_worker done_pid "${probe_pids[@]}" || wait_status=$?
+            if [[ $wait_status -ge 128 ]]; then
+                stop_status=$wait_status
+                break
+            fi
+            for probe_slot in "${!probe_pids[@]}"; do
+                if [[ "${probe_pids[$probe_slot]}" == "$done_pid" ]]; then
+                    unset 'probe_pids[probe_slot]'
+                    break
+                fi
+            done
+        fi
+    done
+    if [[ $stop_status -ne 0 ]]; then
+        for probe_pid in "${probe_pids[@]+"${probe_pids[@]}"}"; do
+            kill "$probe_pid" 2> /dev/null || true
+        done
+    fi
+    for probe_pid in "${probe_pids[@]+"${probe_pids[@]}"}"; do
+        wait_status=0
+        wait "$probe_pid" 2> /dev/null || wait_status=$?
+        if [[ $stop_status -eq 0 && $wait_status -gt 128 ]]; then
+            stop_status=$wait_status
+        fi
+    done
+    # A scan cancelled while its last probes ran has already had its sidecars
+    # removed; publishing now would recreate them.
+    if [[ $stop_status -eq 0 && ${#items[@]} -gt 0 && -n "$cancel_file" && ! -f "$cancel_file" ]]; then
+        stop_status=130
+    fi
+    # The last probe can consume the remaining budget too. Never publish
+    # that root's prefix as complete, even when there is no next item.
+    if [[ $stop_status -eq 0 && "$deadline" =~ ^[0-9]+$ && $SECONDS -ge $deadline ]]; then
+        stop_status=124
+    fi
+    if [[ $stop_status -ne 0 ]]; then
+        rm -f "$results" 2> /dev/null || true # SAFE: exact probe result scratch file owned by this filter
+        return "$stop_status"
+    fi
+
+    local -a probe_rcs=() probe_unverified=()
+    local record_index record_rc record_unverified record_extra
+    if [[ -r "$results" ]]; then
+        while read -r record_index record_rc record_unverified record_extra; do
+            [[ "$record_index" =~ ^[0-9]+$ && "$record_rc" =~ ^[0-9]+$ && -z "$record_extra" ]] || continue
+            [[ "$record_unverified" == "true" || "$record_unverified" == "false" ]] || continue
+            probe_rcs[record_index]="$record_rc"
+            probe_unverified[record_index]="$record_unverified"
+        done < "$results"
+    fi
+    rm -f "$results" 2> /dev/null || true # SAFE: exact probe result scratch file owned by this filter
+
+    for ((item_index = 0; item_index < ${#items[@]}; item_index++)); do
+        item="${items[$item_index]}"
+        record_rc="${probe_rcs[$item_index]:-}"
+        # An unfinished probe or a missing record is not evidence either way.
+        # Keep the candidate visible; the in-process recheck before the menu
+        # reports it.
+        if [[ -z "$record_rc" || "$record_rc" != "0" || "${probe_unverified[$item_index]:-true}" == "true" ]]; then
             echo "$item"
+        fi
+        if [[ -n "$verified_file" && -n "$record_rc" && "$record_rc" != "0" ]]; then
+            # A lost record only costs the review a second walk.
+            printf '%s\n' "$item" >> "$verified_file" 2> /dev/null || true
         fi
     done
 }
 # Args: $1 - path, $2 - optional current epoch
 # Classify artifact activity as recent, old, or uncertain. Only a complete
 # bounded scan may return old; timeouts and read failures fail closed.
+# _PURGE_ACTIVITY_MTIME keeps the artifact mtime it read, for the age label.
 classify_purge_activity() {
     local path="$1"
     local current_time="${2:-}"
     local age_days=$MIN_AGE_DAYS
     _PURGE_ACTIVITY_STATE="uncertain"
+    _PURGE_ACTIVITY_MTIME=""
 
     if [[ ! -e "$path" ]]; then
         _PURGE_ACTIVITY_STATE="old"
@@ -890,6 +1629,7 @@ classify_purge_activity() {
         debug_log "Unable to read purge activity timestamp: $path"
         return 0
     fi
+    _PURGE_ACTIVITY_MTIME="$mod_time"
     if [[ -z "$current_time" || ! "$current_time" =~ ^[0-9]+$ ]]; then
         current_time=$(get_epoch_seconds)
     fi
@@ -980,8 +1720,13 @@ purge_target_activity_still_safe() {
 _mole_purge_final_remove_guard() {
     local path="$1"
     is_safe_configured_purge_artifact "$path" || return 1
-    is_protected_purge_artifact "$path" && return 1
+    # Activity scanning can take the full tree-walk budget. Run it before
+    # protection's final project-process probe, then rebind identities below.
     purge_target_activity_still_safe "$path" "${_MOLE_PURGE_FINAL_ACTIVITY_STATE:-uncertain}" || return $?
+    local protection_rc=0
+    is_protected_purge_artifact "$path" || protection_rc=$?
+    [[ $protection_rc -le 128 ]] || return "$protection_rc"
+    [[ $protection_rc -ne 0 ]] || return 1
 
     _mole_path_matches_identity \
         "${_MOLE_PURGE_FINAL_SCAN_ROOT:-}" \
@@ -1695,6 +2440,7 @@ clean_project_artifacts() {
     local -a uninspected_paths=()
     local -a safe_recent_flags=()
     local -a safe_activity_states=()
+    local -a safe_activity_mtimes=()
     local -a safe_expected_parents=()
     local -a safe_expected_parent_ids=()
     local -a safe_expected_target_ids=()
@@ -1722,7 +2468,8 @@ clean_project_artifacts() {
         scan_pids=()
         # Clean up temp files
         for temp in "${scan_temps[@]+"${scan_temps[@]}"}"; do
-            rm -f "$temp" "${temp}.targets" "${temp}.tags" "${temp}.processed" "${temp}.errors" 2> /dev/null || true
+            rm -f "$temp" "${temp}.targets" "${temp}.tags" "${temp}.walk" "${temp}.processed" "${temp}.errors" \
+                "${temp}.verified" "${temp}.verified.probes" 2> /dev/null || true
         done
         # Clean up purge scanning file
         local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
@@ -1771,7 +2518,7 @@ clean_project_artifacts() {
     local -a active_scan_indexes=()
     _reap_purge_scans() {
         local wait_for_completion="${1:-true}"
-        local slot pid status finished root_index
+        local slot pid status finished unit_index
         while [[ ${#scan_pids[@]} -gt 0 ]]; do
             local -a running_pids=() running_indexes=()
             finished=false
@@ -1784,8 +2531,8 @@ clean_project_artifacts() {
                 fi
                 status=0
                 wait "$pid" 2> /dev/null || status=$?
-                root_index="${active_scan_indexes[slot]}"
-                scan_statuses[root_index]=$status
+                unit_index="${active_scan_indexes[slot]}"
+                unit_statuses[unit_index]=$status
                 finished=true
                 if [[ $status -ge 128 ]]; then
                     local peer
@@ -1808,8 +2555,48 @@ clean_project_artifacts() {
         return 0
     }
 
-    # Refill free slots as scans finish. Root indexes remain stable regardless
-    # of completion order, so incomplete output cannot acquire another root's status.
+    # Every root is scanned first as one unit, exactly as before. Only a root
+    # that is not itself a project and whose single scan timed out is scanned
+    # again, one direct child at a time (_purge_list_scan_units), each child
+    # with its own MO_PURGE_SCAN_TIMEOUT_SEC budget, so one slow project skips
+    # only itself (#1666). The re-scan is capped at that budget times the scan
+    # slots; a child that cannot start before the cap is reported as skipped
+    # by its own path. A root that completes keeps its speed and its output.
+    local -a unit_paths=() unit_root_indexes=() unit_statuses=() unit_temps=() unit_superseded=()
+    local scan_unit_timeout
+    scan_unit_timeout=$(_purge_scan_timeout_seconds)
+    local expanded_root_cap=$((scan_unit_timeout * max_scan_jobs))
+
+    # Start one unit in a free pool slot. Unit indexes remain stable regardless
+    # of completion order, so incomplete output cannot acquire another unit's status.
+    _launch_purge_scan_unit() {
+        local root_index="$1" path="$2" unit_path="$3" unit_timeout="$4"
+        _reap_purge_scans false || return $?
+        unit_paths+=("$unit_path")
+        unit_root_indexes+=("$root_index")
+        local unit_index=$((${#unit_paths[@]} - 1))
+        unit_temps[unit_index]=""
+        unit_superseded[unit_index]=false
+        if [[ "$unit_timeout" -le 0 ]]; then
+            unit_statuses[unit_index]=124
+            debug_log "Purge scan root budget used up before this unit started: $unit_path"
+            return 0
+        fi
+        local scan_output
+        scan_output=$(mktemp)
+        scan_temps+=("$scan_output")
+        unit_temps[unit_index]="$scan_output"
+        # Launch scan in background for true parallelism
+        MO_PURGE_SCAN_TIMEOUT_SEC="$unit_timeout" \
+            scan_purge_targets "$path" "$scan_output" "${scan_output}.verified" "$unit_path" < /dev/null &
+        scan_pids+=("$!")
+        active_scan_indexes+=("$unit_index")
+        if [[ ${#scan_pids[@]} -ge $max_scan_jobs ]]; then
+            _reap_purge_scans || return $?
+        fi
+        return 0
+    }
+
     for path in "${PURGE_SEARCH_PATHS[@]}"; do
         _reap_purge_scans false || scan_interrupt_status=$?
         [[ $scan_interrupt_status -ge 128 ]] && break
@@ -1839,9 +2626,6 @@ clean_project_artifacts() {
                 debug_log "Purge scan root physical identity unavailable: $path"
                 continue
             fi
-            local scan_output
-            scan_output=$(mktemp)
-            scan_temps+=("$scan_output")
             scan_roots+=("$path")
             scan_root_parents+=("$scan_root_parent")
             scan_root_parent_ids+=("$scan_root_parent_id")
@@ -1850,28 +2634,68 @@ clean_project_artifacts() {
             scan_root_physical_parents+=("$_MOLE_PATH_SNAPSHOT_PARENT")
             scan_root_physical_parent_ids+=("$_MOLE_PATH_SNAPSHOT_PARENT_ID")
             scan_root_physical_target_ids+=("$_MOLE_PATH_SNAPSHOT_TARGET_ID")
-            # Launch scan in background for true parallelism
-            scan_purge_targets "$path" "$scan_output" < /dev/null &
-            local scan_pid=$!
-            scan_pids+=("$scan_pid")
-            active_scan_indexes+=("$((${#scan_roots[@]} - 1))")
-            if [[ ${#scan_pids[@]} -ge $max_scan_jobs ]]; then
-                _reap_purge_scans || scan_interrupt_status=$?
-                [[ $scan_interrupt_status -ge 128 ]] && break
-            fi
+            _launch_purge_scan_unit "$((${#scan_roots[@]} - 1))" "$path" "$path" "$scan_unit_timeout" ||
+                scan_interrupt_status=$?
+            [[ $scan_interrupt_status -ge 128 ]] && break
         fi
     done
     while [[ $scan_interrupt_status -lt 128 && ${#scan_pids[@]} -gt 0 ]]; do
         _reap_purge_scans || scan_interrupt_status=$?
     done
 
+    # Fallback for roots whose single scan timed out. Its partial output is
+    # discarded; only completed child units count.
+    local first_pass_units=${#unit_paths[@]}
+    local fallback_index
+    for ((fallback_index = 0; fallback_index < first_pass_units; fallback_index++)); do
+        [[ $scan_interrupt_status -lt 128 ]] || break
+        mole_rc_timeout "${unit_statuses[$fallback_index]:-1}" || continue
+        local fallback_root_index="${unit_root_indexes[$fallback_index]}"
+        local fallback_root="${scan_roots[$fallback_root_index]}"
+        local list_status=0
+        _purge_list_scan_units "$fallback_root" || list_status=$?
+        if [[ $list_status -ge 128 ]]; then
+            scan_interrupt_status=$list_status
+            break
+        fi
+        # A project root, or a root with no child to split into, keeps its
+        # timeout and is reported as before.
+        [[ ${#_PURGE_SCAN_UNITS[@]} -eq 1 && "${_PURGE_SCAN_UNITS[0]}" == "$fallback_root" ]] && continue
+        local -a fallback_units=("${_PURGE_SCAN_UNITS[@]}")
+        unit_superseded[fallback_index]=true
+        debug_log "Purge scan root timed out, scanning its ${#fallback_units[@]} children separately: $fallback_root"
+        local root_cap_deadline=$((SECONDS + expanded_root_cap))
+        local unit_path
+        for unit_path in "${fallback_units[@]}"; do
+            local unit_timeout=$((root_cap_deadline - SECONDS))
+            [[ $unit_timeout -le $scan_unit_timeout ]] || unit_timeout=$scan_unit_timeout
+            _launch_purge_scan_unit "$fallback_root_index" "$fallback_root" "$unit_path" "$unit_timeout" ||
+                scan_interrupt_status=$?
+            [[ $scan_interrupt_status -ge 128 ]] && break
+        done
+    done
+    while [[ $scan_interrupt_status -lt 128 && ${#scan_pids[@]} -gt 0 ]]; do
+        _reap_purge_scans || scan_interrupt_status=$?
+    done
+
     if [[ $scan_interrupt_status -ge 128 ]]; then
+        # A root listing can be interrupted while earlier units still run;
+        # stop them before their files are removed.
+        local interrupted_pid
+        for interrupted_pid in "${scan_pids[@]+"${scan_pids[@]}"}"; do
+            kill "$interrupted_pid" 2> /dev/null || true
+        done
+        for interrupted_pid in "${scan_pids[@]+"${scan_pids[@]}"}"; do
+            wait "$interrupted_pid" 2> /dev/null || true
+        done
+        scan_pids=()
         local interrupted_stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
         rm -f "$interrupted_stats_dir/purge_scanning" 2> /dev/null || true
         local interrupted_temp
         for interrupted_temp in "${scan_temps[@]+"${scan_temps[@]}"}"; do
-            rm -f "$interrupted_temp" "${interrupted_temp}.targets" \
-                "${interrupted_temp}.tags" "${interrupted_temp}.processed" "${interrupted_temp}.errors" 2> /dev/null || true
+            rm -f "$interrupted_temp" "${interrupted_temp}.targets" "${interrupted_temp}.tags" \
+                "${interrupted_temp}.walk" "${interrupted_temp}.processed" "${interrupted_temp}.errors" \
+                "${interrupted_temp}.verified" "${interrupted_temp}.verified.probes" 2> /dev/null || true
         done
         _restore_purge_scan_traps
         if [[ -t 1 ]]; then
@@ -1893,49 +2717,83 @@ clean_project_artifacts() {
     # when overlapping search roots produce the same artifact many times.
     local dedupe_output
     dedupe_output=$(mktemp_file "mole-purge-dedupe") || return 1
+    # Candidates a completed discovery probe already found clean. The review
+    # below walks only the rest: a repeat walk of every artifact tree was the
+    # largest serial step of a purge, and deletion still rechecks each target.
+    local discovery_verified=$'\n'
     local completed_scan_count=0
     local scan_index
-    for ((scan_index = 0; scan_index < ${#scan_temps[@]}; scan_index++)); do
-        scan_output="${scan_temps[$scan_index]}"
-        local scan_status="${scan_statuses[$scan_index]:-1}"
-        if [[ $scan_status -eq 0 ]] && ! _mole_path_matches_identity \
+    local -a root_changed=() root_completed=()
+    for ((scan_index = 0; scan_index < ${#scan_roots[@]}; scan_index++)); do
+        root_changed[scan_index]=false
+        root_completed[scan_index]=false
+        if ! _mole_path_matches_identity \
             "${scan_roots[$scan_index]}" \
             "${scan_root_parents[$scan_index]}" \
             "${scan_root_parent_ids[$scan_index]}" \
             "${scan_root_target_ids[$scan_index]}"; then
-            scan_status=1
-            scan_statuses[scan_index]=1
+            root_changed[scan_index]=true
             debug_log "Purge scan root changed before results were collected: ${scan_roots[$scan_index]}"
-        fi
-        if [[ $scan_status -eq 0 ]] && ! _mole_path_matches_identity \
+        elif ! _mole_path_matches_identity \
             "${scan_root_physical_paths[$scan_index]}" \
             "${scan_root_physical_parents[$scan_index]}" \
             "${scan_root_physical_parent_ids[$scan_index]}" \
             "${scan_root_physical_target_ids[$scan_index]}"; then
-            scan_status=1
-            scan_statuses[scan_index]=1
+            root_changed[scan_index]=true
             debug_log "Purge scan root target changed before results were collected: ${scan_roots[$scan_index]}"
         fi
-        if [[ $scan_status -eq 0 && ! -f "$scan_output" ]]; then
+    done
+    # Only completed units count. A unit that failed or timed out is reported
+    # by its own path and contributes nothing, not even a prefix.
+    local unit_index
+    for ((unit_index = 0; unit_index < ${#unit_paths[@]}; unit_index++)); do
+        scan_index="${unit_root_indexes[$unit_index]}"
+        scan_output="${unit_temps[$unit_index]:-}"
+        local scan_status="${unit_statuses[$unit_index]:-1}"
+        if [[ "${unit_superseded[$unit_index]:-false}" == "true" ]]; then
+            scan_status=-1
+        elif [[ "${root_changed[$scan_index]}" == "true" ]]; then
+            scan_status=-1
+        elif [[ $scan_status -eq 0 && (-z "$scan_output" || ! -f "$scan_output") ]]; then
             scan_status=1
-            scan_statuses[scan_index]=1
         fi
-        if [[ $scan_status -eq 0 && -f "$scan_output" ]]; then
+        if [[ $scan_status -eq 0 ]]; then
             if cat "$scan_output" >> "$dedupe_output"; then
                 completed_scan_count=$((completed_scan_count + 1))
+                root_completed[scan_index]=true
+                if [[ -s "${scan_output}.verified" ]]; then
+                    local verified_item
+                    while IFS= read -r verified_item; do
+                        [[ -n "$verified_item" ]] && discovery_verified+="${verified_item}"$'\n'
+                    done < "${scan_output}.verified"
+                fi
             else
                 scan_status=1
-                scan_statuses[scan_index]=1
-                debug_log "Purge scan output unreadable: ${scan_roots[$scan_index]:-unknown root}"
+                debug_log "Purge scan output unreadable: ${unit_paths[$unit_index]}"
             fi
         fi
-        if [[ $scan_status -ne 0 || ! -f "$scan_output" ]]; then
+        if [[ $scan_status -gt 0 ]]; then
             failed_scan_count=$((failed_scan_count + 1))
-            failed_scan_roots+=("${scan_roots[$scan_index]:-unknown root}")
+            failed_scan_roots+=("${unit_paths[$unit_index]}")
             failed_scan_statuses+=("$scan_status")
-            debug_log "Purge scan incomplete (status $scan_status): ${scan_roots[$scan_index]:-unknown root}"
+            debug_log "Purge scan incomplete (status $scan_status): ${unit_paths[$unit_index]}"
         fi
-        rm -f "$scan_output" "${scan_output}.targets" "${scan_output}.tags" "${scan_output}.processed" "${scan_output}.errors" 2> /dev/null || true
+        if [[ -n "$scan_output" ]]; then
+            rm -f "$scan_output" "${scan_output}.targets" "${scan_output}.tags" "${scan_output}.walk" "${scan_output}.processed" \
+                "${scan_output}.errors" "${scan_output}.verified" "${scan_output}.verified.probes" 2> /dev/null || true
+        fi
+    done
+    # A root binds candidates only when it is unchanged and at least one of
+    # its units completed. A changed root is reported once, by its own path.
+    for ((scan_index = 0; scan_index < ${#scan_roots[@]}; scan_index++)); do
+        scan_statuses[scan_index]=1
+        if [[ "${root_changed[$scan_index]}" == "true" ]]; then
+            failed_scan_count=$((failed_scan_count + 1))
+            failed_scan_roots+=("${scan_roots[$scan_index]}")
+            failed_scan_statuses+=("1")
+        elif [[ "${root_completed[$scan_index]}" == "true" ]]; then
+            scan_statuses[scan_index]=0
+        fi
     done
     if [[ -s "$dedupe_output" ]]; then
         while IFS= read -r item; do
@@ -1951,10 +2809,16 @@ clean_project_artifacts() {
         [[ $failed_scan_count -ne 1 ]] && root_text="roots"
         echo ""
         echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped ${failed_scan_count} project scan ${root_text} because scanning did not complete:"
-        for ((scan_index = 0; scan_index < ${#failed_scan_roots[@]}; scan_index++)); do
+        # A root with thousands of children must not flood the screen; the
+        # heading keeps the full count.
+        local failed_shown_limit=10
+        for ((scan_index = 0; scan_index < ${#failed_scan_roots[@]} && scan_index < failed_shown_limit; scan_index++)); do
             local display_root="${failed_scan_roots[$scan_index]/#$HOME/~}"
             echo -e "  ${GRAY}${display_root}${NC} (status ${failed_scan_statuses[$scan_index]:-1})"
         done
+        if [[ ${#failed_scan_roots[@]} -gt $failed_shown_limit ]]; then
+            echo -e "  ${GRAY}and $((${#failed_scan_roots[@]} - failed_shown_limit)) more${NC}"
+        fi
         echo -e "${GRAY}Re-run with 'mo purge --debug' to inspect the scan failure.${NC}"
         if [[ $completed_scan_count -eq 0 ]]; then
             printf '\n'
@@ -1967,7 +2831,7 @@ clean_project_artifacts() {
         if [[ "$PURGE_RUN_OUTCOME" == "incomplete" ]]; then
             echo -e "${GRAY}No artifacts found in the completed project scans${NC}"
         else
-            echo -e "${GREEN}${ICON_SUCCESS}${NC} Great! No old project artifacts to clean"
+            echo -e "${GREEN}${ICON_SUCCESS}${NC} No old project artifacts to clean"
         fi
         printf '\n'
         [[ "$PURGE_RUN_OUTCOME" != "incomplete" ]] && PURGE_RUN_OUTCOME="no_candidates"
@@ -1982,6 +2846,13 @@ clean_project_artifacts() {
         item="${all_found_items[$candidate_index]}"
         if is_path_whitelisted "$item"; then
             continue
+        fi
+        # A glob entry gives children no inheritance, so an entry on the scratch
+        # root has to be asked for the outputs decomposed from it.
+        if is_swiftpm_build_output_artifact "$item"; then
+            local swiftpm_scratch="${item%/*}"
+            is_path_whitelisted "$swiftpm_scratch" && continue
+            [[ "${swiftpm_scratch##*/}" == "index-build" ]] && is_path_whitelisted "${swiftpm_scratch%/*}" && continue
         fi
         local candidate_bound=false
         local candidate_parent=""
@@ -2015,25 +2886,8 @@ clean_project_artifacts() {
         local candidate_physical_path="${candidate_parent%/}/${item##*/}"
         [[ "$candidate_parent" == "/" ]] && candidate_physical_path="/${item##*/}"
         local candidate_scan_root_index=-1
+        # Root identities are rechecked once per root after this loop.
         for root_index in "${candidate_root_indexes[@]}"; do
-            if ! _mole_path_matches_identity \
-                "${scan_roots[$root_index]}" \
-                "${scan_root_parents[$root_index]}" \
-                "${scan_root_parent_ids[$root_index]}" \
-                "${scan_root_target_ids[$root_index]}"; then
-                continue
-            fi
-            if ! _mole_path_matches_identity \
-                "${scan_root_physical_paths[$root_index]}" \
-                "${scan_root_physical_parents[$root_index]}" \
-                "${scan_root_physical_parent_ids[$root_index]}" \
-                "${scan_root_physical_target_ids[$root_index]}"; then
-                continue
-            fi
-            if ! _mole_path_matches_identity \
-                "$item" "$candidate_parent" "$candidate_parent_id" "$candidate_target_id"; then
-                continue
-            fi
             if ! is_safe_project_artifact_under_root \
                 "$candidate_physical_path" "${scan_root_physical_paths[$root_index]}"; then
                 continue
@@ -2046,7 +2900,17 @@ clean_project_artifacts() {
             debug_log "Skipping purge target whose scan identity changed: $item"
             continue
         fi
-        if is_protected_purge_artifact "$item"; then
+        local protection_rc=1
+        if [[ "$discovery_verified" != *$'\n'"$item"$'\n'* ]]; then
+            protection_rc=0
+            is_protected_purge_artifact "$item" || protection_rc=$?
+        fi
+        if [[ $protection_rc -gt 128 ]]; then
+            PURGE_RUN_OUTCOME="cancelled"
+            if [[ -t 1 ]]; then stop_inline_spinner; fi
+            return "$protection_rc"
+        fi
+        if [[ $protection_rc -eq 0 ]]; then
             if [[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]]; then
                 PURGE_RUN_OUTCOME="incomplete"
                 uninspected_paths+=("$item")
@@ -2064,6 +2928,46 @@ clean_project_artifacts() {
     done
     if [[ -t 1 ]]; then
         stop_inline_spinner
+    fi
+    # Recheck each bound scan root once, after binding, and drop every
+    # candidate of a root that changed. Deletion still rechecks the root and
+    # the candidate identity at the final sink.
+    if [[ ${#safe_to_clean[@]} -gt 0 ]]; then
+        local -a bound_root_states=()
+        local -a kept_items=() kept_parents=() kept_parent_ids=() kept_target_ids=() kept_root_indexes=()
+        local bound_index
+        for ((bound_index = 0; bound_index < ${#safe_to_clean[@]}; bound_index++)); do
+            root_index="${safe_scan_root_indexes[$bound_index]}"
+            if [[ -z "${bound_root_states[$root_index]:-}" ]]; then
+                bound_root_states[root_index]=changed
+                if _mole_path_matches_identity \
+                    "${scan_roots[$root_index]}" \
+                    "${scan_root_parents[$root_index]}" \
+                    "${scan_root_parent_ids[$root_index]}" \
+                    "${scan_root_target_ids[$root_index]}" &&
+                    _mole_path_matches_identity \
+                        "${scan_root_physical_paths[$root_index]}" \
+                        "${scan_root_physical_parents[$root_index]}" \
+                        "${scan_root_physical_parent_ids[$root_index]}" \
+                        "${scan_root_physical_target_ids[$root_index]}"; then
+                    bound_root_states[root_index]=same
+                fi
+            fi
+            if [[ "${bound_root_states[$root_index]}" != "same" ]]; then
+                debug_log "Skipping purge target whose scan identity changed: ${safe_to_clean[$bound_index]}"
+                continue
+            fi
+            kept_items+=("${safe_to_clean[$bound_index]}")
+            kept_parents+=("${safe_expected_parents[$bound_index]}")
+            kept_parent_ids+=("${safe_expected_parent_ids[$bound_index]}")
+            kept_target_ids+=("${safe_expected_target_ids[$bound_index]}")
+            kept_root_indexes+=("$root_index")
+        done
+        safe_to_clean=("${kept_items[@]+"${kept_items[@]}"}")
+        safe_expected_parents=("${kept_parents[@]+"${kept_parents[@]}"}")
+        safe_expected_parent_ids=("${kept_parent_ids[@]+"${kept_parent_ids[@]}"}")
+        safe_expected_target_ids=("${kept_target_ids[@]+"${kept_target_ids[@]}"}")
+        safe_scan_root_indexes=("${kept_root_indexes[@]+"${kept_root_indexes[@]}"}")
     fi
     for item in "${uninspected_paths[@]+"${uninspected_paths[@]}"}"; do
         echo -e "${YELLOW}${ICON_WARNING}${NC} Could not inspect ${item/#$HOME/~}; kept" >&2
@@ -2083,27 +2987,118 @@ clean_project_artifacts() {
         _activity_total_timeout="$MOLE_TIMEOUT_HINT_SCAN_SEC"
     fi
     local _PURGE_ACTIVITY_DEADLINE_EPOCH=$((_now_epoch + _activity_total_timeout))
+    # A few slow artifacts must not consume every later artifact's opportunity.
+    # Reuse the discovery concurrency ceiling, while keeping the SAME shared
+    # deadline and per-item classifier. Results stay indexed until all workers
+    # finish; only a complete, successful old classification can preselect a row.
+    local -a _activity_pids=() _activity_indexes=() _activity_tmpfiles=() _activity_worker_statuses=()
+    local _activity_setup_failed=false
+    local _activity_interrupt_status=0
+    local _activity_previous_int_trap _activity_previous_term_trap
+    _activity_previous_int_trap=$(trap -p INT || true)
+    _activity_previous_term_trap=$(trap -p TERM || true)
+    trap '[[ $_activity_interrupt_status -ge 128 ]] || _activity_interrupt_status=130' INT
+    trap '[[ $_activity_interrupt_status -ge 128 ]] || _activity_interrupt_status=143' TERM
+    _wait_purge_activity_batch() {
+        local drain="${1:-true}" activity_pid worker_status slot finished
+        while [[ ${#_activity_pids[@]} -gt 0 ]]; do
+            local -a running_pids=() running_indexes=()
+            finished=false
+            for ((slot = 0; slot < ${#_activity_pids[@]}; slot++)); do
+                activity_pid="${_activity_pids[$slot]}"
+                if [[ $_activity_interrupt_status -lt 128 ]] && kill -0 "$activity_pid" 2> /dev/null; then
+                    running_pids+=("$activity_pid")
+                    running_indexes+=("${_activity_indexes[$slot]}")
+                    continue
+                fi
+                worker_status=0
+                wait "$activity_pid" 2> /dev/null || worker_status=$?
+                if [[ $worker_status -ge 128 ]]; then
+                    [[ $_activity_interrupt_status -ge 128 ]] || _activity_interrupt_status=$worker_status
+                    # Interrupted wait can leave its bounded probe alive.
+                    # Drain it instead of orphaning timeout/find children.
+                    while kill -0 "$activity_pid" 2> /dev/null; do
+                        wait "$activity_pid" 2> /dev/null || true
+                    done
+                fi
+                _activity_worker_statuses[${_activity_indexes[$slot]}]=$worker_status
+                finished=true
+            done
+            _activity_pids=("${running_pids[@]+"${running_pids[@]}"}")
+            _activity_indexes=("${running_indexes[@]+"${running_indexes[@]}"}")
+            if [[ "$drain" == false && "$finished" == true && $_activity_interrupt_status -lt 128 ]]; then
+                return 0
+            fi
+            # The trap owns cancellation; interrupted sleep must not trigger
+            # errexit before worker drain and caller-trap restoration.
+            [[ ${#_activity_pids[@]} -eq 0 ]] || sleep 0.02 || true
+        done
+    }
     for item in "${safe_to_clean[@]}"; do
-        local is_recent=true
-        local activity_status=0
-        _PURGE_ACTIVITY_STATE="uncertain"
-        is_recently_modified "$item" "$_now_epoch" || activity_status=$?
-        if [[ $activity_status -ge 128 ]]; then
-            PURGE_RUN_OUTCOME="cancelled"
+        [[ $_activity_interrupt_status -ge 128 ]] && break
+        local activity_temp
+        if ! activity_temp=$(mktemp); then
+            _activity_setup_failed=true
+            break
+        fi
+        register_temp_file "$activity_temp"
+        _activity_tmpfiles+=("$activity_temp")
+        (
+            _PURGE_ACTIVITY_STATE="uncertain"
+            _PURGE_ACTIVITY_MTIME=""
+            activity_status=0
+            is_recently_modified "$item" "$_now_epoch" || activity_status=$?
+            [[ $activity_status -lt 128 ]] || exit "$activity_status"
+            printf '%s %s %s\n' "$activity_status" "${_PURGE_ACTIVITY_STATE:-uncertain}" "${_PURGE_ACTIVITY_MTIME:--}" > "$activity_temp" || exit 1
+            exit 0
+        ) < /dev/null &
+        _activity_pids+=("$!")
+        _activity_indexes+=("$((${#_activity_tmpfiles[@]} - 1))")
+        if [[ ${#_activity_pids[@]} -ge $max_scan_jobs ]]; then
+            _wait_purge_activity_batch false
+        fi
+    done
+    _wait_purge_activity_batch
+    trap - INT TERM
+    # eval: restore the caller traps captured before starting activity workers.
+    [[ -z "$_activity_previous_int_trap" ]] || eval "$_activity_previous_int_trap"
+    [[ -z "$_activity_previous_term_trap" ]] || eval "$_activity_previous_term_trap"
+    if [[ $_activity_interrupt_status -ge 128 || "$_activity_setup_failed" == true ]]; then
+        for activity_temp in "${_activity_tmpfiles[@]+"${_activity_tmpfiles[@]}"}"; do
+            rm -f "$activity_temp" # SAFE: exact registered mktemp activity result file
+        done
+        if [[ $_activity_interrupt_status -lt 128 ]]; then
+            PURGE_RUN_OUTCOME="incomplete"
             [[ ! -t 1 ]] || stop_inline_spinner
-            return "$activity_status"
+            return 1
         fi
-        # A bounded menu probe may time out: retain that row, unchecked.
-        local activity_state="${_PURGE_ACTIVITY_STATE:-uncertain}"
-        if [[ $activity_status -eq 1 ]]; then
-            is_recent=false
-            activity_state="old"
-        elif [[ "$activity_state" != "recent" ]]; then
+        PURGE_RUN_OUTCOME="cancelled"
+        [[ ! -t 1 ]] || stop_inline_spinner
+        return "$_activity_interrupt_status"
+    fi
+    local activity_index=0
+    for activity_temp in "${_activity_tmpfiles[@]}"; do
+        local is_recent=true activity_status="" activity_state="uncertain" activity_mtime="" activity_extra=""
+        # Only a complete record from a successful worker can preselect a row.
+        # A truncated first field must never turn unknown evidence into old.
+        if [[ "${_activity_worker_statuses[$activity_index]:-1}" == "0" ]] &&
+            read -r activity_status activity_state activity_mtime activity_extra < "$activity_temp" &&
+            [[ -n "$activity_mtime" && -z "$activity_extra" ]]; then
+            if [[ "$activity_status" == "1" && "$activity_state" == "old" ]]; then
+                is_recent=false
+            elif [[ "$activity_status" != "0" || "$activity_state" != "recent" ]]; then
+                activity_state="uncertain"
+            fi
+        else
             activity_state="uncertain"
+            activity_mtime=""
         fi
+        activity_index=$((activity_index + 1))
         safe_recent_flags+=("$is_recent")
         safe_activity_states+=("$activity_state")
+        safe_activity_mtimes+=("$activity_mtime")
     done
+    rm -f "${_activity_tmpfiles[@]+"${_activity_tmpfiles[@]}"}" 2> /dev/null || true # SAFE: exact registered mktemp activity result files
     if [[ -t 1 ]]; then
         stop_inline_spinner
     fi
@@ -2128,28 +3123,21 @@ clean_project_artifacts() {
         _max_size_jobs=8
     fi
 
-    # Reap any finished PID from the sliding window. Uses `wait -n` when
-    # available (bash 4.3+) to avoid blocking on the slowest job; falls
-    # back to first-PID wait on macOS default bash 3.2.
-    local _has_wait_n=false
-    if [[ "${BASH_VERSINFO[0]:-0}" -gt 4 ]] ||
-        { [[ "${BASH_VERSINFO[0]:-0}" -eq 4 ]] && [[ "${BASH_VERSINFO[1]:-0}" -ge 3 ]]; }; then
-        _has_wait_n=true
-    fi
+    # Keep the sliding window full on Bash 3.2 as well as newer shells.
     _reap_one_size_pid() {
-        if [[ "$_has_wait_n" == "true" ]]; then
-            wait -n "${_size_pids[@]}" 2> /dev/null || true
-            local -a _remaining=()
-            for _p in "${_size_pids[@]}"; do
-                if kill -0 "$_p" 2> /dev/null; then
-                    _remaining+=("$_p")
-                fi
-            done
-            _size_pids=("${_remaining[@]}")
-        else
-            wait "${_size_pids[0]}" 2> /dev/null || true
-            _size_pids=("${_size_pids[@]:1}")
+        local completed_pid="" size_slot worker_rc=0
+        mole_wait_for_any_worker completed_pid "${_size_pids[@]}" || worker_rc=$?
+        if [[ $worker_rc -ge 128 ]]; then
+            [[ $_size_interrupt_status -ge 128 ]] || _size_interrupt_status=$worker_rc
+            _cleanup_purge_size_workers
+            return 0
         fi
+        for size_slot in "${!_size_pids[@]}"; do
+            if [[ "${_size_pids[$size_slot]}" == "$completed_pid" ]]; then
+                unset '_size_pids[size_slot]'
+                break
+            fi
+        done
     }
 
     local _size_previous_int_trap=""
@@ -2262,6 +3250,9 @@ clean_project_artifacts() {
             project_parent="${artifact_path%/*}"
             if ! project_root=$(find_purge_project_root_for_artifact "$artifact_path"); then
                 project_root="$project_parent"
+                if is_swiftpm_packaged_scratch_dir "$project_root" && [[ "${project_root%/*}" == /* && -n "${project_root%/*}" ]]; then
+                    project_root="${project_root%/*}"
+                fi
             fi
             project_identity=$(mole_path_identity "$project_root")
         fi
@@ -2282,9 +3273,20 @@ clean_project_artifacts() {
         local project_root="${project_roots[$item_index]}"
         local project_path="${project_root/#$HOME/~}"
         local artifact_type="${item#"$project_root/"}"
-        local size_raw
-        size_raw=$(cat "${_size_tmpfiles[$item_index]}" 2> /dev/null || echo "0")
-        rm -f "${_size_tmpfiles[$item_index]}" 2> /dev/null || true
+        # Builtin reads keep the old cat mapping: an unreadable result is 0,
+        # an empty one or a second line is invalid. The files are removed
+        # together after this loop.
+        local size_raw="0" size_extra=""
+        if [[ -r "${_size_tmpfiles[$item_index]}" ]]; then
+            size_raw=""
+            if ! {
+                IFS= read -r size_raw || true
+                IFS= read -r size_extra || true
+            } < "${_size_tmpfiles[$item_index]}" 2> /dev/null; then
+                size_raw="0"
+            fi
+            [[ -z "$size_extra" ]] || size_raw="$size_raw"$'\n'"$size_extra"
+        fi
         _sz_idx=$((_sz_idx + 1))
         local size_kb=0
         local size_human=""
@@ -2334,8 +3336,9 @@ clean_project_artifacts() {
         item_expected_target_ids+=("${safe_expected_target_ids[$item_index]}")
         item_scan_root_indexes+=("${safe_scan_root_indexes[$item_index]}")
         # Build human-readable age label (bash 3.2 compatible, no assoc arrays).
-        local _mod_time _age_secs _age_d
-        _mod_time=$(get_file_mtime "$item" 2> /dev/null || echo "0")
+        # Reuse the mtime the activity worker already read for this row.
+        local _mod_time="${safe_activity_mtimes[$item_index]:-}" _age_secs _age_d
+        [[ "$_mod_time" =~ ^[0-9]+$ ]] || _mod_time=$(get_file_mtime "$item" 2> /dev/null || echo "0")
         _age_secs=$((_now_epoch - _mod_time))
         _age_d=$((_age_secs / 86400))
         if [[ "$activity_state" == "uncertain" ]]; then
@@ -2352,6 +3355,7 @@ clean_project_artifacts() {
             item_age_labels+=("$((_age_d / 365))y")
         fi
     done
+    rm -f "${_size_tmpfiles[@]+"${_size_tmpfiles[@]}"}" 2> /dev/null || true # SAFE: exact registered mktemp size result files
 
     # Keep every exact project together. Project groups are ordered by their
     # aggregate known size, then artifacts within each group by item size. Only
@@ -2636,9 +3640,18 @@ clean_project_artifacts() {
             debug_log "Skipping purge target outside configured safe roots: ${item_path:-<empty>}"
             continue
         fi
-        if is_protected_purge_artifact "$item_path"; then
+        local protection_rc=0
+        is_protected_purge_artifact "$item_path" || protection_rc=$?
+        if [[ $protection_rc -gt 128 ]]; then
+            PURGE_RUN_OUTCOME="cancelled"
+            echo "$cleaned_count" > "$stats_dir/purge_count"
+            return "$protection_rc"
+        fi
+        if [[ $protection_rc -eq 0 ]]; then
             if [[ "$PURGE_PROTECTION_UNVERIFIED" == "true" ]]; then
                 echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (could not inspect contents; re-run mo purge to review it again)"
+            elif [[ "${PURGE_PROTECTION_REASON:-}" == "in_use" ]]; then
+                echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (in use; stop what has it open, then run mo purge again)"
             else
                 debug_log "Skipping purge target that became protected after review: $item_path"
             fi
@@ -2695,7 +3708,11 @@ clean_project_artifacts() {
                     fi
                     return "$removal_status"
                 fi
-                echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (final removal check failed; re-run mo purge to review it again)"
+                if [[ "${PURGE_PROTECTION_REASON:-}" == "in_use" ]]; then
+                    echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (in use; stop what has it open, then run mo purge again)"
+                else
+                    echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (final removal check failed; re-run mo purge to review it again)"
+                fi
             fi
         fi
         if [[ -t 1 ]]; then

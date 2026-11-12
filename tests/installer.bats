@@ -242,6 +242,41 @@ setup() {
 	[[ "$output" != *"dangling.lnk"* ]]
 }
 
+@test "installer selection EOF never confirms the menu or deletion" {
+	printf fixture > "$HOME/Downloads/Fixture.dmg"
+	# shellcheck disable=SC2016
+	run env HOME="$HOME" TERM="$TERM" MOLE_TEST_MODE=1 /bin/bash -c '
+		source "$1"
+		INSTALLER_PATHS=("$HOME/Downloads/Fixture.dmg")
+		INSTALLER_SIZES=(7)
+		DISPLAY_NAMES=(Fixture.dmg)
+		execute_installer_delete_plan() { echo SINK_REACHED; }
+		if show_installer_menu; then
+			delete_selected_installers
+		else
+			echo MENU_CANCELLED
+		fi
+	' bash "$PROJECT_ROOT/bin/installer.sh" < <(printf a)
+	[ "$status" -eq 0 ]
+	[[ "$output" == *MENU_CANCELLED* ]] || return 1
+	[[ "$output" != *SINK_REACHED* ]]
+}
+
+@test "installer final confirmation refuses EOF after a valid selection" {
+	printf fixture > "$HOME/Downloads/Fixture.dmg"
+	# shellcheck disable=SC2016
+	run env HOME="$HOME" TERM="$TERM" MOLE_TEST_MODE=1 /bin/bash -c '
+		source "$1"
+		INSTALLER_PATHS=("$HOME/Downloads/Fixture.dmg")
+		INSTALLER_SIZES=(7)
+		MOLE_SELECTION_RESULT=0
+		execute_installer_delete_plan() { echo SINK_REACHED; }
+		delete_selected_installers </dev/null
+	' bash "$PROJECT_ROOT/bin/installer.sh"
+	[ "$status" -ne 0 ]
+	[[ "$output" != *SINK_REACHED* ]]
+}
+
 @test "delete_selected_installers removes selected files and records successes" {
 	local first="$HOME/Downloads/First.dmg"
 	local second="$HOME/Downloads/Second.pkg"

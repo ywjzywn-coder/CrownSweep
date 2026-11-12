@@ -8,21 +8,44 @@ set -euo pipefail
 # Touch ID and Clamshell Detection
 # ============================================================================
 
+# Print the sudo PAM file and its sudo_local companion, one per line.
+# MOLE_PAM_SUDO_FILE / MOLE_PAM_SUDO_LOCAL_FILE are test-only: touchid writes
+# these paths through sudo, so an exported override in a real run must not
+# choose which root-owned file receives the pam_tid line.
+mole_pam_sudo_paths() {
+    local pam_sudo_file="/etc/pam.d/sudo" pam_sudo_local_file=""
+    if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
+        pam_sudo_file="${MOLE_PAM_SUDO_FILE:-$pam_sudo_file}"
+        pam_sudo_local_file="${MOLE_PAM_SUDO_LOCAL_FILE:-}"
+    fi
+    printf '%s\n%s\n' "$pam_sudo_file" "${pam_sudo_local_file:-${pam_sudo_file%/*}/sudo_local}"
+}
+
 check_touchid_support() {
-    local pam_sudo_file="${MOLE_PAM_SUDO_FILE:-/etc/pam.d/sudo}"
-    local pam_sudo_local_file="${MOLE_PAM_SUDO_LOCAL_FILE:-$(dirname "$pam_sudo_file")/sudo_local}"
+    local pam_sudo_file pam_sudo_local_file
+    {
+        IFS= read -r pam_sudo_file
+        IFS= read -r pam_sudo_local_file
+    } < <(mole_pam_sudo_paths)
 
     # Check sudo_local first (Sonoma+)
-    if [[ -f "$pam_sudo_local_file" ]] && grep -q "pam_tid.so" "$pam_sudo_local_file" 2> /dev/null; then
+    if [[ -f "$pam_sudo_local_file" ]] && mole_pam_enables_touchid "$pam_sudo_local_file"; then
         return 0
     fi
 
     # Fallback to checking sudo directly
     if [[ -f "$pam_sudo_file" ]]; then
-        grep -q "pam_tid.so" "$pam_sudo_file" 2> /dev/null
+        mole_pam_enables_touchid "$pam_sudo_file"
         return $?
     fi
     return 1
+}
+
+# A commented pam_tid.so line enables nothing: macOS ships sudo_local.template
+# with it commented out, and commenting it out is how people turn Touch ID off
+# by hand. Only a line with no "#" before pam_tid.so counts.
+mole_pam_enables_touchid() {
+    grep -q '^[^#]*pam_tid\.so' "$1" 2> /dev/null
 }
 
 # Detect clamshell mode (lid closed)
@@ -44,6 +67,36 @@ is_clamshell_mode() {
     return 1 # Lid is open
 }
 
+# Run a command with terminal echo off and restore the original mode on every
+# exit, Ctrl-C included. A subshell owns the restore, so it never depends on
+# the caller's traps. Typed input stays buffered for the next reader.
+_mole_tty_quiet() (
+    # No `local`: the EXIT trap runs after the function scope ends, and the
+    # subshell already keeps these names away from the caller.
+    _quiet_tty="$1"
+    shift
+    _quiet_saved=$({ stty -g < "$_quiet_tty"; } 2> /dev/null) || _quiet_saved=""
+    if [[ -n "$_quiet_saved" ]]; then
+        trap 'stty "$_quiet_saved" < "$_quiet_tty" 2> /dev/null || true' EXIT
+        trap 'exit 130' INT TERM HUP
+        stty -echo < "$_quiet_tty" 2> /dev/null || true
+    fi
+    "$@"
+)
+
+# A password just worked on a Mac whose user has enrolled fingerprints, while
+# sudo still ignores them: name the command that turns them on, once per
+# authorization (maintainer 2026-11-02). Mole never edits PAM on its own.
+_mole_touchid_hint() {
+    [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]] && return 0
+    check_touchid_support && return 0
+    command -v bioutil > /dev/null 2>&1 || return 0
+    local enrolled=""
+    enrolled=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" bioutil -c 2> /dev/null) || return 0
+    [[ "$enrolled" =~ [1-9][0-9]*\ biometric\ template ]] || return 0
+    echo -e "${GRAY}Tip: run ${NC}mo touchid${GRAY} to use Touch ID instead of the password${NC}"
+}
+
 _request_password() {
     local tty_path="$1"
 
@@ -52,10 +105,6 @@ _request_password() {
     local stty_orig
     stty_orig=$(stty -g < "$tty_path" 2> /dev/null || echo "")
     trap '[[ -n "${stty_orig:-}" ]] && stty "${stty_orig:-}" < "$tty_path" 2> /dev/null || true' RETURN
-
-    if check_touchid_support; then
-        echo -e "${GRAY}Note: Touch ID dialog may appear once more, just cancel it${NC}" > "$tty_path"
-    fi
 
     echo -e "${PURPLE}${ICON_ARROW}${NC} Enter your credentials:" > "$tty_path"
 
@@ -101,10 +150,9 @@ request_sudo_access() {
         # app display names (batch uninstall builds it from ${sudo_apps[*]}),
         # so escape backslashes and double quotes before embedding it in the
         # AppleScript string literal, or an app named with an embedded quote
-        # could break out and run `do shell script`. Same escaping as
-        # force_kill_app and remove_login_item.
-        local escaped_msg="${prompt_msg//\\/\\\\}"
-        escaped_msg="${escaped_msg//\"/\\\"}"
+        # could break out and run `do shell script`.
+        local escaped_msg=""
+        mole_applescript_escape escaped_msg "$prompt_msg"
         local password
         password=$(osascript -e "display dialog \"$escaped_msg\" default answer \"\" with title \"Mole\" with icon caution with hidden answer" -e 'text returned of result' 2> /dev/null)
 
@@ -129,14 +177,11 @@ request_sudo_access() {
 
     # Check if in clamshell mode - if yes, skip Touch ID entirely
     if is_clamshell_mode; then
-        local clear_lines=3
-        if check_touchid_support; then
-            clear_lines=4
-        fi
         echo -e "${PURPLE}${ICON_ARROW}${NC} ${prompt_msg}"
         if _request_password "$tty_path"; then
             # Clear all prompt lines (use safe clearing method)
-            safe_clear_lines "$clear_lines" "$tty_path"
+            safe_clear_lines 3 "$tty_path"
+            _mole_touchid_hint
             return 0
         fi
         return 1
@@ -148,60 +193,25 @@ request_sudo_access() {
         if _request_password "$tty_path"; then
             # Clear all prompt lines (use safe clearing method)
             safe_clear_lines 3 "$tty_path"
+            _mole_touchid_hint
             return 0
         fi
         return 1
     fi
 
-    # Touch ID is available and not in clamshell mode
+    # Touch ID is available and not in clamshell mode. One sudo owns the
+    # whole exchange: the system dialog takes the fingerprint or, on macOS 27,
+    # the password; Cancel there falls back to sudo's own terminal prompt.
+    # Killing it after a few seconds and starting another sudo opened the
+    # same dialog twice and threw away a password typed into the first.
     echo -e "${PURPLE}${ICON_ARROW}${NC} ${prompt_msg} ${GRAY}, Touch ID or password${NC}"
 
-    # Start sudo in background so we can monitor and control it
-    sudo -v < /dev/null > /dev/null 2>&1 &
-    local sudo_pid=$!
-
-    # Wait for sudo to complete or timeout (5 seconds)
-    local elapsed=0
-    local timeout=50 # 50 * 0.1s = 5 seconds
-    while ((elapsed < timeout)); do
-        if ! kill -0 "$sudo_pid" 2> /dev/null; then
-            # Process exited
-            wait "$sudo_pid" 2> /dev/null
-            local exit_code=$?
-            if [[ $exit_code -eq 0 ]] && sudo -n true 2> /dev/null; then
-                # Touch ID succeeded - clear the prompt line
-                safe_clear_lines 1 "$tty_path"
-                return 0
-            fi
-            # Touch ID failed or cancelled
-            break
-        fi
-        sleep 0.1
-        elapsed=$((elapsed + 1))
-    done
-
-    # Touch ID failed/cancelled - clean up thoroughly before password input
-
-    # Kill the sudo process if still running
-    if kill -0 "$sudo_pid" 2> /dev/null; then
-        kill -9 "$sudo_pid" 2> /dev/null
-        wait "$sudo_pid" 2> /dev/null || true
-    fi
-
-    # Clear sudo state immediately
-    sudo -k 2> /dev/null
-
-    # IMPORTANT: Wait longer for macOS to fully close Touch ID UI and SecurityAgent
-    # Without this delay, subsequent sudo calls may re-trigger Touch ID
-    sleep 1
-
-    # Clear any leftover prompts on the screen
-    safe_clear_line "$tty_path"
-
-    # Now use our password input (this should not trigger Touch ID again)
-    if _request_password "$tty_path"; then
-        # Clear all prompt lines (use safe clearing method)
-        safe_clear_lines 3 "$tty_path"
+    # Text typed into the terminal while the dialog is up stays off the screen.
+    # shellcheck disable=SC2024,SC2094
+    # Intentionally route sudo's native prompt to the same TTY device it reads from.
+    if _mole_tty_quiet "$tty_path" sudo -v < "$tty_path" > /dev/null 2> "$tty_path" &&
+        sudo -n true 2> /dev/null; then
+        safe_clear_lines 1 "$tty_path"
         return 0
     fi
     return 1
@@ -225,6 +235,7 @@ request_sudo_access_with_password() {
 
     if printf '%s\n' "$password" | sudo -S -p "" -v > /dev/null 2>&1; then
         unset password
+        _mole_touchid_hint
         return 0
     fi
 
@@ -245,23 +256,33 @@ _start_sudo_keepalive() {
     # Start background keepalive process with all outputs redirected
     # This is critical: command substitution waits for all file descriptors to close
     (
-        # Initial delay to let sudo cache stabilize after password entry
-        # This prevents immediately triggering Touch ID again
-        sleep 2
-
+        # Subshell-only state must survive function-local unwinding at EXIT.
+        child_pid=""
+        local delay=2
+        # A foreground sleep delays shell traps and can outlive the worker.
+        # Wait on an owned child instead, then reap it before this worker exits.
+        trap 'if [[ -n "$child_pid" ]]; then kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; fi' EXIT
+        trap 'exit 0' HUP INT TERM
         while true; do
-            if ! sudo -n -v 2> /dev/null; then
+            # The initial delay lets the credential cache settle after login.
+            sleep "$delay" &
+            child_pid=$!
+            wait "$child_pid" || true
+            child_pid=""
+            kill -0 "$$" 2> /dev/null || exit
+            sudo -n -v 2> /dev/null &
+            child_pid=$!
+            if wait "$child_pid"; then
+                delay=30
+            else
                 # A failed refresh is harmless and often transient (authd
                 # busy, machine waking). Giving up after a few misses is what
                 # let the timestamp lapse minutes into a long install and
                 # forced a second authentication prompt; `-n` never prompts,
                 # so retrying costs nothing. Exit only with the parent.
-                kill -0 "$$" 2> /dev/null || exit
-                sleep 5
-                continue
+                delay=5
             fi
-            sleep 30
-            kill -0 "$$" 2> /dev/null || exit
+            child_pid=""
         done
     ) > /dev/null 2>&1 &
 
@@ -302,7 +323,14 @@ adopt_sudo_session() {
         MOLE_SUDO_ESTABLISHED="false"
     fi
 
-    if ! sudo -n -v 2> /dev/null; then
+    local adoption_rc=0
+    if [[ -t 0 ]] && declare -F mole_tty_is_foreground > /dev/null && mole_tty_is_foreground; then
+        # Validate command access before cleanup can hide a deferred prompt.
+        has_sudo_session || adoption_rc=$?
+    else
+        sudo -n -v 2> /dev/null || adoption_rc=$?
+    fi
+    if [[ $adoption_rc -ne 0 ]]; then
         MOLE_SUDO_ESTABLISHED="false"
         return 1
     fi

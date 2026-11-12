@@ -35,7 +35,9 @@ func collectBatteries() (batts []BatteryStatus, err error) {
 
 	// macOS: pmset for real-time percentage/status.
 	if runtime.GOOS == "darwin" && commandExists("pmset") {
-		if out, err := runCmd(context.Background(), "pmset", "-g", "batt"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if out, err := runCmd(ctx, "pmset", "-g", "batt"); err == nil {
 			// Health/cycles/capacity from AppleSmartBattery and cached system_profiler.
 			health, cycles, capacity := getCachedPowerData()
 			if batts := parsePMSet(out, health, cycles, capacity); len(batts) > 0 {
@@ -372,6 +374,17 @@ func collectThermal() ThermalStatus {
 		thermal.SystemPower = powerThermal.SystemPower
 		thermal.AdapterPower = powerThermal.AdapterPower
 		thermal.BatteryPower = powerThermal.BatteryPower
+	}
+
+	// macOS 27 keeps the gauge data under the AppleSmartBatteryPack child, so the
+	// top-level read can have no Temperature. Read the pack only then, which keeps
+	// a single ioreg call on every release that still reports it at the top.
+	if thermal.BatteryTemp == 0 {
+		ctxPack, cancelPack := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancelPack()
+		if out, err := runCmd(ctxPack, "ioreg", "-rc", "AppleSmartBatteryPack", "-l"); err == nil {
+			thermal.BatteryTemp = parseAppleSmartBatteryThermal(out).BatteryTemp
+		}
 	}
 
 	// Do not synthesize CPU temperature from battery sensors or cpu_thermal_level.

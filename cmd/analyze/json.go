@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,9 +102,7 @@ func performOverviewScanForJSONWithEntries(path string, insightEntries, overview
 		entries = append(entries, entry)
 	}
 
-	sort.SliceStable(entries, func(i, j int) bool {
-		return entries[i].Size > entries[j].Size
-	})
+	sortDirEntriesBySize(entries)
 
 	return jsonOutput{
 		Path:       path,
@@ -144,10 +141,12 @@ func measureOverviewEntriesForJSON(overviewEntries []dirEntry, insightPaths map[
 			if cached, state, cacheErr := loadOverviewCachedMeasurement(item.Path); cacheErr == nil && cached > 0 {
 				size, item.State = cached, state
 			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), duTimeout)
+				defer cancel()
 				if insightPaths[item.Path] {
-					size, err = measureInsightSize(context.Background(), item.Path)
+					size, err = measureInsightSize(ctx, item.Path)
 				} else {
-					size, err = measureOverviewSize(context.Background(), item.Path)
+					size, err = measureOverviewSize(ctx, item.Path)
 				}
 				item.State = measurementState(size, err)
 			}

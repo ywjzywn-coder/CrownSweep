@@ -48,7 +48,7 @@ mole_path_identity() {
     if [[ -e "$normalized" || -L "$normalized" ]]; then
         if command -v stat > /dev/null 2>&1; then
             local fs_id=""
-            fs_id=$(stat -L -f '%d:%i' "$normalized" 2> /dev/null || stat -f '%d:%i' "$normalized" 2> /dev/null || true)
+            fs_id=$("$STAT_BSD" -L -f '%d:%i' "$normalized" 2> /dev/null || "$STAT_BSD" -f '%d:%i' "$normalized" 2> /dev/null || true)
             if [[ "$fs_id" =~ ^[0-9]+:[0-9]+$ ]]; then
                 printf 'inode:%s\n' "$fs_id"
                 return 0
@@ -67,6 +67,25 @@ mole_identity_in_list() {
     for existing in "$@"; do
         [[ "$existing" == "$needle" ]] && return 0
     done
+    return 1
+}
+
+# Every docker command talks to the endpoint the current context or
+# DOCKER_HOST names, which can be a remote engine over TCP or SSH. Mole reports
+# and prunes this Mac only, so each Docker query asks first; `docker context
+# inspect` reads local configuration and never dials the engine (#1922).
+# Returns 0 for a local unix socket, 1 for docker missing or any other
+# endpoint, 2 when the answer is unknown, and a signal status unchanged.
+mole_docker_endpoint_is_local() {
+    command -v docker > /dev/null 2>&1 || return 1
+    local host="" rc=0
+    host=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" docker context inspect --format '{{.Endpoints.docker.Host}}' 2> /dev/null) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        mole_rc_signal "$rc" && return "$rc"
+        return 2
+    fi
+    [[ -n "$host" && "$host" != *$'\n'* ]] || return 2
+    [[ "$host" == unix:///* ]] && return 0
     return 1
 }
 
@@ -113,7 +132,7 @@ _mole_repair_stale_brew_entries() {
 
     local relink_rc=0
     HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
-        run_with_timeout "${MOLE_HOMEBREW_UPDATE_TIMEOUT:-120}" \
+        run_with_timeout 120 \
         brew link --overwrite mole > /dev/null 2>&1 || relink_rc=$?
     if [[ $relink_rc -eq 0 ]]; then
         echo -e "${GREEN}${ICON_SUCCESS}${NC} Repaired stale launcher, now pointing at the current Homebrew install"
@@ -121,6 +140,48 @@ _mole_repair_stale_brew_entries() {
         log_warning "Launcher still points at a removed Homebrew version"
         printf 'Run: brew link --overwrite mole\n' >&2
     fi
+}
+
+# The first items of a release's "### Changelog" list, each cut to its title:
+# the release notes write every item as "Title: detail".
+mole_release_highlight_titles() {
+    local body="$1" limit="${2:-4}" line item in_list=false count=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        if [[ "$line" == "### Changelog"* ]]; then
+            in_list=true
+            continue
+        fi
+        [[ "$in_list" == true ]] || continue
+        [[ "$line" == "### "* ]] && break
+        [[ "$line" =~ ^[0-9]+\.[[:space:]]+(.+)$ ]] || continue
+        item="${BASH_REMATCH[1]}"
+        item="${item%%: *}"
+        printf '%s\n' "$item"
+        count=$((count + 1))
+        if [[ $count -ge $limit ]]; then
+            break
+        fi
+    done <<< "$body"
+}
+
+# After a stable update, a few lines on what the new version changed, read from
+# its published release (maintainer 2026-11-01). Best effort and terminal only:
+# offline, a rate limit or a body without the list prints nothing.
+mole_print_release_highlights() {
+    local version="${1#[Vv]}" body titles title
+    [[ -t 1 ]] || return 0
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+    body=$(curl -fsSL --connect-timeout "${MOLE_LOOKUP_CONNECT_TIMEOUT:-2}" --max-time "${MOLE_LOOKUP_MAX_TIME:-3}" \
+        "https://api.github.com/repos/tw93/mole/releases/tags/V${version}" 2> /dev/null |
+        /usr/bin/plutil -extract body raw -o - - 2> /dev/null) || return 0
+    titles=$(mole_release_highlight_titles "$body" 4)
+    [[ -n "$titles" ]] || return 0
+    printf "What's new in %s\n" "$version"
+    while IFS= read -r title; do
+        printf '  %s %s\n' "$ICON_LIST" "$title"
+    done <<< "$titles"
+    printf '  %s\n\n' "${GRAY}https://github.com/tw93/Mole/releases/tag/V${version}${NC}"
 }
 
 # Update via Homebrew
@@ -131,7 +192,7 @@ update_via_homebrew() {
     temp_upgrade=$(mktemp_file "brew_upgrade")
 
     # Set up trap for interruption (Ctrl+C) with inline cleanup
-    trap 'stop_inline_spinner 2>/dev/null; safe_remove "$temp_update" true; safe_remove "$temp_upgrade" true; echo ""; exit 130' INT TERM
+    trap 'stop_inline_spinner 2>/dev/null; rm -f "$temp_update" "$temp_upgrade"; echo ""; exit 130' INT TERM # SAFE: own mktemp scratch files
 
     # Update Homebrew
     if [[ -t 1 ]]; then
@@ -140,7 +201,7 @@ update_via_homebrew() {
         echo "Updating Homebrew..."
     fi
 
-    local brew_update_timeout="${MOLE_HOMEBREW_UPDATE_TIMEOUT:-120}"
+    local brew_update_timeout=120
     HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
         run_with_timeout "$brew_update_timeout" brew update > "$temp_update" 2>&1 || true
 
@@ -155,7 +216,7 @@ update_via_homebrew() {
         echo "Upgrading Mole..."
     fi
 
-    local brew_upgrade_timeout="${MOLE_HOMEBREW_UPGRADE_TIMEOUT:-120}"
+    local brew_upgrade_timeout=120
     local upgrade_status=0
     HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
         run_with_timeout "$brew_upgrade_timeout" brew upgrade mole > "$temp_upgrade" 2>&1 || upgrade_status=$?
@@ -171,8 +232,8 @@ update_via_homebrew() {
     trap - INT TERM
 
     # Cleanup temp files
-    safe_remove "$temp_update" true
-    safe_remove "$temp_upgrade" true
+    # Own mktemp scratch files: safe_remove would log them as cleanup rows.
+    rm -f "$temp_update" "$temp_upgrade" # SAFE: own mktemp scratch files
 
     if [[ "$upgrade_status" -ne 0 ]]; then
         log_error "Homebrew upgrade failed"
@@ -201,6 +262,10 @@ update_via_homebrew() {
         echo ""
         echo -e "${GREEN}${ICON_SUCCESS}${NC} Updated to latest version, ${new_version:-$current_version}"
         echo ""
+        # Record the update before the network highlights fetch, so Ctrl-C
+        # during that fetch cannot drop the row for a change already made.
+        log_operation "update" "REBUILT" "Homebrew mole" "updated to ${new_version:-unknown}"
+        mole_print_release_highlights "${new_version:-}"
     fi
 
     # Both success shapes can leave a stale foreign launcher shadowing the
@@ -287,6 +352,7 @@ remove_apps_from_dock() {
                     [[ -n "$raw_path" && "$url" == *"$raw_path"* ]]; }; then
                     if /usr/libexec/PlistBuddy -c "Delete :$dock_array:$i" "$plist" 2> /dev/null; then
                         changed=true
+                        log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "REMOVED" "$full_path" "dock entry"
                         # After deletion, current index i now points to the next item.
                         continue
                     fi

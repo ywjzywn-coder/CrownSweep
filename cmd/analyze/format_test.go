@@ -4,6 +4,8 @@ package main
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +21,7 @@ func TestSpinnerFramesHaveSingleColumnWidth(t *testing.T) {
 	}
 }
 
-func TestRuneWidth(t *testing.T) {
+func TestDisplayWidthCharacters(t *testing.T) {
 	tests := []struct {
 		name  string
 		input rune
@@ -33,13 +35,13 @@ func TestRuneWidth(t *testing.T) {
 		{"CJK ideograph", '語', 2},
 		{"Full-width number", '１', 2},
 		{"ASCII space", ' ', 1},
-		{"Tab", '	', 1},
+		{"Tab", '	', 0},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := runeWidth(tt.input); got != tt.want {
-				t.Errorf("runeWidth(%q) = %d, want %d", tt.input, got, tt.want)
+			if got := displayWidth(string(tt.input)); got != tt.want {
+				t.Errorf("displayWidth(%q) = %d, want %d", tt.input, got, tt.want)
 			}
 		})
 	}
@@ -290,6 +292,18 @@ func TestDisplayPath(t *testing.T) {
 			},
 		},
 		{
+			name: "Keep sibling of home that shares its prefix",
+			setup: func() string {
+				t.Setenv("HOME", "/Users/test")
+				return "/Users/tester/Downloads"
+			},
+			check: func(t *testing.T, result string) {
+				if result != "/Users/tester/Downloads" {
+					t.Errorf("Expected unchanged path, got %q", result)
+				}
+			},
+		},
+		{
 			name: "Keep absolute path outside home",
 			setup: func() string {
 				t.Setenv("HOME", "/Users/test")
@@ -312,6 +326,29 @@ func TestDisplayPath(t *testing.T) {
 	}
 }
 
+func TestViewHeaderKeepsSiblingOfHomeUnabbreviated(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "test")
+	sibling := filepath.Join(root, "tester")
+	for _, dir := range []string{home, sibling} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", home)
+
+	m := newModel(sibling, false)
+	for line := range strings.SplitSeq(m.View(), "\n") {
+		if strings.Contains(line, "Analyze Disk") {
+			if !strings.Contains(line, sibling) {
+				t.Fatalf("header should show %s, got %q", sibling, line)
+			}
+			return
+		}
+	}
+	t.Fatal("header line not rendered")
+}
+
 func TestPadName(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -332,56 +369,6 @@ func TestPadName(t *testing.T) {
 			if gotWidth < tt.wantWidth && displayWidth(tt.input) < tt.targetWidth {
 				t.Errorf("padName(%q, %d) width = %d, want >= %d", tt.input, tt.targetWidth, gotWidth, tt.wantWidth)
 			}
-		})
-	}
-}
-
-func TestTrimNameWithWidth(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		maxWidth int
-		check    func(t *testing.T, result string)
-	}{
-		{
-			name:     "Trim ASCII name",
-			input:    "verylongfilename.txt",
-			maxWidth: 10,
-			check: func(t *testing.T, result string) {
-				if displayWidth(result) > 10 {
-					t.Errorf("Width exceeds max: %d > 10", displayWidth(result))
-				}
-				if !strings.HasSuffix(result, "...") {
-					t.Errorf("Expected ellipsis, got %q", result)
-				}
-			},
-		},
-		{
-			name:     "Trim CJK name",
-			input:    "很长的文件名称.txt",
-			maxWidth: 12,
-			check: func(t *testing.T, result string) {
-				if displayWidth(result) > 12 {
-					t.Errorf("Width exceeds max: %d > 12", displayWidth(result))
-				}
-			},
-		},
-		{
-			name:     "No trimming needed",
-			input:    "short.txt",
-			maxWidth: 20,
-			check: func(t *testing.T, result string) {
-				if result != "short.txt" {
-					t.Errorf("Should not trim, got %q", result)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := trimNameWithWidth(tt.input, tt.maxWidth)
-			tt.check(t, result)
 		})
 	}
 }
@@ -444,5 +431,45 @@ func TestFormatUnusedTime(t *testing.T) {
 				t.Errorf("formatUnusedTime(%d days ago) = %q, want %q", tt.daysAgo, got, tt.want)
 			}
 		})
+	}
+}
+
+// Names macOS hands back decomposed (NFD), CJK punctuation, halfwidth kana and
+// joined emoji keep the column width the terminal draws, so the size column
+// after a padded name stays aligned and a cut never splits a grapheme.
+func TestUnicodeColumnsPreserveGraphemes(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		width int
+	}{
+		{"微信输入法", 10}, {"资料、备份", 10}, {"「报告」.pdf", 12}, {"Cafe\u0301", 4}, {"ｶﾀｶﾅ", 4}, {"👨‍👩‍👧‍👦", 2},
+	} {
+		if got := displayWidth(tt.name); got != tt.width {
+			t.Errorf("%q width=%d want %d", tt.name, got, tt.width)
+		}
+		if got := lipgloss.Width(padName(tt.name, 24)); got != 24 {
+			t.Errorf("%q padded width=%d", tt.name, got)
+		}
+	}
+	if got := truncateMiddle("👨‍👩‍👧‍👦abc", 2); got != "👨‍👩‍👧‍👦" {
+		t.Errorf("split grapheme=%q", got)
+	}
+}
+
+func TestTruncateMiddleNeverExceedsTheColumnBudget(t *testing.T) {
+	// A wide grapheme at the tail cut used to leave the name one cell too wide,
+	// which pushed the size column on CJK and flag names.
+	names := []string{
+		"🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵🇯🇵",
+		"资料备份资料备份资料备份资料备份",
+		"abc资料备份def资料备份ghi资料",
+		"report-2023-final-version-archive.tar.gz",
+	}
+	for _, name := range names {
+		for budget := 1; budget <= 24; budget++ {
+			if got := truncateMiddle(name, budget); displayWidth(got) > budget {
+				t.Errorf("truncateMiddle(%q, %d) = %q is %d cells", name, budget, got, displayWidth(got))
+			}
+		}
 	}
 }

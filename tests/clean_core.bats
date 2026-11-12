@@ -9,7 +9,7 @@ setup_file() {
     MOLE_TEST_MODE=1
     export MOLE_TEST_MODE
 
-    # Two tests below run the real pipeline (MOLE_TEST_MODE=0), which otherwise
+    # Full-pipeline tests below run the real pipeline (MOLE_TEST_MODE=0), which otherwise
     # scans the host: a full lsregister -dump. That cost seconds per test and
     # scaled with whatever LaunchServices happened to hold, which made this
     # file the critical path of the whole CI suite. The scan feeds no
@@ -73,7 +73,7 @@ run_clean_dry_run() {
         "$PROJECT_ROOT/mole" clean --dry-run
 }
 
-# Stub the two host toolchains the real pipeline shells out to, so what these
+# Stub the host toolchains the real pipeline shells out to, so what these
 # tests measure does not depend on the machine's Homebrew or Xcode. brew is
 # required to be mocked by project policy: no verification run may reach a real
 # package manager. xcrun follows for the same reason, and returning non-zero is
@@ -99,6 +99,16 @@ esac
 exit 0
 MOCK
 
+    cat > "$MOCK_TOOLCHAIN_BIN/go" << 'MOCK'
+#!/bin/bash
+# Shim: resolve empty fixture caches without downloading a host toolchain.
+case "$*" in
+    'env GOMODCACHE') printf '%s\n' "$HOME/go/pkg/mod" ;;
+    'env GOCACHE') printf '%s\n' "$HOME/Library/Caches/go-build" ;;
+    *) printf 'Unexpected Go command in clean fixture: %s\n' "$*" >&2; exit 99 ;;
+esac
+MOCK
+
     cat > "$MOCK_TOOLCHAIN_BIN/xcrun" << 'MOCK'
 #!/bin/bash
 # Shim: no simulator toolchain, which is the CLT-only shape clean handles.
@@ -120,7 +130,7 @@ MOCK
 printf '  PID  PPID COMM ARGS\n'
 MOCK
 
-    chmod +x "$MOCK_TOOLCHAIN_BIN/brew" "$MOCK_TOOLCHAIN_BIN/xcrun" \
+    chmod +x "$MOCK_TOOLCHAIN_BIN/brew" "$MOCK_TOOLCHAIN_BIN/go" "$MOCK_TOOLCHAIN_BIN/xcrun" \
         "$MOCK_TOOLCHAIN_BIN/lsof" "$MOCK_TOOLCHAIN_BIN/ps"
 }
 
@@ -159,6 +169,107 @@ EOF
     [[ ! -e "$base/a" ]] || return 1
     [[ ! -e "$base/b" ]] || return 1
     [[ -e "$base/keep" ]] || return 1
+
+    rm -rf "$base"
+}
+
+@test "safe_clean removes a 0B target without printing a row for it" {
+    local base="$HOME/safe_clean_zero"
+    mkdir -p "$base/empty" "$base/full"
+    : > "$base/empty/zero"
+    printf 'xxxx' > "$base/full/data"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc << EOF
+set -euo pipefail
+source "\$PROJECT_ROOT/lib/core/common.sh"
+source "\$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { echo ACTIVITY; }
+is_path_whitelisted() { return 1; }
+safe_remove() { /bin/rm -rf "\$1"; return 0; } # SAFE: test fixture
+safe_clean "$base/empty" "Empty cache"
+safe_clean "$base/full" "Full cache"
+echo "FILES=\$files_cleaned"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"Empty cache"* ]] || return 1
+    [[ "$output" == *"Full cache"* ]] || return 1
+    [ "$(printf '%s\n' "$output" | grep -c '^ACTIVITY$')" -eq 1 ] || return 1
+    [[ "$output" == *"FILES=2"* ]] || return 1
+    [[ ! -e "$base/empty" && ! -e "$base/full" ]] || return 1
+    rm -rf "$base"
+}
+
+@test "safe_clean keeps the row when a size could not be read" {
+    local base="$HOME/safe_clean_unsized"
+    mkdir -p "$base/one" "$base/two"
+    printf 'xxxx' > "$base/one/data"
+    printf 'xxxx' > "$base/two/data"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc << EOF
+set -euo pipefail
+source "\$PROJECT_ROOT/lib/core/common.sh"
+source "\$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+is_path_whitelisted() { return 1; }
+# A sizing failure that is neither a timeout nor a signal reads as 0.
+get_cleanup_path_size_kb() { return 1; }
+_cleanup_path_sizes_kb() { return 1; }
+safe_remove() { /bin/rm -rf "\$1"; return 0; } # SAFE: test fixture
+safe_clean "$base/one" "Unsized single"
+safe_clean "$base/two"/* "Unsized batch"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Unsized single"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"Unsized batch"* ]] || { echo "$output"; return 1; }
+    rm -rf "$base"
+}
+
+@test "safe_clean colors a real cleanup size by unit like the dry-run preview" {
+    local base="$HOME/safe_clean_color"
+    mkdir -p "$base"
+    /bin/dd if=/dev/zero of="$base/blob" bs=1024 count=2048 2> /dev/null
+
+    run env -u NO_COLOR HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc << EOF
+set -euo pipefail
+source "\$PROJECT_ROOT/lib/core/common.sh"
+source "\$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+safe_remove() { /bin/rm -rf "\$1"; return 0; }
+safe_clean "$base/blob" "Test cache"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    # The success icon stays green; only the size takes its unit color.
+    [[ "$output" == *$'\033[0;32m✓\033[0m Test cache'* ]] || return 1
+    local yellow_mb=$'\033\\[0;33m[0-9.]+MB\033\\[0m'
+    [[ "$output" =~ $yellow_mb ]] || return 1
+    [[ ! -e "$base/blob" ]] || return 1
 
     rm -rf "$base"
 }
@@ -240,6 +351,40 @@ EOF
     [[ "$output" != *"would clean"* ]]
 }
 
+@test "safe_clean_guarded dry-run shows loading while the guard checks each item" {
+    if ! /usr/bin/script -q /dev/null /usr/bin/true < /dev/null > /dev/null 2>&1; then
+        skip "script cannot allocate a TTY in this environment"
+    fi
+    local base="$HOME/safe_clean_guarded_dry_loading"
+    mkdir -p "$base"
+    local i
+    for i in 1 2 3 4 5; do printf 'x' > "$base/item$i.log"; done
+    local raw="$HOME/guarded-dry-loading.raw"
+
+    # shellcheck disable=SC2016  # inner bash expands these from its environment
+    PROJECT_ROOT="$PROJECT_ROOT" HOME="$HOME" BASE="$base" TERM=xterm-256color MOLE_TEST_MODE=1 \
+        /usr/bin/script -q -F "$raw" /bin/bash --noprofile --norc -c '
+            set -euo pipefail
+            source "$PROJECT_ROOT/lib/core/common.sh"
+            source "$PROJECT_ROOT/bin/clean.sh"
+            DRY_RUN=true
+            spinning=""
+            start_section_spinner() { spinning="$1"; echo "SPIN:$1"; }
+            stop_section_spinner() { spinning=""; echo "STOP"; }
+            stop_inline_spinner() { spinning=""; echo "STOP"; }
+            note_activity() { :; }
+            is_path_whitelisted() { return 1; }
+            delete_guard() { echo "GUARD_WHILE:${spinning:-none}"; }
+            safe_clean_guarded delete_guard "$BASE"/item*.log "Guarded cache"
+        ' < /dev/null > /dev/null 2>&1
+
+    local content
+    content=$(tr -d '\r' < "$raw")
+    [[ "$content" == *"GUARD_WHILE:Checking Guarded cache..."* ]] || { echo "$content"; return 1; }
+    [[ "$content" != *"GUARD_WHILE:none"* ]] || { echo "$content"; return 1; }
+    [[ "$content" == *"GUARD_WHILE:Checking Guarded cache..."*"STOP"*"Guarded cache"*"dry"* ]] || { echo "$content"; return 1; }
+}
+
 @test "safe_clean_guarded dry-run stops at the first target-specific denial" {
     local base="$HOME/safe_clean_guarded_dry_targets"
     mkdir -p "$base/a" "$base/b"
@@ -280,6 +425,85 @@ EOF
     [[ "$output" != *"REGISTER:$base/b"* ]] || return 1
     [[ "$output" == *"RC=75 FILES=1"* ]] || return 1
     [[ "$output" != *"2 items"* ]]
+}
+
+@test "safe_clean_guarded skips only the path its guard names and keeps going" {
+    # Both size branches (three targets or fewer, and more) in real and dry-run
+    # mode each have their own guard site.
+    local mode count failures=0
+    for mode in real dry; do
+        for count in 3 4; do
+            run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MODE="$mode" COUNT="$count" \
+                BASE="$HOME/safe_clean_guarded_skip_${mode}_${count}" MOLE_TEST_MODE=1 \
+                /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+[[ "$MODE" != dry ]] || DRY_RUN=true
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+is_path_whitelisted() { return 1; }
+get_cleanup_path_size_kb() { echo 1; }
+record_dry_run_cleanup_target() { printf '%s\n' "$1" >> "$BASE/preview"; }
+safe_remove() { /bin/rm -rf "$1"; return 0; }
+# Names the path it refuses, so the batch goes on without it.
+skip_guard() {
+    [[ "$1" != "$BASE/t2" ]] || { _MOLE_SAFE_CLEAN_SKIP_PATH="$1"; return 1; }
+}
+# Refuses the same path without naming it, which stops the batch.
+stop_guard() { [[ "$1" != "$BASE/t2" ]]; }
+handled() {
+    if [[ "$MODE" == dry ]]; then
+        [[ -f "$BASE/preview" ]] && grep -Fxq "$1" "$BASE/preview"
+    else
+        [[ ! -e "$1" ]]
+    fi
+}
+reset() {
+    rm -rf "$BASE"
+    targets=()
+    local i
+    for ((i = 1; i <= COUNT; i++)); do
+        mkdir -p "$BASE/t$i"
+        targets+=("$BASE/t$i")
+    done
+}
+
+reset
+rc=0
+safe_clean_guarded skip_guard "${targets[@]}" "Skip guard" || rc=$?
+[[ $rc -eq 0 ]] || { echo "SKIP_RC:$rc"; exit 1; }
+for ((i = 1; i <= COUNT; i++)); do
+    if [[ $i -eq 2 ]]; then
+        ! handled "$BASE/t$i" || { echo "SKIP_HANDLED:t$i"; exit 1; }
+    else
+        handled "$BASE/t$i" || { echo "SKIP_MISSED:t$i"; exit 1; }
+    fi
+done
+
+reset
+rc=0
+safe_clean_guarded stop_guard "${targets[@]}" "Stop guard" || rc=$?
+[[ $rc -eq 75 ]] || { echo "STOP_RC:$rc"; exit 1; }
+handled "$BASE/t1" || { echo "STOP_MISSED:t1"; exit 1; }
+for ((i = 2; i <= COUNT; i++)); do
+    ! handled "$BASE/t$i" || { echo "STOP_HANDLED:t$i"; exit 1; }
+done
+EOF
+            [ "$status" -eq 0 ] || {
+                echo "$mode/$count: $output"
+                failures=$((failures + 1))
+            }
+        done
+    done
+    [ "$failures" -eq 0 ] || return 1
 }
 
 @test "safe_clean_guarded filters ineligible targets before the dry-run guard" {
@@ -986,7 +1210,7 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Free space: 75.16GB"* ]] || return 1
-    [[ "$output" == *"Tracked cleanup:"* ]] || return 1
+    [[ "$output" == *"Removed:"* ]] || return 1
     [[ "$output" == *"1.02GB"* ]] || return 1
     [[ "$output" == *"Free space: 76.19GB (+1.02GB)"* ]] || return 1
     [[ "$output" != *"Space freed:"* ]] || return 1
@@ -1058,6 +1282,9 @@ PLIST
     echo "cache" > "$HOME/Library/Application Support/Code/CachedData/data.bin"
 
     set_mock_host_toolchains
+    # Deduplication needs an idle fixture owner, independent of host editors.
+    printf '#!/bin/bash\nexit 1\n' > "$MOCK_TOOLCHAIN_BIN/pgrep"
+    chmod +x "$MOCK_TOOLCHAIN_BIN/pgrep"
     run env HOME="$HOME" MOLE_TEST_MODE=0 \
         PATH="$MOCK_TOOLCHAIN_BIN:$PATH" "$PROJECT_ROOT/mole" clean --dry-run
     [ "$status" -eq 0 ]
@@ -1108,9 +1335,10 @@ PLIST
     [[ -n "$preview_total" && "$preview_items" =~ ^[0-9]+$ && "$preview_categories" =~ ^[0-9]+$ ]] || return 1
     [[ "$output" != *"Category total"* ]] || return 1
     printf '%s\n' "$output" | grep -F "Potential space:" |
-        grep -F "Items: $preview_items" |
-        grep -F "Categories: $preview_categories" |
+        grep -E " · $preview_items items?\b" |
         grep -qF "$preview_total" || return 1
+    # The box keeps two lines: the total and the file list.
+    [[ "$output" != *"Categories:"* && "$output" != *"add protection rules"* ]] || return 1
 }
 
 @test "dry-run ledger keeps shell-timeout child candidates and unknown sizes" {
@@ -1603,42 +1831,38 @@ EOF
 }
 
 @test "_clean_mail_downloads removes old attachments" {
-    mkdir -p "$HOME/Library/Mail Downloads"
-    touch "$HOME/Library/Mail Downloads/old.pdf"
-    touch -t 202301010000 "$HOME/Library/Mail Downloads/old.pdf"
+    # One opening's folder with Mail's untouched copy inside, a month old.
+    mkdir -p "$HOME/Library/Mail Downloads/OPENING"
+    touch "$HOME/Library/Mail Downloads/OPENING/old.pdf"
+    touch -t 202301010000 "$HOME/Library/Mail Downloads/OPENING/old.pdf"
+    touch -t 202301010000 "$HOME/Library/Mail Downloads/OPENING"
 
-    if command -v mkfile > /dev/null 2>&1; then
-        mkfile -n 6000k "$HOME/Library/Mail Downloads/dummy.dat"
-    else
-        truncate -s 6000k "$HOME/Library/Mail Downloads/dummy.dat"
-    fi
+    # The cleanup threshold uses allocated blocks; a sparse file stays below it.
+    dd if=/dev/zero of="$HOME/Library/Mail Downloads/dummy.dat" bs=1024 count=6000 2> /dev/null
 
-    [ -f "$HOME/Library/Mail Downloads/old.pdf" ]
+    [ -f "$HOME/Library/Mail Downloads/OPENING/old.pdf" ]
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
+pgrep() { return 1; }
 _clean_mail_downloads
 EOF
 
     [ "$status" -eq 0 ]
-    [ ! -f "$HOME/Library/Mail Downloads/old.pdf" ]
+    [ ! -f "$HOME/Library/Mail Downloads/OPENING/old.pdf" ]
 }
 
 @test "_clean_mail_downloads uses dry-run wording and keeps attachments" {
-    mkdir -p "$HOME/Library/Mail Downloads"
-    touch "$HOME/Library/Mail Downloads/old.pdf"
-    touch -t 202301010000 "$HOME/Library/Mail Downloads/old.pdf"
+    # One opening's folder with Mail's untouched copy inside, a month old.
+    mkdir -p "$HOME/Library/Mail Downloads/OPENING"
+    touch "$HOME/Library/Mail Downloads/OPENING/old.pdf"
+    touch -t 202301010000 "$HOME/Library/Mail Downloads/OPENING/old.pdf"
+    touch -t 202301010000 "$HOME/Library/Mail Downloads/OPENING"
 
-    # MOLE_MAIL_DOWNLOADS_MIN_KB is readonly in base.sh, so an env override is
-    # discarded and the sweep stays below threshold. Grow the directory instead,
-    # the same way the non-dry-run case above does.
-    if command -v mkfile > /dev/null 2>&1; then
-        mkfile -n 6000k "$HOME/Library/Mail Downloads/dummy.dat"
-    else
-        truncate -s 6000k "$HOME/Library/Mail Downloads/dummy.dat"
-    fi
+    # The cleanup threshold uses allocated blocks; a sparse file stays below it.
+    dd if=/dev/zero of="$HOME/Library/Mail Downloads/dummy.dat" bs=1024 count=6000 2> /dev/null
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -1651,7 +1875,7 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"Would clean 1 mail attachments"* ]] || return 1
     [[ "$output" != *"Cleaned 1 mail attachments"* ]] || return 1
-    [ -f "$HOME/Library/Mail Downloads/old.pdf" ]
+    [ -f "$HOME/Library/Mail Downloads/OPENING/old.pdf" ]
 }
 
 @test "clean_time_machine_failed_backups detects running backup correctly" {
@@ -1763,7 +1987,7 @@ EOF
             note_activity
             echo "  row output"
             end_section
-        ' > /dev/null 2>&1
+        ' < /dev/null > /dev/null 2>&1
 
     raw_content="$(cat "$raw")"
     # Idle header painted, then the next header overwrites its line in place.
@@ -1790,7 +2014,7 @@ EOF
             start_section "User essentials"
             note_activity
             end_section
-        ' > /dev/null 2>&1
+        ' < /dev/null > /dev/null 2>&1
 
     raw_content="$(cat "$raw")"
     # The log_success row counts as activity: the section is not idle, so the
@@ -2105,4 +2329,211 @@ EOF
         echo "$folded"
         return 1
     }
+}
+
+@test "Space skips later privileged cleanup even when credentials become cached" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+fixture=$(mktemp -d "$HOME/sudo-choice.XXXXXX")
+export MOLE_XCODE_DOCUMENTATION_CACHE_DIR="$fixture/docs"
+export MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR="$fixture/simulator"
+mkdir -p "$MOLE_XCODE_DOCUMENTATION_CACHE_DIR/DeveloperDocumentation.index" "$MOLE_XCODE_DOCUMENTATION_CACHE_DIR/DeveloperDocumentation-old.index" "$MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR/entry"
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+holds_compiled_model_cache() { return 1; }
+_xcode_xctest_devices_process_running() { return 1; }
+_coresimulator_cache_process_running() { return 1; }
+_coresimulator_booted_device_state() { return 1; }
+note_activity() { :; }
+get_path_size_kb() { echo 1; }
+_sim_runtime_size_kb() { echo 1; }
+has_sudo_session() { return 1; }
+ensure_sudo_session() { echo auth >> "$fixture/privileged"; return 1; }
+safe_sudo_remove() { echo remove >> "$fixture/privileged"; }
+_mole_bounded_sudo() { echo probe >> "$fixture/privileged"; return 1; }
+read_key() { echo SPACE; }
+prompt_for_system_clean
+# No authorization prompts after the explicit choice.
+clean_xcode_documentation_cache
+clean_xcode_system_coresimulator_caches
+# A credential refreshed elsewhere is not consent for this cleanup.
+has_sudo_session() { return 0; }
+clean_xcode_documentation_cache
+clean_xcode_system_coresimulator_caches
+MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 clean_orphaned_system_services
+[[ ! -e "$fixture/privileged" ]] || { cat "$fixture/privileged"; exit 1; }
+[[ -d "$MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR/entry" ]] || exit 1
+# Positive control: allowing system cleanup reaches the same real functions.
+SYSTEM_CLEAN=true
+has_sudo_session() { return 1; }
+clean_xcode_documentation_cache
+clean_xcode_system_coresimulator_caches
+MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 clean_orphaned_system_services
+[[ "$(cat "$fixture/privileged")" == $'auth\nauth\nprobe' ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "skipping system cleanup keeps browser removal and simulator sizing unprivileged" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+fixture=$(mktemp -d "$HOME/user-only.XXXXXX")
+export MOLE_CHROME_APP_PATHS="$fixture/Google Chrome.app"
+versions="$MOLE_CHROME_APP_PATHS/Contents/Frameworks/Google Chrome Framework.framework/Versions"
+mkdir -p "$versions/128.0.0.0" "$versions/129.0.0.0"
+ln -s 129.0.0.0 "$versions/Current"
+touch -t 202401010000 "$versions/128.0.0.0"
+touch -t 202402010000 "$versions/129.0.0.0"
+pgrep() { return 1; }
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+has_sudo_session() { return 0; }
+get_path_size_kb() { echo 1; }
+note_activity() { :; }
+safe_remove() { echo user >> "$fixture/actions"; }
+safe_sudo_remove() { echo privileged >> "$fixture/actions"; }
+run_with_timeout() { printf '%s\n' "$*" >> "$fixture/probes"; echo '1 fixture'; }
+SYSTEM_CLEAN=false
+clean_chrome_old_versions
+_sim_runtime_size_kb "$fixture" > /dev/null
+[[ "$(cat "$fixture/actions")" == user ]] || exit 1
+[[ "$(cat "$fixture/probes")" != *sudo* ]] || exit 1
+SYSTEM_CLEAN=true
+clean_chrome_old_versions
+_sim_runtime_size_kb "$fixture" > /dev/null
+[[ "$(cat "$fixture/actions")" == $'user\nprivileged' ]] || exit 1
+[[ "$(cat "$fixture/probes")" == *'sudo -n du'* ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "mo clean refuses a shell that may not write, and removes nothing" {
+    [[ "$(id -u)" != "0" ]] || skip "root ignores directory modes"
+    local caches="$HOME/Library/Caches" logs="$HOME/Library/Logs"
+    mkdir -p "$caches/com.example.refused" "$logs"
+    touch "$caches/com.example.refused/blob"
+    chmod 555 "$caches" "$logs"
+
+    run env HOME="$HOME" MOLE_TEST_MODE=1 MO_NO_OPLOG=1 "$PROJECT_ROOT/bin/clean.sh"
+    chmod 755 "$caches" "$logs"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"writing to ~/Library/Caches was refused (Permission denied)"* ]] || return 1
+    [[ "$output" == *"Nothing was removed."* ]] || return 1
+    [[ "$output" != *"Cleanup complete"* ]] || return 1
+    [ -f "$caches/com.example.refused/blob" ]
+}
+
+@test "mo clean carries on when only one checked folder refuses" {
+    [[ "$(id -u)" != "0" ]] || skip "root ignores directory modes"
+    local caches="$HOME/Library/Caches" logs="$HOME/Library/Logs"
+    mkdir -p "$caches" "$logs"
+    chmod 555 "$caches"
+
+    run env HOME="$HOME" MOLE_TEST_MODE=1 MO_NO_OPLOG=1 "$PROJECT_ROOT/bin/clean.sh"
+    chmod 755 "$caches"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"was refused"* ]] || return 1
+    [ -z "$(find "$logs" -name '.mole-write-check.*' -print -quit)" ]
+}
+
+# $1 is the tool to fail, $2 the error it prints; everything else stays real.
+_failing_write_check_tool() {
+    local bin_dir="$HOME/write-check-bin"
+    mkdir -p "$bin_dir" "$HOME/Library/Caches" "$HOME/Library/Logs"
+    rm -f "$bin_dir/mktemp" "$bin_dir/rmdir"
+    cat > "$bin_dir/$1" << SH
+#!/bin/bash
+case "\$*" in
+    *.mole-write-check*)
+        echo "$1: failed on \$*: $2" >&2
+        exit 1
+        ;;
+esac
+exec /bin/$1 "\$@" 2> /dev/null || exec /usr/bin/$1 "\$@"
+SH
+    chmod +x "$bin_dir/$1"
+    printf '%s' "$bin_dir"
+}
+
+@test "mo clean still runs on a full disk, where the write check also fails" {
+    local bin_dir
+    bin_dir=$(_failing_write_check_tool mktemp "No space left on device")
+
+    run env HOME="$HOME" PATH="$bin_dir:$PATH" MOLE_TEST_MODE=1 MO_NO_OPLOG=1 "$PROJECT_ROOT/bin/clean.sh"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"was refused"* ]] || return 1
+}
+
+@test "mo clean carries on when removing the probe fails for another reason" {
+    local bin_dir
+    bin_dir=$(_failing_write_check_tool rmdir "No space left on device")
+
+    run env HOME="$HOME" PATH="$bin_dir:$PATH" MOLE_TEST_MODE=1 MO_NO_OPLOG=1 "$PROJECT_ROOT/bin/clean.sh"
+    find "$HOME/Library" -maxdepth 2 -name '.mole-write-check.*' -exec /bin/rmdir {} +
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"was refused"* ]] || return 1
+}
+
+@test "mo clean refuses when the system denies removing the probe" {
+    local bin_dir
+    bin_dir=$(_failing_write_check_tool rmdir "Operation not permitted")
+
+    run env HOME="$HOME" PATH="$bin_dir:$PATH" MOLE_TEST_MODE=1 MO_NO_OPLOG=1 "$PROJECT_ROOT/bin/clean.sh"
+    find "$HOME/Library" -maxdepth 2 -name '.mole-write-check.*' -exec /bin/rmdir {} +
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"was refused (Operation not permitted)"* ]] || return 1
+}
+
+@test "the write check ignores stderr noise from a healthy mktemp and refusal words in a path" {
+    run env HOME="$HOME" MallocStackLogging=1 MOLE_TEST_MODE=1 MO_NO_OPLOG=1 "$PROJECT_ROOT/bin/clean.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"was refused"* ]] || return 1
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+_clean_write_refusal "mktemp: mkdtemp failed on /Permission denied/x: No space left on device" && exit 7
+_clean_write_refusal "rmdir: /x: Read-only file system"
+EOF
+    [ "$status" -eq 0 ]
+    [ "$output" = "Read-only file system" ]
+}
+
+@test "mo clean --external refuses a volume the system will not write to" {
+    [[ "$(id -u)" != "0" ]] || skip "root ignores directory modes"
+    local volume="$HOME/fake-volume"
+    mkdir -p "$volume"
+    chmod 555 "$volume"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" VOLUME="$volume" MOLE_TEST_MODE=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+EXTERNAL_VOLUME_TARGET="$VOLUME"
+refuse_cleanup_without_write_access
+EOF
+    chmod 755 "$volume"
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"was refused (Permission denied)"* ]] || return 1
+}
+
+@test "mo clean --dry-run writes no probe and is not refused by the write check" {
+    [[ "$(id -u)" != "0" ]] || skip "root ignores directory modes"
+    local caches="$HOME/Library/Caches" logs="$HOME/Library/Logs"
+    mkdir -p "$caches" "$logs"
+    chmod 555 "$caches" "$logs"
+
+    run env HOME="$HOME" MOLE_TEST_MODE=1 MO_NO_OPLOG=1 "$PROJECT_ROOT/bin/clean.sh" --dry-run
+    chmod 755 "$caches" "$logs"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"was refused"* ]] || return 1
+    [ -z "$(find "$caches" -name '.mole-write-check.*' -print -quit)" ]
 }

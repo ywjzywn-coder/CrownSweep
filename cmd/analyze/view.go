@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"unicode"
@@ -37,7 +38,7 @@ func (m model) View() string {
 			if !m.localSnapshotFresh {
 				freshnessLabel = " · last successful check"
 			}
-			fmt.Fprintf(&b, "%s%d Time Machine local %s · snapshot-only space is not listed below%s%s\n",
+			fmt.Fprintf(&b, "%s%d local %s · snapshot-only space is not listed below%s%s\n",
 				colorGray, m.localSnapshotCount, snapshotLabel, freshnessLabel, colorReset)
 		}
 		if m.overviewScanning {
@@ -46,13 +47,11 @@ func (m model) View() string {
 				fmt.Fprintf(&b, "%s%s%s%s Analyzing disk usage...\n\n",
 					colorCyan, colorBold, spinnerFrames[m.spinner], colorReset)
 			} else {
-				fmt.Fprintf(&b, "%sSelect a location to explore:%s  ", colorGray, colorReset)
-				fmt.Fprintf(&b, "%s%s%s%s %s\n\n", colorCyan, colorBold, spinnerFrames[m.spinner], colorReset, m.status)
+				m.writeOverviewStatus(&b)
 			}
 		} else {
 			if hasPendingOverviewEntries(m.entries) {
-				fmt.Fprintf(&b, "%sSelect a location to explore:%s  ", colorGray, colorReset)
-				fmt.Fprintf(&b, "%s%s%s%s %s\n\n", colorCyan, colorBold, spinnerFrames[m.spinner], colorReset, m.status)
+				m.writeOverviewStatus(&b)
 			} else {
 				fmt.Fprintf(&b, "%sSelect a location to explore:%s\n\n", colorGray, colorReset)
 			}
@@ -76,13 +75,13 @@ func (m model) View() string {
 		// "0 items removed" there reads as a stalled delete; say what is happening
 		// instead, and show the tally only once it means something.
 		if count > 0 {
-			fmt.Fprintf(&b, "%s%s%s%s Deleting: %s%s items%s removed, please wait...\n",
+			fmt.Fprintf(&b, "%s%s%s%s Moving to Trash: %s%s items%s moved, please wait...\n",
 				colorCyan, colorBold,
 				spinnerFrames[m.spinner],
 				colorReset,
 				colorYellow, formatNumber(count), colorReset)
 		} else {
-			fmt.Fprintf(&b, "%s%s%s%s Deleting: moving to Trash, please wait...\n",
+			fmt.Fprintf(&b, "%s%s%s%s Moving to Trash, please wait...\n",
 				colorCyan, colorBold,
 				spinnerFrames[m.spinner],
 				colorReset)
@@ -252,14 +251,14 @@ func (m model) View() string {
 					sizeText := fmt.Sprintf("%s scanning", spinnerFrames[m.spinner])
 					sizeColor := colorCyan
 					if sizeVal >= 0 {
-						sizeText = measuredSizeLabel(sizeVal, entry.State)
+						sizeText = sizeColumn(measuredSizeLabel(sizeVal, entry.State))
 						sizeColor = colorGray
 						if totalSize > 0 {
 							sizeColor = sizeColorForPercent(percent)
 						}
 					}
 					entryPrefix := "   "
-					name := trimNameWithWidth(entry.Name, nameWidth)
+					name := truncateMiddle(entry.Name, nameWidth)
 					paddedName := padName(name, nameWidth)
 					nameSegment := paddedName
 					numColor := ""
@@ -295,7 +294,8 @@ func (m model) View() string {
 				maxSize := maxDirEntrySize(m.entries)
 
 				viewport := calculateViewport(m.height, false)
-				nameWidth := calculateNameWidth(m.width)
+				indexWidth := max(2, len(strconv.Itoa(len(m.entries))))
+				nameWidth := calculateNameWidth(m.width) - (indexWidth - 2)
 				start := max(m.offset, 0)
 				end := min(start+viewport, len(m.entries))
 
@@ -305,7 +305,7 @@ func (m model) View() string {
 					if entry.IsDir {
 						icon = "📁"
 					}
-					name := trimNameWithWidth(entry.Name, nameWidth)
+					name := truncateMiddle(entry.Name, nameWidth)
 					paddedName := padName(name, nameWidth)
 
 					sizeValue := max(entry.Size, 0)
@@ -318,7 +318,7 @@ func (m model) View() string {
 					bar := coloredProgressBar(sizeValue, maxSize, percent)
 
 					sizeColor := sizeColorForPercent(percent)
-					size := measuredSizeLabel(entry.Size, entry.State)
+					size := sizeColumn(measuredSizeLabel(entry.Size, entry.State))
 					if entry.Size < 0 {
 						size = fmt.Sprintf("%s %s", spinnerFrames[m.spinner], "scanning")
 						sizeColor = colorCyan
@@ -358,12 +358,12 @@ func (m model) View() string {
 					}
 
 					if hintLabel == "" {
-						fmt.Fprintf(&b, "%s%s %s%2d.%s %s %s%s%s  %s  %s %s%10s%s\n",
-							entryPrefix, selectIcon, numColor, displayIndex, colorReset, bar, percentColor, percentStr, colorReset,
+						fmt.Fprintf(&b, "%s%s %s%*d.%s %s %s%s%s  %s  %s %s%10s%s\n",
+							entryPrefix, selectIcon, numColor, indexWidth, displayIndex, colorReset, bar, percentColor, percentStr, colorReset,
 							activityMarker, nameSegment, sizeColor, size, colorReset)
 					} else {
-						fmt.Fprintf(&b, "%s%s %s%2d.%s %s %s%s%s  %s  %s %s%10s%s  %s\n",
-							entryPrefix, selectIcon, numColor, displayIndex, colorReset, bar, percentColor, percentStr, colorReset,
+						fmt.Fprintf(&b, "%s%s %s%*d.%s %s %s%s%s  %s  %s %s%10s%s  %s\n",
+							entryPrefix, selectIcon, numColor, indexWidth, displayIndex, colorReset, bar, percentColor, percentStr, colorReset,
 							activityMarker, nameSegment, sizeColor, size, colorReset, hintLabel)
 					}
 				}
@@ -440,25 +440,38 @@ func (m model) View() string {
 		}
 
 		if deleteCount > 1 {
-			fmt.Fprintf(&b, "%sDelete:%s %d items, %s  %sPress Enter to confirm  |  ESC cancel%s\n",
+			fmt.Fprintf(&b, "%sMove to Trash:%s %d items, %s  %sPress Enter to confirm  |  ESC cancel%s\n",
 				colorRed, colorReset,
 				deleteCount, measuredSizeLabel(totalDeleteSize, deleteState),
 				colorGray, colorReset)
 		} else {
-			fmt.Fprintf(&b, "%sDelete:%s %s, %s  %sPress Enter to confirm  |  ESC cancel%s\n",
+			fmt.Fprintf(&b, "%sMove to Trash:%s %s, %s  %sPress Enter to confirm  |  ESC cancel%s\n",
 				colorRed, colorReset,
 				m.deleteTarget.Name, measuredSizeLabel(m.deleteTarget.Size, m.deleteTarget.State),
 				colorGray, colorReset)
 		}
 		if deleteCount > 1 && hasAppBundle {
-			fmt.Fprintf(&b, "%sApp bundles delete the bundle only. Use mo uninstall <App> to also remove support files.%s\n",
+			fmt.Fprintf(&b, "%sOnly the app bundle moves to Trash. Use mo uninstall <App> to also remove support files.%s\n",
 				colorYellow, colorReset)
 		} else if deleteCount <= 1 && isAppBundleEntry(*m.deleteTarget) {
-			fmt.Fprintf(&b, "%sApp bundle: this deletes the bundle only. Use %s to also remove its support files.%s\n",
+			fmt.Fprintf(&b, "%sApp bundle: only the bundle moves to Trash. Use %s to also remove its support files.%s\n",
 				colorYellow, uninstallCommandForApp(m.deleteTarget.Name), colorReset)
 		}
 	}
 	return b.String()
+}
+
+func (m model) writeOverviewStatus(b *strings.Builder) {
+	const prompt = "Select a location to explore:"
+	status := m.status
+	inlineWidth := displayWidth(prompt) + 2 + displayWidth(spinnerFrames[m.spinner]) + 1 + displayWidth(status)
+	if m.width > 0 && inlineWidth > m.width {
+		fmt.Fprintf(b, "%s%s%s\n", colorGray, prompt, colorReset)
+		status = truncateMiddle(status, max(0, m.width-displayWidth(spinnerFrames[m.spinner])-1))
+	} else {
+		fmt.Fprintf(b, "%s%s%s  ", colorGray, prompt, colorReset)
+	}
+	fmt.Fprintf(b, "%s%s%s%s %s\n\n", colorCyan, colorBold, spinnerFrames[m.spinner], colorReset, status)
 }
 
 // isAppBundleEntry reports whether a scanned entry is a macOS application

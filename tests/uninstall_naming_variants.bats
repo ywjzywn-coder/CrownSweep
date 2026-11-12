@@ -61,7 +61,9 @@ setup() {
     echo "test" > "$HOME/.config/zed/settings.json"
     echo "test" > "$HOME/Library/Application Support/Zed/cache.db"
 
-    result=$(find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
+    # An empty app root, so a Zed installed on the test machine cannot count as a sibling.
+    mkdir -p "$HOME/apps"
+    result=$(MOLE_TEST_MODE=1 MOLE_TEST_APP_FAMILY_ROOT="$HOME/apps" find_app_files "dev.zed.Zed-Nightly" "Zed Nightly")
 
     [[ "$result" =~ .config/zed ]] || return 1
     [[ "$result" =~ "Library/Application Support/Zed" ]]
@@ -175,6 +177,31 @@ EOF
     [ "$(printf '%s\n' "$result" | awk -v path="$container" '$0 == path { count++ } END { print count + 0 }')" -eq 1 ]
 }
 
+@test "embedded bundle discovery folds extension case without forking tr" {
+    local app="$HOME/Applications/Folding.app"
+    local id
+    for id in Widget.APPEX Service.Xpc Ignored.Bundle; do
+        mkdir -p "$app/Contents/PlugIns/$id/Contents"
+        printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.folding.%s</string></dict></plist>\n' \
+            "${id%%.*}" > "$app/Contents/PlugIns/$id/Contents/Info.plist"
+    done
+
+    run env HOME="$HOME" APP="$app" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+tr() { printf 'tr\n' >> "$HOME/embedded-tr.trace"; command tr "$@"; }
+rm -f "$HOME/embedded-tr.trace"
+_mole_uninstall_embedded_bundle_ids "$APP" "com.example.folding" | LC_ALL=C sort
+[[ ! -e "$HOME/embedded-tr.trace" ]] || echo "tr forked"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"com.example.folding.Widget"* ]] || return 1
+    [[ "$output" == *"com.example.folding.Service"* ]] || return 1
+    [[ "$output" != *"com.example.folding.Ignored"* ]] || return 1
+    [[ "$output" != *"tr forked"* ]]
+}
+
 @test "find_app_files detects vendor-nested Application Support directories" {
     mkdir -p "$HOME/Library/Application Support/Avid/Sibelius"
     mkdir -p "$HOME/Library/Application Support/OtherVendor/Sibelius"
@@ -249,6 +276,24 @@ find_app_files 'invalid_bundle' ''"
 
     [[ "$result" != *"Library/Application Support/Anki2"* ]] || return 1
     [[ "$result" == *"Library/Application Support/AnkiProgramFiles"* ]]
+}
+
+@test "find_app_files detects Claude Desktop third-party provider folders" {
+    mkdir -p "$HOME/Library/Application Support/Claude-3p/claude-code"
+    mkdir -p "$HOME/Library/Logs/Claude-3p"
+    mkdir -p "$HOME/.local/share/claude"
+
+    result=$(find_app_files "com.anthropic.claudefordesktop" "Claude")
+
+    [[ "$result" == *"Library/Application Support/Claude-3p"* ]] || return 1
+    [[ "$result" == *"Library/Logs/Claude-3p"* ]] || return 1
+    [[ "$result" != *".local/share/claude"* ]] || return 1
+
+    other=$(find_app_files "com.example.other" "Other")
+    [[ "$other" != *"Claude-3p"* ]] || return 1
+
+    sibling=$(MOLE_UNINSTALL_SIBLING_SURVIVES=1 find_app_files "com.anthropic.claudefordesktop" "Claude")
+    [[ "$sibling" != *"Claude-3p"* ]]
 }
 
 # Independent CLI dotdir protection, issue #993.
@@ -402,4 +447,234 @@ find_app_files 'invalid_bundle' ''"
     # display name still derives, so the negatives above are not vacuous.
     result=$(find_app_files "one.ayugram.AyuGramDesktop" "AyuGram")
     [[ "$result" =~ "Application Support/AyuGram Desktop" ]] || return 1
+}
+
+@test "find_app_files adds PlayCover's exact per-app files and alias, never PlayChain (#1715)" {
+    local root="$HOME/Library/Containers/io.playcover.PlayCover"
+    local bundle="$root/Applications/fit.mole.probe.app"
+    mkdir -p "$bundle" "$root/App Settings" "$root/Keymapping" "$root/Entitlements" \
+        "$root/PlayChain" "$HOME/Applications/PlayCover/Mole Probe.app" \
+        "$HOME/Applications/PlayCover/Other.app"
+    printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.probe</string></dict></plist>' > "$bundle/Info.plist"
+    : > "$bundle/MoleProbe"
+    ln -s "$bundle/Info.plist" "$HOME/Applications/PlayCover/Mole Probe.app/Info.plist"
+    ln -s "$bundle/MoleProbe" "$HOME/Applications/PlayCover/Mole Probe.app/MoleProbe"
+    # Points at the bundle, but holds a real file too: not a PlayCover alias.
+    ln -s "$bundle/Info.plist" "$HOME/Applications/PlayCover/Other.app/Info.plist"
+    : > "$HOME/Applications/PlayCover/Other.app/Notes.txt"
+    local f
+    for f in "App Settings/fit.mole.probe.plist" "Keymapping/fit.mole.probe.plist" \
+        "Entitlements/fit.mole.probe.plist" "PlayChain/fit.mole.probe" \
+        "PlayChain/fit.mole.probe.keyCover" "App Settings/fit.mole.probe.other.plist"; do
+        : > "$root/$f"
+    done
+
+    mkdir -p "$root/Keymapping/fit.mole.probe" "$root/Keymapping/fit.mole.probex"
+    : > "$root/Keymapping/fit.mole.probe/default.plist"
+    # Since PlayCover's macOS 27 change the alias holds a copy of Info.plist.
+    mkdir -p "$HOME/Applications/PlayCover/Mole Probe Copy.app" "$HOME/Applications/PlayCover/Forged.app"
+    cp "$bundle/Info.plist" "$HOME/Applications/PlayCover/Mole Probe Copy.app/Info.plist"
+    ln -s "$bundle/MoleProbe" "$HOME/Applications/PlayCover/Mole Probe Copy.app/MoleProbe"
+    # A copied plist naming another app is not this bundle's alias.
+    printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.other</string></dict></plist>' \
+        > "$HOME/Applications/PlayCover/Forged.app/Info.plist"
+    ln -s "$bundle/MoleProbe" "$HOME/Applications/PlayCover/Forged.app/MoleProbe"
+
+    result=$(find_app_files "fit.mole.probe" "Mole Probe" "$bundle")
+
+    [[ "$result" == *"$root/Keymapping/fit.mole.probe"$'\n'* || "$result" == *"$root/Keymapping/fit.mole.probe" ]] || return 1
+    [[ "$result" != *"fit.mole.probex"* ]] || return 1
+    [[ "$result" == *"$HOME/Applications/PlayCover/Mole Probe Copy.app"* ]] || return 1
+    [[ "$result" != *"Forged.app"* ]] || return 1
+    [[ "$result" == *"$root/App Settings/fit.mole.probe.plist"* ]] || return 1
+    [[ "$result" == *"$root/Keymapping/fit.mole.probe.plist"* ]] || return 1
+    [[ "$result" == *"$root/Entitlements/fit.mole.probe.plist"* ]] || return 1
+    [[ "$result" == *"$HOME/Applications/PlayCover/Mole Probe.app"* ]] || return 1
+    [[ "$result" != *"PlayChain"* ]] || return 1
+    [[ "$result" != *"fit.mole.probe.other.plist"* ]] || return 1
+    [[ "$result" != *"Other.app"* ]] || return 1
+
+    # The same bundle id from any other app path gets none of these.
+    result=$(find_app_files "fit.mole.probe" "Mole Probe" "$HOME/Applications/Mole Probe.app")
+    [[ "$result" != *"io.playcover.PlayCover"* ]] || return 1
+    [[ "$result" != *"Applications/PlayCover"* ]]
+}
+
+@test "force_kill_app matches a PlayCover bundle by its executable, not its display name (#1715)" {
+    local bundle="$HOME/Library/Containers/io.playcover.PlayCover/Applications/fit.mole.probe.app"
+    mkdir -p "$bundle"
+    printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>fit.mole.probe</string><key>CFBundleExecutable</key><string>MoleProbe</string></dict></plist>' > "$bundle/Info.plist"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/base.sh"
+source "$PROJECT_ROOT/lib/core/log.sh"
+source "$PROJECT_ROOT/lib/core/app_protection.sh"
+# force_kill_app silences pgrep, so the stub records its arguments in a file.
+pgrep() { echo "PGREP:$*" >> "$HOME/pgrep.log"; return 1; }
+force_kill_app "Mole Probe" "$HOME/Library/Containers/io.playcover.PlayCover/Applications/fit.mole.probe.app"
+cat "$HOME/pgrep.log"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"PGREP:-x MoleProbe"* ]] || return 1
+    [[ "$output" != *"PGREP:-x Mole Probe"* ]]
+}
+
+@test "find_app_files finds the crash reporter and Darwin cache folders named by the exact bundle id (#1736)" {
+    local id="com.example.starry.proplus.8.osx"
+    local reporter="$HOME/Library/Caches/com.plausiblelabs.crashreporter.data"
+    mkdir -p "$reporter/$id" "$reporter/com.example.other" "$HOME/darwin-cache/C/$id" "$HOME/darwin-cache/C/com.example.other"
+    echo x > "$reporter/$id/report"
+    echo x > "$HOME/darwin-cache/C/$id/data"
+    mole_darwin_user_cache_root() { printf '%s\n' "$HOME/darwin-cache/C"; }
+
+    result=$(find_app_files "$id" "Starry Night")
+
+    [[ "$result" == *"$reporter/$id"* ]] || return 1
+    [[ "$result" == *"$HOME/darwin-cache/C/$id"* ]] || return 1
+    # Exact id only: a neighbor of the same vendor and the shared roots stay.
+    [[ "$result" != *"com.example.other"* ]] || return 1
+    [[ "$result" != *"$reporter"$'\n'* ]] || return 1
+    [[ "$result" != *"darwin-cache/C"$'\n'* ]] || return 1
+}
+
+@test "find_app_files skips the Darwin cache folder when its root cannot be resolved (#1736)" {
+    local id="com.example.starry.proplus.8.osx"
+    mkdir -p "$HOME/darwin-cache/C/$id"
+    mole_darwin_user_cache_root() { return 1; }
+
+    result=$(find_app_files "$id" "Starry Night")
+
+    [[ "$result" != *"darwin-cache"* ]] || return 1
+}
+
+# Mole Mac markingDefaultSelectableData: a family's name-derived folders are
+# every installed build's data. The CLI removes everything it lists, so it
+# leaves them out of the list while another build of the family is installed.
+@test "find_app_files leaves the stable app's base-name folders to it while it is installed" {
+    local apps="$HOME/apps"
+    mkdir -p "$apps/Zed.app" "$apps/Zed Nightly.app"
+    mkdir -p "$HOME/.config/zed" "$HOME/Library/Application Support/Zed" "$HOME/Library/Caches/dev.zed.Zed-Nightly"
+
+    result=$(MOLE_TEST_MODE=1 MOLE_TEST_APP_FAMILY_ROOT="$apps" find_app_files "dev.zed.Zed-Nightly" "Zed Nightly" "$apps/Zed Nightly.app")
+
+    [[ "$result" != *"Application Support/Zed"* ]] || return 1
+    [[ "$result" != *".config/zed"* ]] || return 1
+    [[ "$result" == *"Caches/dev.zed.Zed-Nightly"* ]]
+}
+
+@test "find_app_files leaves the family's name folders to a channel build still installed" {
+    local apps="$HOME/apps"
+    mkdir -p "$apps/Zed.app" "$apps/Zed Preview.app"
+    mkdir -p "$HOME/.config/zed" "$HOME/Library/Application Support/Zed" "$HOME/Library/Caches/dev.zed.Zed" "$HOME/Library/Preferences"
+    touch "$HOME/Library/Preferences/Zed.plist"
+
+    result=$(MOLE_TEST_MODE=1 MOLE_TEST_APP_FAMILY_ROOT="$apps" find_app_files "dev.zed.Zed" "Zed" "$apps/Zed.app")
+
+    [[ "$result" != *"Application Support/Zed"* ]] || return 1
+    [[ "$result" != *".config/zed"* ]] || return 1
+    [[ "$result" != *"Preferences/Zed.plist"* ]] || return 1
+    [[ "$result" == *"Caches/dev.zed.Zed"* ]]
+}
+
+@test "find_app_files accepts an empty family-filtered result under Bash 3.2 nounset" {
+    local apps="$HOME/apps"
+    mkdir -p "$apps/Zed.app" "$apps/Zed Nightly.app" "$HOME/Library/Application Support/Zed"
+
+    # shellcheck disable=SC2016 # Expand fixture paths in the Bash 3.2 child.
+    run env MOLE_TEST_MODE=1 MOLE_TEST_APP_FAMILY_ROOT="$apps" /bin/bash -u -c '
+        source "$PROJECT_ROOT/lib/core/base.sh"
+        source "$PROJECT_ROOT/lib/core/log.sh"
+        source "$PROJECT_ROOT/lib/core/app_protection.sh"
+        find_app_files dev.zed.Zed-Nightly "Zed Nightly" "$HOME/apps/Zed Nightly.app"
+    '
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ -d "$HOME/Library/Application Support/Zed" ]
+}
+
+@test "find_app_files still takes the family's folders when no other build is installed" {
+    local apps="$HOME/apps"
+    mkdir -p "$apps/Zed Nightly.app" "$apps/Zedit.app"
+    mkdir -p "$HOME/.config/zed" "$HOME/Library/Application Support/Zed"
+
+    result=$(MOLE_TEST_MODE=1 MOLE_TEST_APP_FAMILY_ROOT="$apps" find_app_files "dev.zed.Zed-Nightly" "Zed Nightly" "$apps/Zed Nightly.app")
+
+    [[ "$result" == *"Application Support/Zed"* ]] || return 1
+    [[ "$result" == *".config/zed"* ]]
+}
+
+@test "find_shared_app_paths reaches a localized short name's folder through the bundle product token" {
+    local shared="$HOME/Shared"
+    mkdir -p "$shared/UURemote" "$shared/UURemote Data" "$shared/UUPlayer" "$shared/Other"
+
+    # Under the C locale Bash counts bytes, and the 8-byte name passed the old
+    # gate; the reported failure is a UTF-8 terminal, where it is 4 characters.
+    result=$(export LC_ALL=en_US.UTF-8; find_shared_app_paths "com.netease.uuremote" "UU远程" "$shared")
+
+    [[ "$result" == *"/Shared/UURemote"* ]] || return 1
+    [[ "$result" != *"UURemote Data"* ]] || return 1
+    [[ "$result" != *"UUPlayer"* ]] || return 1
+    [[ "$result" != *"Other"* ]]
+}
+
+@test "find_shared_app_paths stays silent for a short name whose product token is short or generic" {
+    local shared="$HOME/Shared"
+    mkdir -p "$shared/Line" "$shared/Browser" "$shared/Helper Data"
+
+    result=$(find_shared_app_paths "jp.naver.line.mac" "LINE" "$shared")
+    [[ -z "$result" ]] || return 1
+    result=$(find_shared_app_paths "com.thebrowser.Browser" "Arc" "$shared")
+    [[ -z "$result" ]] || return 1
+    result=$(find_shared_app_paths "com.vendor.helper" "Hlp" "$shared")
+    [[ -z "$result" ]]
+}
+
+@test "find_shared_app_paths stays silent for a common display name even with a usable product token" {
+    local shared="$HOME/Shared"
+    mkdir -p "$shared/Audio" "$shared/Projects"
+
+    # The product token only stands in for a short name; a common word such
+    # as "Music" must not reach /Users/Shared/Audio through com.vendor.audio.
+    result=$(find_shared_app_paths "com.vendor.audio" "Music" "$shared")
+    [[ -z "$result" ]] || return 1
+    result=$(find_shared_app_paths "com.acme.projects" "Files" "$shared")
+    [[ -z "$result" ]]
+}
+
+@test "find_app_files never lets a look-alike name claim a sibling product's folders" {
+    # shellcheck disable=SC2030 # Bats runs each test in its own subshell.
+    export MOLE_TEST_MODE=1 MOLE_TEST_APP_FAMILY_ROOT="$HOME/apps"
+    mkdir -p "$HOME/apps"
+    local support="$HOME/Library/Application Support"
+    mkdir -p "$support/Code" "$support/Code - Insiders" "$support/Cleaner for Xcode" \
+        "$support/Xcodes" "$support/Thunderbird" "$support/login" "$support/Logic"
+
+    result=$(find_app_files "com.microsoft.VSCode" "Visual Studio Code")
+    [[ "$result" == *"/Application Support/Code"* ]] || return 1
+    [[ "$result" != *"Code - Insiders"* ]] || return 1
+    result=$(find_app_files "com.microsoft.VSCodeInsiders" "Visual Studio Code - Insiders")
+    [[ "$result" == *"Code - Insiders"* ]] || return 1
+    [[ "$result" != *"/Application Support/Code"$'\n'* && "$result" != *"/Application Support/Code" ]] || return 1
+    result=$(find_app_files "com.apple.dt.Xcode" "Xcode")
+    [[ "$result" != *"Cleaner for Xcode"* && "$result" != *"Xcodes"* ]] || return 1
+    result=$(find_app_files "org.mozilla.firefox" "Firefox")
+    [[ "$result" != *"Thunderbird"* ]] || return 1
+    result=$(find_app_files "com.logi.optionsplus" "Logi Options+")
+    [[ "$result" != *"login"* && "$result" != *"Logic"* ]]
+}
+
+@test "find_app_system_files leaves the family's system folders to another installed build" {
+    [[ -d "/Library/Application Support/Apple" ]] || skip "needs /Library/Application Support/Apple"
+    # shellcheck disable=SC2031 # No export from another Bats test reaches this test.
+    export MOLE_TEST_MODE=1 MOLE_TEST_APP_FAMILY_ROOT="$HOME/apps"
+    mkdir -p "$HOME/apps"
+
+    result=$(find_app_system_files "com.example.apple" "Apple" "/Applications/Apple.app")
+    [[ "$result" == *"/Library/Application Support/Apple"* ]] || return 1
+
+    mkdir -p "$HOME/apps/Apple Beta.app"
+    result=$(find_app_system_files "com.example.apple" "Apple" "/Applications/Apple.app")
+    [[ "$result" != *"/Library/Application Support/Apple"* ]]
 }

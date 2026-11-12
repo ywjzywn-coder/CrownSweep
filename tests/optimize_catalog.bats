@@ -40,7 +40,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/optimize/catalog.sh"
 
-optimize_catalog_handler_for system_maintenance >/dev/null
+optimize_catalog_handler_for cache_refresh >/dev/null
 if optimize_catalog_handler_for launch_services_rebuild >/dev/null 2>&1; then
     echo "LaunchServices rebuild is still registered"
     exit 1
@@ -60,7 +60,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/optimize/catalog.sh"
 
-optimize_catalog_handler_for system_maintenance >/dev/null
+optimize_catalog_handler_for cache_refresh >/dev/null
 if optimize_catalog_handler_for dock_refresh >/dev/null 2>&1; then
     echo "Dock refresh is still registered"
     exit 1
@@ -80,11 +80,10 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/optimize/catalog.sh"
 
 expected=$(cat <<'CONTRACT'
-system_maintenance|opt_system_maintenance|DNS & Spotlight Check|DNS & Spotlight Check|Refresh DNS cache & verify Spotlight status|true
 cache_refresh|opt_cache_refresh|Finder Cache Refresh|Finder Cache Refresh|Refresh QuickLook thumbnails & icon services cache|true
 saved_state_cleanup|opt_saved_state_cleanup|App State Cleanup|App State Cleanup|Remove old saved application states (30+ days)|true
 fix_broken_configs|opt_fix_broken_configs|Broken Config Repair|Broken Config Repair|Fix corrupted preferences files|true
-network_optimization|opt_network_optimization|Network Cache Refresh|Network Cache Refresh|Optimize DNS cache & restart mDNSResponder|true
+network_optimization|opt_network_optimization|Network Cache Refresh|Network Cache Refresh|Refresh DNS cache|true
 sqlite_vacuum|opt_sqlite_vacuum|Database Optimization|Database Optimization|Compress SQLite databases for Mail, Safari & Messages (skips if apps are running)|true
 prevent_network_dsstore|opt_prevent_network_dsstore|Prevent Finder .DS_Store|Prevent Finder .DS_Store|Set a persistent Finder preference to stop writing .DS_Store on SMB/AFP/NFS and USB volumes|true
 legacy_overrides_audit|opt_legacy_overrides_audit|Legacy Overrides|Legacy Overrides|Remove hidden App Nap and disk-image verification overrides left by old tweak tools|true
@@ -148,7 +147,7 @@ contract_hash=$(
         shasum -a 256 |
         awk '{print $1}'
 )
-expected_hash="dc42553fcae1b1d1ebf768d3cfec6d8c0171140dd5a2a532ebacfee91d27146f"
+expected_hash="64978fdbfa1b27e520e48a8d5c26d0e9caa35e581c878fa5ace09b96490bd9ec"
 if [[ "$contract_hash" != "$expected_hash" ]]; then
     echo "health optimization contract hash: expected $expected_hash, got $contract_hash"
     exit 1
@@ -164,7 +163,7 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/manage/whitelist.sh"
 
 contract_hash=$(get_optimize_whitelist_items | shasum -a 256 | awk '{print $1}')
-expected_hash="fd558bbd50cb04d149f23540b041d03d8e78514e2bd5f1a4d171b9fa6402fb1d"
+expected_hash="6d2b6ab6b447fb01a7406f1bcaf3e929a39c95bfd1aa9880d64dd3b8608cf283"
 if [[ "$contract_hash" != "$expected_hash" ]]; then
     echo "optimize whitelist contract hash: expected $expected_hash, got $contract_hash"
     exit 1
@@ -179,7 +178,7 @@ EOF
 set -euo pipefail
 
 if /bin/bash --noprofile --norc < <(
-    awk '!changed && /opt_cache_refresh/ {sub(/opt_cache_refresh/, "opt_system_maintenance"); changed=1} {print}' \
+    awk '!changed && /opt_cache_refresh/ {sub(/opt_cache_refresh/, "opt_saved_state_cleanup"); changed=1} {print}' \
         "$PROJECT_ROOT/lib/optimize/catalog.sh"
 ); then
     echo "duplicate handler passed validation"
@@ -196,8 +195,8 @@ fi
 EOF
 
     [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
-    [[ "$output" == *"Duplicate optimize task handler: opt_system_maintenance"* ]] || return 1
-    [[ "$output" == *"Optimize task is not safe for automatic execution: system_maintenance"* ]] || return 1
+    [[ "$output" == *"Duplicate optimize task handler: opt_saved_state_cleanup"* ]] || return 1
+    [[ "$output" == *"Optimize task is not safe for automatic execution: cache_refresh"* ]] || return 1
 }
 
 @test "optimize catalog resolves handlers by exact action id" {
@@ -225,7 +224,7 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 
-[[ ${#MOLE_OPTIMIZE_ACTIONS[@]} -eq 20 ]] || exit 1
+[[ ${#MOLE_OPTIMIZE_ACTIONS[@]} -eq 19 ]] || exit 1
 for handler in "${MOLE_OPTIMIZE_HANDLERS[@]}"; do
     if ! declare -F "$handler" >/dev/null; then
         echo "missing handler: $handler"

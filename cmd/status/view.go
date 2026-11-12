@@ -7,9 +7,20 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/tw93/mole/internal/units"
 )
+
+// Keep the fallback within both dimensions so the renderer cannot clip away
+// its explanation. A later resize recomputes the dashboard from the model.
+func renderTerminalTooSmall(width, height int) string {
+	return lipgloss.NewStyle().
+		Width(width).
+		MaxWidth(width).
+		MaxHeight(height).
+		Render("Terminal too small. Enlarge the window to view status.")
+}
 
 var (
 	titleStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#C79FD7")).Bold(true)
@@ -463,17 +474,13 @@ func renderMemoryCard(mem MemoryStatus, cardWidth int) cardData {
 			lines = append(lines, fmt.Sprintf("Avail  %s", humanBytes(mem.Available)))
 		}
 	}
-	// Memory pressure status.
-	if mem.Pressure != "" {
-		pressureStyle := okStyle
-		pressureText := "Status " + mem.Pressure
-		switch mem.Pressure {
-		case "warn":
-			pressureStyle = warnStyle
-		case "critical":
-			pressureStyle = dangerStyle
-		}
-		lines = append(lines, pressureStyle.Render(pressureText))
+	// Memory pressure status, only when it asks for attention: normal is the
+	// usual state and a line that always reads normal is noise.
+	switch mem.Pressure {
+	case "warn":
+		lines = append(lines, warnStyle.Render("Status warn"))
+	case "critical":
+		lines = append(lines, dangerStyle.Render("Status critical"))
 	}
 	return cardData{icon: iconMemory, title: "Memory", lines: lines}
 }
@@ -543,6 +550,14 @@ func formatDiskLine(label string, d DiskStatus) string {
 	free := uint64(0)
 	if d.Total > d.Used {
 		free = d.Total - d.Used
+	}
+	// Finder's corrected used value includes purgeable APFS space in the
+	// corresponding free value. Keep the main status line for immediately
+	// free space; the meta line below reports purgeable space separately.
+	if free > d.Purgeable {
+		free -= d.Purgeable
+	} else {
+		free = 0
 	}
 	return fmt.Sprintf("%-6s %s  %s used, %s free", label, bar, used, humanBytesShort(free))
 }
@@ -724,6 +739,15 @@ func renderNetworkCard(netStats []NetworkStatus, history NetworkHistory, proxy P
 	totalRx, totalTx := networkTotals(netStats)
 	var primaryIP string
 
+	// The routed physical interface owns the IP line, so Ethernet and USB
+	// adapters show theirs. A routed tunnel's address is not the Mac's LAN IP,
+	// and an unknown route keeps the en0 fallback.
+	for _, n := range netStats {
+		if n.IP != "" && n.defaultRoute && !n.defaultTunnel {
+			primaryIP = n.IP
+			break
+		}
+	}
 	for _, n := range netStats {
 		if primaryIP == "" && n.IP != "" && n.Name == "en0" {
 			primaryIP = n.IP
@@ -874,18 +898,17 @@ func renderBatteryCard(batts []BatteryStatus, thermal ThermalStatus, probed bool
 				healthParts = append(healthParts, dangerStyle.Render(label))
 			case "warn":
 				healthParts = append(healthParts, warnStyle.Render(label))
-			default:
+			case "ok":
 				healthParts = append(healthParts, okStyle.Render(label))
 			}
-		} else if b.Health != "" {
+		}
+		if len(healthParts) == 0 && b.Health != "" {
 			healthParts = append(healthParts, b.Health)
 		}
 
 		if b.CycleCount > 0 {
 			cycleText := fmt.Sprintf("%d cycles", b.CycleCount)
-			if b.CycleCount > batteryCycleDanger {
-				cycleText = dangerStyle.Render(cycleText)
-			} else if b.CycleCount > batteryCycleWarn {
+			if b.CycleCount > batteryCycleWarn {
 				cycleText = warnStyle.Render(cycleText)
 			}
 			healthParts = append(healthParts, cycleText)
@@ -1076,11 +1099,15 @@ func humanBytesCompact(v uint64) string {
 	return units.BytesBinCompact(v)
 }
 
+// shorten fits s into maxLen terminal cells, ending a cut with "…". It counts
+// display width rather than bytes, so a multi-byte name (CJK, accents, the
+// curly apostrophe in "Kevin’s") is not cut in the middle of a character or
+// shortened while it still fits.
 func shorten(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	if ansi.StringWidth(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen-1] + "…"
+	return ansi.Truncate(s, maxLen, "…")
 }
 
 func remainingLineWidth(width int, prefix string) int {

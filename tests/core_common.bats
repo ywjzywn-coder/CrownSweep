@@ -20,9 +20,29 @@ setup() {
     mkdir -p "$HOME"
 }
 
-@test "mo_spinner_chars returns default sequence" {
+@test "mo_spinner_chars returns centered 2x2 sequence" {
     result="$(HOME="$HOME" /bin/bash --noprofile --norc -c "source '$PROJECT_ROOT/lib/core/common.sh'; mo_spinner_chars")"
-    [ "$result" = $'⠋\n⠙\n⠹\n⠸\n⠼\n⠴\n⠦\n⠧\n⠇\n⠏' ]
+    [ "$result" = $'⠖\n⠲\n⠴\n⠦' ]
+}
+
+@test "format_spinner_message fits a CJK name by display width in both locales" {
+    local locale
+    for locale in C en_US.UTF-8; do
+        # shellcheck disable=SC2016  # the inner bash expands these
+        run env HOME="$HOME" LC_ALL="$locale" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc -c '
+            source "$PROJECT_ROOT/lib/core/common.sh"
+            tput() { echo 40; }
+            format_spinner_message "Removing 网易云音乐网易云音乐网易云音乐网易云音乐..."
+        '
+        [ "$status" -eq 0 ] || return 1
+        local msg="$output"
+        # 40 columns leave 32 for the message; a split character is invalid UTF-8.
+        printf '%s' "$msg" | /usr/bin/iconv -f UTF-8 -t UTF-8 > /dev/null || { echo "$locale split: $msg"; return 1; }
+        run python3 -I -c 'import sys, unicodedata; print(sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in sys.argv[1]))' "$msg"
+        [ "$status" -eq 0 ] || return 1
+        (( output <= 32 )) || { echo "$locale width $output: $msg"; return 1; }
+        [[ "$msg" == "Removing 网"*"..." ]] || { echo "$locale: $msg"; return 1; }
+    done
 }
 
 @test "detect_architecture maps current CPU to friendly label" {
@@ -252,7 +272,7 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 pgrep() {
-    [[ "$1" == "-x" && "$2" == "xcodebuild" ]]
+    [[ "$1" == -*x && "|$2|" == *"|xcodebuild|"* ]]
 }
 xcode_build_tooling_process_state
 EOF
@@ -273,6 +293,26 @@ PATH=/nonexistent
 process_state=0
 xcode_build_tooling_process_state || process_state=$?
 [[ "$process_state" -eq 2 ]] || exit 3
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "Xcode and CoreSimulator process probes each run one pgrep" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+rm -f "$HOME/pgrep-calls"
+pgrep() { printf x >> "$HOME/pgrep-calls"; return 1; }
+calls() { wc -c < "$HOME/pgrep-calls" | tr -d ' '; }
+debug_log() { :; }
+process_state=0
+xcode_build_tooling_process_state || process_state=$?
+[[ "$process_state" -eq 1 && "$(calls)" -eq 1 ]] || { echo "xcode calls=$(calls) state=$process_state"; exit 1; }
+rm -f "$HOME/pgrep-calls"; process_state=0
+_coresimulator_cache_process_running || process_state=$?
+[[ "$process_state" -eq 1 && "$(calls)" -eq 1 ]] || { echo "simulator calls=$(calls) state=$process_state"; exit 1; }
 EOF
 
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
@@ -310,20 +350,260 @@ EOF
     [[ "$result" == "1" ]]
 }
 
-@test "drain_pending_input clears stdin buffer" {
-    result=$(
-        (echo -e "test\ninput" | HOME="$HOME" /bin/bash --noprofile --norc -c "source '$PROJECT_ROOT/lib/core/common.sh'; drain_pending_input; echo done") &
-        pid=$!
-        sleep 2
-        if kill -0 "$pid" 2> /dev/null; then
-            kill "$pid" 2> /dev/null || true
-            wait "$pid" 2> /dev/null || true
-            echo "timeout"
-        else
-            wait "$pid" 2> /dev/null || true
-        fi
+@test "drain_pending_input clears stdin buffer under the system Bash" {
+    run /bin/bash --noprofile --norc <<'EOF'
+export MOLE_BASE_LOADED=1
+source "$PROJECT_ROOT/lib/core/ui.sh"
+printf 'test\ninput' | {
+    drain_pending_input
+    if IFS= read -r -s -n 1 -t 1 remaining; then
+        printf 'LEAK:%s\n' "$remaining"
+    else
+        printf 'DRAINED\n'
+    fi
+}
+EOF
+    [ "$status" -eq 0 ]
+    [ "$output" = "DRAINED" ]
+}
+
+@test "drain_pending_input still drains when the optional Perl helper fails" {
+    run /bin/bash --noprofile --norc <<'EOF'
+export MOLE_BASE_LOADED=1
+source "$PROJECT_ROOT/lib/core/ui.sh"
+_mole_drain_with_perl() { return 127; }
+printf 'pending\n' | {
+    drain_pending_input
+    if IFS= read -r -s -n 1 -t 1 remaining; then
+        printf 'LEAK:%s\n' "$remaining"
+    else
+        printf 'DRAINED\n'
+    fi
+}
+EOF
+    [ "$status" -eq 0 ]
+    [ "$output" = "DRAINED" ]
+}
+
+@test "drain_pending_input retains the byte bound under the system Bash" {
+    run /bin/bash --noprofile --norc <<'EOF'
+export MOLE_BASE_LOADED=1
+source "$PROJECT_ROOT/lib/core/ui.sh"
+printf '%0101dZ' 0 | {
+    drain_pending_input
+    IFS= read -r -s -n 1 -t 1 remaining || exit 1
+    printf 'REMAINING:%s\n' "$remaining"
+}
+EOF
+    [ "$status" -eq 0 ]
+    [ "$output" = "REMAINING:Z" ]
+}
+
+@test "drain_pending_input does not wait a second for each idle pipe" {
+    run python3 - <<'PY'
+import subprocess
+
+script = '''
+export MOLE_BASE_LOADED=1
+source "$PROJECT_ROOT/lib/core/ui.sh"
+for ((i=0; i<10; i++)); do drain_pending_input; done
+printf 'DONE\\n'
+'''
+process = subprocess.Popen(
+    ["/bin/bash", "--noprofile", "--norc", "-c", script],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+)
+try:
+    # Keep the writer open and empty: EOF would make even a long read timeout
+    # return immediately and would not test the idle wait.
+    process.wait(timeout=3)
+    assert process.returncode == 0
+    assert process.stdout.read() == b"DONE\n"
+finally:
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+    process.stdin.close()
+    process.stdout.close()
+    process.stderr.close()
+PY
+    [ "$status" -eq 0 ]
+}
+
+@test "drain_pending_input does not stall a terminal when Perl fails" {
+    run python3 - <<'PY'
+import os
+import pty
+import subprocess
+import time
+
+script = '''
+export MOLE_BASE_LOADED=1
+source "$PROJECT_ROOT/lib/core/ui.sh"
+_mole_drain_with_perl() { return 127; }
+for ((i=0; i<3; i++)); do drain_pending_input; done
+printf 'DONE\\n'
+'''
+master, slave = pty.openpty()
+process = None
+try:
+    started = time.monotonic()
+    process = subprocess.Popen(
+        ["/bin/bash", "--noprofile", "--norc", "-c", script],
+        stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    [[ "$result" == "done" ]]
+    stdout, stderr = process.communicate(timeout=10)
+    elapsed = time.monotonic() - started
+    assert process.returncode == 0, (stdout, stderr)
+    assert stdout == b"DONE\n", (stdout, stderr)
+    # The integer fallback blocks one second per call on an idle terminal.
+    assert elapsed < 1.5, elapsed
+finally:
+    if process is not None and process.poll() is None:
+        process.kill()
+        process.wait()
+    os.close(master)
+    os.close(slave)
+PY
+    [ "$status" -eq 0 ]
+}
+
+@test "drain_pending_input clears terminal input and preserves terminal settings" {
+    run python3 - <<'PY'
+import os
+import pty
+import subprocess
+import termios
+
+script = '''
+export MOLE_BASE_LOADED=1
+source "$PROJECT_ROOT/lib/core/ui.sh"
+drain_pending_input 0.1
+printf 'DONE\\n'
+'''
+for pending in [b"\n", b"\x1b[A"]:
+    master, slave = pty.openpty()
+    process = None
+    try:
+        original = termios.tcgetattr(slave)
+        os.write(master, pending)
+        process = subprocess.Popen(
+            ["/bin/bash", "--noprofile", "--norc", "-c", script],
+            stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 0, (stdout, stderr)
+        assert stdout == b"DONE\n", (pending, stdout, stderr)
+        restored = termios.tcgetattr(slave)
+        # Darwin's transient input-reprocessing bit is not a mode change.
+        original[3] &= ~getattr(termios, "PENDIN", 0)
+        restored[3] &= ~getattr(termios, "PENDIN", 0)
+        assert restored == original, (original, restored)
+        # Read the remaining kernel queue directly. A second Bash read can
+        # flush queued input while setting its own modes and mask a failed drain.
+        probe = termios.tcgetattr(slave)
+        probe[3] &= ~(termios.ICANON | termios.ECHO)
+        probe[6][termios.VMIN] = 0
+        probe[6][termios.VTIME] = 0
+        termios.tcsetattr(slave, termios.TCSANOW, probe)
+        remaining = os.read(slave, 1024)
+        assert remaining == b"", (pending, remaining)
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)
+        os.close(slave)
+PY
+    [ "$status" -eq 0 ]
+}
+
+@test "mole_ascii_lowercase matches LC_ALL=C tr byte for byte" {
+    run /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+while IFS= read -r sample; do
+    expected=$(printf '%s' "$sample" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    actual=""
+    mole_ascii_lowercase actual "$sample"
+    [[ "$actual" == "$expected" ]] || { printf 'MISMATCH [%s] [%s] [%s]\n' "$sample" "$actual" "$expected"; exit 1; }
+done << 'SAMPLES'
+com.Apple.SystemSettings
+Zed Nightly
+ÄÖÜ Café ÉCOLE
+微信 WeChat
+[A-Z]*?{Glob}
+  Leading And Trailing  
+
+SAMPLES
+echo OK
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$output" = OK ]
+}
+
+@test "is_root_user answers from EUID without forking id" {
+    run /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+id() { echo called >> "$HOME/id-calls"; command id "$@"; }
+rc=0
+is_root_user || rc=$?
+expected=1
+[[ "$(command id -u)" == "0" ]] && expected=0
+[[ $rc -eq $expected ]] || { echo "RC=$rc EXPECTED=$expected"; exit 1; }
+[[ ! -e "$HOME/id-calls" ]] || { echo "FORKED_ID"; exit 1; }
+echo OK
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$output" = OK ]
+}
+
+@test "is_critical_system_component ignores case and leaves nocasematch as it was" {
+    run /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+for token in com.apple.SystemSettings "System Preferences" LoginItems com.apple.TCC ControlCenter; do
+    is_critical_system_component "$token" || { echo "MISSED $token"; exit 1; }
+done
+for token in com.example.app Slack "Visual Studio Code"; do
+    ! is_critical_system_component "$token" || { echo "FLAGGED $token"; exit 1; }
+done
+shopt -q nocasematch && { echo "LEFT_ON"; exit 1; }
+shopt -s nocasematch
+is_critical_system_component "LoginItems" || exit 1
+shopt -q nocasematch || { echo "TURNED_OFF"; exit 1; }
+echo OK
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$output" = OK ]
+}
+
+@test "bytes_to_human never prints 1000 of a unit that has a next unit" {
+    output="$(
+        HOME="$HOME" /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+bytes_to_human 999499
+bytes_to_human 999500
+bytes_to_human 999999
+bytes_to_human 999949999
+bytes_to_human 999950000
+bytes_to_human 999999999
+bytes_to_human 1000000000
+bytes_to_human 1500000
+EOF
+    )"
+
+    bytes_lines=()
+    while IFS= read -r line; do
+        bytes_lines+=("$line")
+    done <<< "$output"
+
+    [ "${bytes_lines[0]}" = "999KB" ]
+    [ "${bytes_lines[1]}" = "1.0MB" ]
+    [ "${bytes_lines[2]}" = "1.0MB" ]
+    [ "${bytes_lines[3]}" = "999.9MB" ]
+    [ "${bytes_lines[4]}" = "1.00GB" ]
+    [ "${bytes_lines[5]}" = "1.00GB" ]
+    [ "${bytes_lines[6]}" = "1.00GB" ]
+    [ "${bytes_lines[7]}" = "1.5MB" ]
 }
 
 @test "bytes_to_human converts byte counts into readable units" {
@@ -382,6 +662,34 @@ EOF
     [ "$output" = "~"'/Library/Application Support/MobileSync/Backup' ]
 }
 
+@test "format_path_link shows a short label inside a link to the full path" {
+    output="$(
+        HOME="$HOME" MOLE_ANSI_SUPPORTED_CACHE=0 /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+format_path_link "$HOME/Library/Application Support/MobileSync/Backup" "…/MobileSync/Backup"
+EOF
+    )"
+
+    local st=$'\033\\'
+    local expected_link="]8;;file://$HOME/Library/Application%20Support/MobileSync/Backup${st}"
+    [[ "$output" == *"$expected_link…/MobileSync/Backup"$'\033'* ]] || { printf '%q\n' "$output"; return 1; }
+    [[ "$output" != *"${st}~/Library"* ]] || { printf '%q\n' "$output"; return 1; }
+}
+
+@test "format_path_link keeps the full path in plain text despite a short label" {
+    output="$(
+        HOME="$HOME" /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+format_path_link "$HOME/Library/Application Support/MobileSync/Backup" "…/MobileSync/Backup"
+printf '\n'
+EOF
+    )"
+
+    # Without a link nothing carries the full path, so the label is ignored.
+    # shellcheck disable=SC2088  # literal tilde is the expected display form
+    [ "$output" = "~"'/Library/Application Support/MobileSync/Backup' ]
+}
+
 @test "colorize_human_size colors dry-run size units by suffix" {
     output="$(
         env -u NO_COLOR HOME="$HOME" /bin/bash --noprofile --norc << 'EOF'
@@ -394,6 +702,8 @@ colorize_human_size "180KB"
 printf '\n'
 colorize_human_size "0B"
 printf '\n'
+colorize_human_size "3.27GB+"
+printf '\n'
 EOF
     )"
 
@@ -405,7 +715,9 @@ EOF
     [ "${color_lines[0]}" = $'\033[0;31m1.00GB\033[0m' ]
     [ "${color_lines[1]}" = $'\033[0;33m5.0MB\033[0m' ]
     [ "${color_lines[2]}" = $'\033[0;32m180KB\033[0m' ]
-    [ "${color_lines[3]}" = $'\033[0;38;5;244m0B\033[0m' ]
+    [ "${color_lines[3]}" = $'\033[0;38;5;244m0B\033[0m' ] || return 1
+    # A lower-bound total keeps its unit's color.
+    [ "${color_lines[4]}" = $'\033[0;31m3.27GB+\033[0m' ]
 }
 
 @test "muted text avoids theme-defined ANSI bright black" {
@@ -587,6 +899,47 @@ EOF
     [ "$result" = "not-protected" ]
 }
 
+@test "protected bundle alternation matches exactly what each pattern matches alone" {
+    run env HOME="$HOME" /bin/bash --noprofile --norc <<'EOF2'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+patterns=("${SYSTEM_CRITICAL_BUNDLES[@]}" "${DATA_PROTECTED_BUNDLES[@]}")
+# An entry with | ( or ) would change the meaning of the @(a|b|...) alternation.
+for pattern in "${patterns[@]}"; do
+    [[ -n "$pattern" && "$pattern" != *[\|\(\)]* ]] || { echo "bad entry: $pattern"; exit 1; }
+done
+probes=("$HOME/Library/Caches/com.example.app" "plain" "日本語IME" "$HOME/Library/Caches/Écrivain/1Password/x")
+for pattern in "${patterns[@]}"; do
+    literal="${pattern//\*/X}"
+    probes+=("$literal" "/p/$literal/q" "${pattern//\*/}")
+done
+for probe in "${probes[@]}"; do
+    expected=1
+    for pattern in "${patterns[@]}"; do
+        # shellcheck disable=SC2053 # unquoted RHS is the glob under test
+        if [[ "$probe" == $pattern ]]; then expected=0; break; fi
+    done
+    actual=1
+    _mole_matches_protected_glob "$probe" "$_MOLE_CLEAN_PROTECTED_GLOB" && actual=0
+    [[ "$actual" == "$expected" ]] || { echo "mismatch: $probe"; exit 1; }
+done
+# A caller with nocasematch keeps its locale's case folding: U+212A, the
+# Kelvin sign, folds to k only in a UTF-8 locale, so org.<U+212A>eepassxc
+# still matches org.keepassxc.* as it did with the per-pattern loop.
+export LC_ALL=en_US.UTF-8
+kelvin_id=$(printf 'org.\xe2\x84\xaaeepassxc.any')
+shopt -s nocasematch
+should_protect_data "$kelvin_id" || { echo "nocasematch lost Unicode folding"; exit 1; }
+shopt -u nocasematch
+# The C locale used for the match stays inside the helper.
+should_protect_data "plain" || true
+[[ "$LC_ALL" == "en_US.UTF-8" ]] || { echo "caller locale changed"; exit 1; }
+echo ok
+EOF2
+    [ "$status" -eq 0 ]
+    [ "$output" = "ok" ]
+}
+
 # Regression: CUPS prefs have a bundle-ID-style name but no parent .app,
 # so the orphan sweep deleted them and users lost their default printer
 # and recent-printer list. See #731.
@@ -740,7 +1093,7 @@ EOF
     PATH="$fake_bin:$PATH" PROJECT_ROOT="$PROJECT_ROOT" HOME="$HOME" \
         /usr/bin/script -q /dev/null /bin/bash --noprofile --norc -c \
         "source \"\$PROJECT_ROOT/lib/core/common.sh\"; start_inline_spinner \"Testing...\"; /bin/sleep 0.15; stop_inline_spinner" \
-        > /dev/null 2>&1
+        < /dev/null > /dev/null 2>&1
 
     [ ! -f "$marker" ]
 }
@@ -762,7 +1115,7 @@ EOF
     # The old byte-slicing implementation emitted invalid UTF-8 here. Do not
     # require a full animation cycle: CI startup time can consume part of this
     # bounded capture even though the spinner itself is healthy.
-    [[ "$raw_content" == *"⠋"* ]]
+    [[ "$raw_content" == *"⠖"* ]]
 }
 
 @test "update_inline_spinner_message returns 1 without an active spinner" {
@@ -778,21 +1131,31 @@ EOF
 
     local raw="$HOME/spinner-update.raw"
     # shellcheck disable=SC2016  # inner bash expands these from its environment
-    PROJECT_ROOT="$PROJECT_ROOT" HOME="$HOME" TERM=xterm-256color \
-        /usr/bin/script -q "$raw" /bin/bash --noprofile --norc -c '
+    # -F flushes each write, so the inner shell can watch its own frames.
+    PROJECT_ROOT="$PROJECT_ROOT" HOME="$HOME" TERM=xterm-256color RAW="$raw" \
+        /usr/bin/script -qF "$raw" /bin/bash --noprofile --norc -c '
             source "$PROJECT_ROOT/lib/core/common.sh"
+            # A loaded runner can take longer than a fixed sleep to draw the
+            # next frame, so wait for the text itself, up to 3 s.
+            wait_for_frame() {
+                local tries=0
+                until /usr/bin/grep -q "$1" "$RAW" 2> /dev/null || [[ $tries -ge 30 ]]; do
+                    /bin/sleep 0.1
+                    tries=$((tries + 1))
+                done
+            }
             MOLE_SPINNER_PREFIX="  " start_inline_spinner "Phase one..."
             pid_before="$INLINE_SPINNER_PID"
             control_dir="$INLINE_SPINNER_CONTROL_DIR"
-            control_mode=$(stat -f%Lp "$control_dir")
+            control_mode=$(/usr/bin/stat -f%Lp "$control_dir")
             [[ "$INLINE_SPINNER_MSG_FILE" == "$control_dir/message" && "$control_mode" == "700" ]] && echo "CONTROL_PRIVATE"
-            /bin/sleep 0.2
+            wait_for_frame "Phase one"
             update_inline_spinner_message "Phase two..." || echo "UPDATE_FAILED"
-            /bin/sleep 0.2
+            wait_for_frame "Phase two"
             pid_after="$INLINE_SPINNER_PID"
             stop_inline_spinner
             [[ "$pid_before" == "$pid_after" && -n "$pid_before" ]] && echo "PID_STABLE"
-        ' > /dev/null 2>&1
+        ' < /dev/null > /dev/null 2>&1
 
     raw_content="$(cat "$raw")"
     [[ "$raw_content" == *"Phase one..."* ]] || return 1
@@ -809,25 +1172,78 @@ EOF
 
     local raw="$HOME/spinner-progress.raw"
     # shellcheck disable=SC2016  # inner bash expands these from its environment
-    PROJECT_ROOT="$PROJECT_ROOT" HOME="$HOME" TERM=xterm-256color \
-        /usr/bin/script -q "$raw" /bin/bash --noprofile --norc -c '
+    # A loaded macos-26 runner drew only the first frame within a fixed 0.2s
+    # wait (capture: "0/10" once, then PID_STABLE), so wait for the redraw in
+    # the flushed capture instead of sleeping a guessed interval.
+    PROJECT_ROOT="$PROJECT_ROOT" HOME="$HOME" TERM=xterm-256color RAW="$raw" \
+        /usr/bin/script -q -F "$raw" /bin/bash --noprofile --norc -c '
             source "$PROJECT_ROOT/lib/core/common.sh"
             start_section_spinner "Scanning items... 0/10"
             pid_before="$INLINE_SPINNER_PID"
             last_tick=0
             update_progress_if_needed 5 10 last_tick 1
             pid_after="$INLINE_SPINNER_PID"
-            /bin/sleep 0.2
+            for _ in $(/usr/bin/seq 50); do
+                /usr/bin/grep -q "Scanning items... 5/10" "$RAW" 2> /dev/null && break
+                /bin/sleep 0.1
+            done
             stop_inline_spinner
             [[ "$pid_before" == "$pid_after" && -n "$pid_before" ]] && echo "PID_STABLE"
-        ' > /dev/null 2>&1
+        ' < /dev/null > /dev/null 2>&1
 
     raw_content="$(cat "$raw")"
-    # This case failed once on a CI runner and could not be reproduced in
-    # about 70 local runs; print the PTY capture so the next failure explains
-    # itself instead of being retuned blind.
+    # Print the PTY capture so a failure explains itself instead of being
+    # retuned blind.
     [[ "$raw_content" == *"Scanning items... 5/10"* ]] || { cat -v "$raw"; return 1; }
     [[ "$raw_content" == *"PID_STABLE"* ]] || { cat -v "$raw"; return 1; }
+}
+
+@test "update_progress_if_needed reads the epoch clock once per shell" {
+    local calls="$HOME/epoch-calls"
+    local spins="$HOME/spinner-text"
+    # shellcheck disable=SC2016  # inner bash expands these from its environment
+    run env PROJECT_ROOT="$PROJECT_ROOT" CALLS="$calls" SPINS="$spins" \
+        /bin/bash --noprofile --norc -c '
+            source "$PROJECT_ROOT/lib/core/common.sh"
+            get_epoch_seconds() { printf "x\n" >> "$CALLS"; echo 1000000; }
+            start_section_spinner() { printf "%s\n" "$1" >> "$SPINS"; }
+            last_tick=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                update_progress_if_needed "$i" 10 last_tick 60 || true
+            done
+            echo "last_tick=$last_tick"
+        '
+    [ "$status" -eq 0 ]
+    [[ "$(wc -l < "$calls" | tr -d ' ')" == "1" ]] || return 1
+    [[ "$(cat "$spins")" == "Scanning items... 1/10" ]] || return 1
+    [[ "$output" == "last_tick=1000000" || "$output" == "last_tick=1000001" ]]
+}
+
+@test "update_progress_if_needed lets the shell clock advance the throttle" {
+    local spins="$HOME/spinner-advance"
+    # The epoch is read once and frozen by the stub, so only $SECONDS can move
+    # the clock. Jump it instead of sleeping: the throttle must hold inside the
+    # interval, then fire once the clock passes it.
+    # shellcheck disable=SC2016  # inner bash expands these from its environment
+    run env PROJECT_ROOT="$PROJECT_ROOT" SPINS="$spins" \
+        /bin/bash --noprofile --norc -c '
+            source "$PROJECT_ROOT/lib/core/common.sh"
+            get_epoch_seconds() { echo 1000000; }
+            start_section_spinner() { printf "%s\n" "$1" >> "$SPINS"; }
+            SECONDS=100
+            last_tick=0
+            update_progress_if_needed 1 10 last_tick 60 || exit 11
+            rc=0
+            update_progress_if_needed 2 10 last_tick 60 || rc=$?
+            [[ $rc -eq 1 ]] || exit 12
+            SECONDS=$((SECONDS + 100))
+            update_progress_if_needed 3 10 last_tick 60 || exit 13
+            echo "last_tick=$last_tick"
+        '
+    [ "$status" -eq 0 ] || { echo "status=$status"; return 1; }
+    [[ "$output" =~ ^last_tick=[0-9]+$ ]] || return 1
+    [ "${output#last_tick=}" -ge 1000100 ] || return 1
+    [[ "$(cat "$spins")" == $'Scanning items... 1/10\nScanning items... 3/10' ]]
 }
 
 @test "safe_clear_lines emits the same erase sequence per line to the target device" {
@@ -898,6 +1314,18 @@ for mode in 0 1; do
 done
 EOF
     [ "$status" -eq 0 ]
+}
+
+@test "truncate_by_display_width prints strings that look like echo options" {
+    run /bin/bash -c "export MOLE_BASE_LOADED=1; source '$PROJECT_ROOT/lib/core/ui.sh'; truncate_by_display_width '-n' 10; truncate_by_display_width '-e' 10"
+    [ "$status" -eq 0 ]
+    [ "$output" = $'-n\n-e' ]
+}
+
+@test "truncate_by_display_width counts ASCII as one column (#1918)" {
+    run /bin/bash -c "export MOLE_BASE_LOADED=1; source '$PROJECT_ROOT/lib/core/ui.sh'; truncate_by_display_width 'abcdefghijklmnop' 10; truncate_by_display_width '中文abcdefghij' 10"
+    [ "$status" -eq 0 ]
+    [ "$output" = $'abcdefg...\n中文abc...' ]
 }
 
 @test "read_key respects MOLE_READ_KEY_FORCE_CHAR" {
@@ -1047,4 +1475,204 @@ assert b'\r\x1b[2KError:' in raw, raw
 assert b'AFTER:14:\n' in raw, raw
 assert b'Cleaning fixture...' not in raw.split(b'Error:', 1)[1], raw
 PY
+}
+
+@test "loading Mole appends /usr/sbin and /sbin to a PATH without them" {
+    run env -i HOME="$HOME" PATH="/usr/bin:/bin" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/base.sh"
+echo "PATH=$PATH"
+command -v diskutil
+bash -c 'command -v lsof'
+EOF
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PATH=/usr/bin:/bin:/usr/sbin:/sbin"* ]] || return 1
+    [[ "$output" == *"/usr/sbin/diskutil"* ]] || return 1
+    [[ "$output" == *"/usr/sbin/lsof"* ]] || return 1
+
+    run env -i HOME="$HOME" PATH="/sbin:/usr/bin:/usr/sbin:/bin" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/base.sh"
+echo "PATH=$PATH"
+EOF
+    [ "$status" -eq 0 ]
+    [[ "$output" == "PATH=/sbin:/usr/bin:/usr/sbin:/bin" ]]
+}
+
+@test "sysctl never resolves through PATH (#1804)" {
+    # sysctl lives in /usr/sbin, which a shell PATH may leave out; the lookup
+    # then fails and every caller falls back silently. Shell calls go through
+    # $SYSCTL_CMD (or the literal /usr/sbin/sysctl), Go through the absolute path.
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+start='(^|[[:space:];(|&`"'"'"']|[$][(])'
+pattern="${start}sysctl[[:space:]]"
+for probe in '    n=$(sysctl -n hw.ncpu 2> /dev/null || echo 4)' '    sysctl -n vm.swapusage 2> /dev/null || true'; do
+    printf '%s\n' "$probe" | grep -qE "$pattern" || { echo "matcher missed: $probe"; exit 1; }
+done
+for allowed in '    n=$("$SYSCTL_CMD" -n hw.ncpu)' '    [[ "$(/usr/sbin/sysctl -n hw.optional.arm64)" == "1" ]]'; do
+    if printf '%s\n' "$allowed" | grep -qE "$pattern"; then
+        echo "matcher flagged: $allowed"
+        exit 1
+    fi
+done
+matched=$(find "$PROJECT_ROOT/lib" "$PROJECT_ROOT/bin" -name '*.sh' -print0 |
+    xargs -0 grep -nE "$pattern" "$PROJECT_ROOT/mole" "$PROJECT_ROOT/install.sh" |
+    grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+if [[ -n "$matched" ]]; then
+    echo "sysctl resolved through PATH: $matched"
+    exit 1
+fi
+go_matched=$(find "$PROJECT_ROOT/cmd" -name '*.go' ! -name '*_test.go' -print0 | xargs -0 grep -n '"sysctl"' || true)
+if [[ -n "$go_matched" ]]; then
+    echo "Go sysctl resolved through PATH: $go_matched"
+    exit 1
+fi
+echo "clean"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "clean" ]]
+}
+
+@test "BSD-only stat, date, find and tr forms never resolve through PATH (#1196, #1752)" {
+    # GNU coreutils earlier in PATH reads stat -f as file-system status and
+    # date -r/-j differently, so these calls go through $STAT_BSD and
+    # $_DATE_CMD; GNU find reads `-depth 2` as a path, so use -mindepth/-maxdepth. Match the command position, skip comment lines, and prove
+    # the matcher fires on a known positive.
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+# A command word starts after a separator, an opening quote or $( ; an
+# absolute /usr/bin/find is the BSD binary and may use -depth N.
+start='(^|[[:space:];(|&`"'"'"']|[$][(])'
+pattern="${start}(stat[[:space:]]+-|date[[:space:]]+-[A-Za-z]*[jrv]|find[^|;]*[[:space:]]-depth[[:space:]]+[0-9])"
+for probe in '    age=$(( now - $(stat -f %m "$d") ))' '    -exec stat -f "%z" {} +' '    d=$(date -r "$n" +%F)' "    'find \"\$1\" -type d -depth 2'"; do
+    printf '%s\n' "$probe" | grep -qE "$pattern" || { echo "matcher missed: $probe"; exit 1; }
+done
+printf '%s\n' '    x=$("$STAT_BSD" -f%m "$f")' | grep -qE "$pattern" && { echo "matcher flagged STAT_BSD"; exit 1; }
+printf '%s\n' '    /usr/bin/find /private/var/folders -type d \( -depth 3 ! -name C \) -prune' | grep -qE "$pattern" && { echo "matcher flagged the system find"; exit 1; }
+# Join backslash-continued lines first: `run_with_timeout 5 stat \` with the
+# flag on the next line slipped past a per-line match once.
+joined=$(find "$PROJECT_ROOT/lib" "$PROJECT_ROOT/bin" -name '*.sh' -print0 |
+    xargs -0 awk 'FNR == 1 { buf = "" } /\\$/ { if (buf == "") start = FNR; buf = buf substr($0, 1, length($0) - 1) " "; next } { if (buf != "") { print FILENAME ":" start ":" buf $0; buf = "" } else print FILENAME ":" FNR ":" $0 }' \
+        "$PROJECT_ROOT/mole" "$PROJECT_ROOT/install.sh")
+printf '%s\n' 'x.sh:1:    run_with_timeout 5 stat -f%m "$e"' | grep -qE ":.*$pattern" || { echo "matcher missed a joined line"; exit 1; }
+matched=$(printf '%s\n' "$joined" | grep -E "$pattern" |
+    grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+if [[ -n "$matched" ]]; then
+    echo "BSD-only flags resolved through PATH: $matched"
+    exit 1
+fi
+# GNU tr folds case byte by byte, so outside LC_ALL=C a locale-aware fold
+# (É to é in an app name) needs the system tr.
+tr_pattern="${start}tr[[:space:]]+'\[:(upper|lower):\]'"
+printf '%s\n' "    lower=\$(printf '%s' \"\$n\" | tr '[:upper:]' '[:lower:]')" | grep -qE "$tr_pattern" || { echo "tr matcher missed"; exit 1; }
+tr_matched=$(printf '%s\n' "$joined" | grep -E "$tr_pattern" | grep -v 'LC_ALL=C tr' |
+    grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+if [[ -n "$tr_matched" ]]; then
+    echo "locale case folding resolved through PATH tr: $tr_matched"
+    exit 1
+fi
+EOF
+
+    [[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+}
+
+@test "has_full_disk_access reports denied when protected paths exist but cannot be read" {
+    mkdir -p "$HOME/Library/Mail/V10" "$HOME/Library/Messages"
+    : > "$HOME/Library/Messages/chat.db"
+    chmod 000 "$HOME/Library/Mail/V10" "$HOME/Library/Messages/chat.db"
+
+    run env HOME="$HOME" /bin/bash --noprofile --norc -c "
+source '$PROJECT_ROOT/lib/core/common.sh'
+unset MOLE_HAS_FDA
+rc=0
+has_full_disk_access || rc=\$?
+printf '%s:%s\n' \"\$rc\" \"\$MOLE_HAS_FDA\"
+"
+    chmod 755 "$HOME/Library/Mail/V10"
+    chmod 644 "$HOME/Library/Messages/chat.db"
+    rm -rf "$HOME/Library"
+
+    # stat succeeds on a TCC-protected path without Full Disk Access, so only
+    # listing a folder or opening a file proves the terminal can read it.
+    [ "$output" = "1:0" ]
+}
+
+@test "has_full_disk_access reports granted when a protected path can be read" {
+    mkdir -p "$HOME/Library/Mail/V10"
+
+    run env HOME="$HOME" /bin/bash --noprofile --norc -c "
+source '$PROJECT_ROOT/lib/core/common.sh'
+unset MOLE_HAS_FDA
+rc=0
+has_full_disk_access || rc=\$?
+printf '%s:%s\n' \"\$rc\" \"\$MOLE_HAS_FDA\"
+"
+    rm -rf "$HOME/Library"
+
+    [ "$output" = "0:1" ]
+}
+
+@test "has_full_disk_access reports unknown when no protected path exists" {
+    rm -rf "$HOME/Library"
+
+    run env HOME="$HOME" /bin/bash --noprofile --norc -c "
+source '$PROJECT_ROOT/lib/core/common.sh'
+unset MOLE_HAS_FDA
+rc=0
+has_full_disk_access || rc=\$?
+printf '%s:%s\n' \"\$rc\" \"\$MOLE_HAS_FDA\"
+"
+
+    [ "$output" = "2:unknown" ]
+}
+
+@test "mole_count_label keeps one item singular" {
+    # shellcheck disable=SC2016  # inner bash expands these from its environment
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc -c '
+        source "$PROJECT_ROOT/lib/core/base.sh"
+        printf "%s|%s|%s\n" "$(mole_count_label 1 dir)" "$(mole_count_label 0 item)" "$(mole_count_label 12 item)"
+    '
+    [ "$status" -eq 0 ] || return 1
+    [ "$output" = "1 dir|0 items|12 items" ]
+}
+
+@test "mole_applescript_escape leaves no bare quote or trailing backslash in an AppleScript literal" {
+    cat > "$HOME/escape_probe.sh" << 'PROBE'
+source "$1/lib/core/base.sh"
+bad=0
+samples=('plain' 'a"b' 'a\b' 'x\"; do shell script "id"' $'two\nlines' 'ends\' '')
+for sample in "${samples[@]}"; do
+    mole_applescript_escape out "$sample"
+    # Drop every escaped pair; a surviving quote or backslash would end the literal early.
+    rest=${out//\\\\/}
+    rest=${rest//\\\"/}
+    case "$rest" in
+        *'"'* | *'\'*)
+            bad=1
+            printf 'unsafe: %s\n' "$out"
+            ;;
+    esac
+done
+mole_applescript_escape out 'a"b\c'
+[[ "$out" == 'a\"b\\c' ]] || {
+    bad=1
+    printf 'wrong: %s\n' "$out"
+}
+exit "$bad"
+PROBE
+    run /bin/bash --noprofile --norc "$HOME/escape_probe.sh" "$PROJECT_ROOT"
+    echo "$output"
+    [ "$status" -eq 0 ]
+}
+
+@test "AppleScript string literals built from bundle names use mole_applescript_escape" {
+    for f in lib/core/sudo.sh lib/core/app_protection.sh lib/uninstall/batch.sh; do
+        run grep -c '^[^#]*mole_applescript_escape ' "$PROJECT_ROOT/$f"
+        [ "$status" -eq 0 ]
+        [ "$output" -ge 1 ]
+        run grep -nE '^[^#]*\$\{[a-z_]+//\\\\"/' "$PROJECT_ROOT/$f"
+        [ "$status" -ne 0 ]
+    done
 }

@@ -10,6 +10,7 @@ MOLE_COMMANDS=(
     "history:Review cleanup activity"
     "purge:Remove old project artifacts"
     "installer:Find and remove installer files"
+    "slim:Remove Intel code from universal apps"
     "touchid:Configure Touch ID for sudo"
     "completion:Setup shell tab completion"
     "update:Update to latest version"

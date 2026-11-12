@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/fs"
 	"slices"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -139,6 +138,7 @@ type historyEntry struct {
 }
 
 type scanResultMsg struct {
+	id     int64
 	path   string
 	result scanResult
 	err    error
@@ -192,6 +192,8 @@ type overviewSizeMsg struct {
 	Err         error
 }
 
+type initializeMsg struct{}
+
 type tickMsg time.Time
 
 type deleteProgressMsg struct {
@@ -200,6 +202,7 @@ type deleteProgressMsg struct {
 	count        int64
 	path         string
 	removedPaths []string
+	logWarning   string // set when the audit log could not be written
 }
 
 type model struct {
@@ -215,6 +218,7 @@ type model struct {
 	totalSize           int64
 	scanning            bool
 	spinner             int
+	tickRunning         bool // one tickCmd loop is already re-arming itself
 	filesScanned        *int64
 	dirsScanned         *int64
 	bytesScanned        *int64
@@ -239,7 +243,7 @@ type model struct {
 	totalFiles          int64           // Total files found in current/last scan
 	lastTotalFiles      int64           // Total files from previous scan (for progress bar)
 	diskFree            int64           // Free disk space for the analyzed volume
-	localSnapshotCount  int             // Read-only Time Machine snapshot count for overview context
+	localSnapshotCount  int             // Read-only local snapshot count for overview context
 	localSnapshotFresh  bool            // False after the latest matching probe failed
 	snapshotProbeID     int64
 	snapshotRunner      localSnapshotCommandRunner
@@ -261,6 +265,8 @@ type model struct {
 	liveScanCancel      context.CancelFunc
 	liveScanEvents      <-chan liveScanEventMsg
 	liveScanningPaths   map[string]bool
+	liveEntryIndex      map[string]int
+	liveEntriesDirty    bool
 	autoSortLiveEntries bool
 	liveSortMode        liveSortMode
 }
@@ -319,10 +325,7 @@ func (m *model) hydrateOverviewEntries() {
 }
 
 func (m *model) sortOverviewEntriesBySize() {
-	// Stable sort by size.
-	sort.SliceStable(m.entries, func(i, j int) bool {
-		return m.entries[i].Size > m.entries[j].Size
-	})
+	sortDirEntriesBySize(m.entries)
 }
 
 func (m *model) getScanProgress() (files, dirs, bytes int64) {
@@ -388,6 +391,27 @@ func (m *model) clampLargeSelection() {
 	}
 }
 
+// selectedPathSizes returns the sizes the view showed for paths, which is
+// what the audit log records for each Trash move.
+func (m model) selectedPathSizes(paths []string) map[string]int64 {
+	sizes := make(map[string]int64, len(paths))
+	wanted := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		wanted[path] = true
+	}
+	for _, entry := range m.entriesAll {
+		if wanted[entry.Path] && entry.Size > 0 {
+			sizes[entry.Path] = entry.Size
+		}
+	}
+	for _, file := range m.largeFilesAll {
+		if wanted[file.Path] && file.Size > 0 {
+			sizes[file.Path] = file.Size
+		}
+	}
+	return sizes
+}
+
 func (m *model) removePathFromView(path string) {
 	if path == "" {
 		return
@@ -408,6 +432,7 @@ func (m *model) removePathFromView(path string) {
 	// shift the shared array twice and corrupt it; rebuilding via the filters
 	// keeps the view, the query, and the selection consistent.
 	m.entriesAll = removeByPath(m.entriesAll, path, dirEntryPath)
+	m.liveEntryIndex = nil
 	m.largeFilesAll = removeByPath(m.largeFilesAll, path, fileEntryPath)
 
 	if removedSize > 0 {

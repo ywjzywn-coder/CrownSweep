@@ -16,7 +16,7 @@ load_quick_purge_hint_paths() {
 
     while IFS= read -r line; do
         [[ -n "$line" ]] && paths+=("$line")
-    done < <(mole_purge_read_paths_config "$config_file")
+    done < <(mole_purge_read_paths_config "$config_file" 2> /dev/null)
 
     if [[ ${#paths[@]} -eq 0 ]]; then
         paths=("${MOLE_PURGE_DEFAULT_SEARCH_PATHS[@]}")
@@ -66,7 +66,7 @@ hint_collect_child_dirs_with_timeout() {
     # 1s: shallow directory listing should be near-instant on healthy local
     # paths. Slow/cloud-backed roots are skipped so `mo clean` never appears
     # stuck while rendering this non-destructive hint.
-    run_with_timeout "$timeout_seconds" find "$parent" -mindepth 1 -maxdepth 1 -type d -print0 > "$output_file" 2> /dev/null
+    run_with_timeout "$timeout_seconds" "$FIND_BSD" "$parent" -mindepth 1 -maxdepth 1 -type d -print0 > "$output_file" 2> /dev/null
 }
 
 # shellcheck disable=SC2329
@@ -296,8 +296,8 @@ probe_project_artifact_hints() {
             fi
             [[ -d "$project_dir" ]] || continue
 
-            local project_name
-            project_name=$(basename "$project_dir")
+            local project_name="${project_dir%/}"
+            project_name="${project_name##*/}"
             [[ "$project_name" == .* ]] && continue
 
             if [[ $root_projects_scanned -ge $max_projects_per_root ]]; then
@@ -350,8 +350,8 @@ probe_project_artifact_hints() {
                 fi
                 [[ -d "$nested_dir" ]] || continue
 
-                local nested_name
-                nested_name=$(basename "$nested_dir")
+                local nested_name="${nested_dir%/}"
+                nested_name="${nested_name##*/}"
                 [[ "$nested_name" == .* ]] && continue
 
                 case "$nested_name" in
